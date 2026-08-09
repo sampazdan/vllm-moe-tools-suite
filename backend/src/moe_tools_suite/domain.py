@@ -113,12 +113,65 @@ class ProfileValidation(BaseModel):
     retained_fraction: float = 0.0
 
 
+class ProfileSource(StrEnum):
+    PROPOSAL = "proposal"
+    MANUAL = "manual"
+    IMPORT = "import"
+
+
+class CreateExpertProfileRequest(BaseModel):
+    name: Annotated[str, Field(min_length=1, max_length=120)]
+    description: Annotated[str, Field(max_length=1000)] = ""
+    model_id: str
+    profile: ExpertProfile
+    source: ProfileSource = ProfileSource.MANUAL
+    source_run_id: str | None = None
+    parent_profile_id: str | None = None
+    metric: Literal["routing_mass", "selection_count"] | None = None
+    observed_mass_retained: Annotated[float, Field(ge=0, le=1)] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, name: str) -> str:
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("name cannot be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> CreateExpertProfileRequest:
+        if self.source is ProfileSource.PROPOSAL and self.source_run_id is None:
+            raise ValueError("proposal profiles require source_run_id")
+        if self.metric is not None and self.source_run_id is None:
+            raise ValueError("profile metric requires source_run_id")
+        if self.observed_mass_retained is not None and self.source_run_id is None:
+            raise ValueError("observed mass requires source_run_id")
+        return self
+
+
+class SavedExpertProfile(BaseModel):
+    id: str
+    name: str
+    description: str
+    model_id: str
+    profile: ExpertProfile
+    profile_fingerprint: str
+    source: ProfileSource
+    source_run_id: str | None = None
+    parent_profile_id: str | None = None
+    metric: Literal["routing_mass", "selection_count"] | None = None
+    validation: ProfileValidation
+    observed_mass_retained: float | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class ModelSession(BaseModel):
     id: str
     model_id: str
     state: ModelState
     mode: Literal["mock", "vllm"]
     profile: ExpertProfile | None = None
+    profile_id: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -165,6 +218,44 @@ class BenchmarkRun(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class RunDetail(BaseModel):
+    run: BenchmarkRun
+    model_session: ModelSession
+    saved_profile: SavedExpertProfile | None = None
+
+
+class CreateComparisonRequest(BaseModel):
+    baseline_run_id: str
+    candidate_run_id: str
+    name: Annotated[str | None, Field(max_length=120)] = None
+
+    @field_validator("name")
+    @classmethod
+    def normalize_optional_name(cls, name: str | None) -> str | None:
+        if name is None:
+            return None
+        return name.strip() or None
+
+
+class ComparisonRecord(BaseModel):
+    id: str
+    name: str
+    baseline_run_id: str
+    candidate_run_id: str
+    profile_id: str | None = None
+    profile_fingerprint: str
+    benchmark_id: str
+    cohort_item_ids: list[str]
+    baseline_score: float
+    candidate_score: float
+    score_delta: float
+    regressions: int
+    recoveries: int
+    retained_passes: int
+    retained_failures: int
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class RoutingSummary(BaseModel):
     run_id: str
     layer_ids: list[int]
@@ -188,6 +279,13 @@ class ProfileProposal(BaseModel):
 class CreateModelSessionRequest(BaseModel):
     model_id: str
     profile: ExpertProfile | None = None
+    profile_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_profile_reference(self) -> CreateModelSessionRequest:
+        if self.profile_id is not None and self.profile is None:
+            raise ValueError("profile_id requires profile")
+        return self
 
 
 class SystemStatus(BaseModel):

@@ -74,6 +74,7 @@ export interface ModelSession {
   state: ModelState;
   mode: "mock" | "vllm";
   profile: ExpertProfile | null;
+  profile_id: string | null;
   created_at: string;
 }
 
@@ -140,4 +141,53 @@ export interface ProfileProposal {
   profile: ExpertProfile;
   validation: ProfileValidation;
   observed_mass_retained: number;
+}
+
+export type ProfileSource = "proposal" | "manual" | "import";
+
+export interface CreateExpertProfileRequest {
+  name: string;
+  description?: string;
+  model_id: string;
+  profile: ExpertProfile;
+  source?: ProfileSource;
+  source_run_id?: string | null;
+  parent_profile_id?: string | null;
+  metric?: "routing_mass" | "selection_count" | null;
+  observed_mass_retained?: number | null;
+}
+
+export interface SavedExpertProfile {
+  id: string;
+  name: string;
+  description: string;
+  model_id: string;
+  profile: ExpertProfile;
+  profile_fingerprint: string;
+  source: ProfileSource;
+  source_run_id: string | null;
+  parent_profile_id: string | null;
+  metric: "routing_mass" | "selection_count" | null;
+  validation: ProfileValidation;
+  observed_mass_retained: number | null;
+  created_at: string;
+}
+
+export interface ComparisonRecord {
+  id: string;
+  name: string;
+  baseline_run_id: string;
+  candidate_run_id: string;
+  profile_id: string | null;
+  profile_fingerprint: string;
+  benchmark_id: string;
+  cohort_item_ids: string[];
+  baseline_score: number;
+  candidate_score: number;
+  score_delta: number;
+  regressions: number;
+  recoveries: number;
+  retained_passes: number;
+  retained_failures: number;
+  created_at: string;
 }

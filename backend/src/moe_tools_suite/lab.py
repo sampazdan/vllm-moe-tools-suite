@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -13,7 +15,11 @@ from .domain import (
     BenchmarkInfo,
     BenchmarkItem,
     BenchmarkRun,
+    ComparisonRecord,
+    CreateComparisonRequest,
+    CreateExpertProfileRequest,
     CreateModelSessionRequest,
+    ExpertProfile,
     JobKind,
     JobRecord,
     JobStatus,
@@ -25,13 +31,19 @@ from .domain import (
     ProfileProposalRequest,
     ProfileValidation,
     RoutingSummary,
+    RunDetail,
     RunItemResult,
     RunRequest,
     RuntimeStatus,
+    SavedExpertProfile,
 )
 from .persistence import SqliteStore
 from .process_manager import ManagedVllmServer
-from .profiles import propose_fixed_budget_profile, validate_profile
+from .profiles import (
+    calculate_observed_mass_retained,
+    propose_fixed_budget_profile,
+    validate_profile,
+)
 from .runtime import MockModelRuntime, ModelRuntime, VllmRuntime
 from .settings import Settings
 from .telemetry import aggregate_routing
@@ -90,6 +102,8 @@ class ResearchLab:
             job_id: JobArtifacts(record=job, payload=payload)
             for job_id, (job, payload) in self.store.load_jobs().items()
         }
+        self.profiles = self.store.load_expert_profiles()
+        self.comparisons = self.store.load_comparisons()
         self._job_guard = Lock()
         self.runtime: ModelRuntime = self._create_runtime()
         self.server = self._create_server()
@@ -148,12 +162,20 @@ class ResearchLab:
             previous_session.state = ModelState.STOPPED
             self.store.save_model_session(previous_session)
 
+        matched_profile = (
+            self._find_saved_profile(request.model_id, request.profile)
+            if request.profile is not None
+            else None
+        )
         self.session = ModelSession(
             id=str(uuid4()),
             model_id=request.model_id,
             state=ModelState.STARTING,
             mode=self.settings.mode,
             profile=request.profile,
+            profile_id=request.profile_id or (
+                matched_profile.id if matched_profile is not None else None
+            ),
         )
         self.model_sessions[self.session.id] = self.session
         self.store.save_model_session(self.session)
@@ -279,6 +301,14 @@ class ResearchLab:
             validation = validate_profile(request.profile, self.topology)
             if not validation.valid:
                 raise ValueError("; ".join(validation.errors))
+        if request.profile_id is not None:
+            saved_profile = self.profiles.get(request.profile_id)
+            if saved_profile is None:
+                raise ValueError("profile_id does not reference a saved profile")
+            if saved_profile.model_id != request.model_id:
+                raise ValueError("saved profile belongs to a different model")
+            if saved_profile.profile != request.profile:
+                raise ValueError("profile does not match saved profile_id")
 
     async def run_benchmark(
         self, request: RunRequest, *, job_id: str | None = None
@@ -394,6 +424,181 @@ class ResearchLab:
             reverse=True,
         )
 
+    def get_run_detail(self, run_id: str) -> RunDetail:
+        artifacts = self.runs.get(run_id)
+        if artifacts is None:
+            raise KeyError(run_id)
+        model_session = self.model_sessions.get(artifacts.run.model_session_id)
+        if model_session is None:
+            raise RuntimeError("run references a missing model session")
+        saved_profile = (
+            self.profiles.get(model_session.profile_id)
+            if model_session.profile_id is not None
+            else (
+                self._find_saved_profile(
+                    model_session.model_id, model_session.profile
+                )
+                if model_session.profile is not None
+                else None
+            )
+        )
+        return RunDetail(
+            run=artifacts.run,
+            model_session=model_session,
+            saved_profile=saved_profile,
+        )
+
+    def create_expert_profile(
+        self, request: CreateExpertProfileRequest
+    ) -> SavedExpertProfile:
+        if request.model_id != MODEL_ID:
+            raise ValueError(f"unsupported model {request.model_id!r}")
+        validation = validate_profile(request.profile, self.topology)
+        if not validation.valid:
+            raise ValueError("; ".join(validation.errors))
+
+        source_run = None
+        if request.source_run_id is not None:
+            source_run = self.runs.get(request.source_run_id)
+            if source_run is None:
+                raise KeyError(request.source_run_id)
+            source_session = self.model_sessions.get(
+                source_run.run.model_session_id
+            )
+            if source_session is None or source_session.model_id != request.model_id:
+                raise ValueError("source run belongs to a different model")
+
+        if request.parent_profile_id is not None:
+            parent = self.profiles.get(request.parent_profile_id)
+            if parent is None:
+                raise KeyError(request.parent_profile_id)
+            if parent.model_id != request.model_id:
+                raise ValueError("parent profile belongs to a different model")
+
+        saved = SavedExpertProfile(
+            id=str(uuid4()),
+            name=request.name,
+            description=request.description,
+            model_id=request.model_id,
+            profile=request.profile,
+            profile_fingerprint=_profile_fingerprint(request.profile),
+            source=request.source,
+            source_run_id=request.source_run_id,
+            parent_profile_id=request.parent_profile_id,
+            metric=request.metric,
+            validation=validation,
+            observed_mass_retained=(
+                calculate_observed_mass_retained(
+                    source_run.routing, request.profile
+                )
+                if source_run is not None
+                else None
+            ),
+        )
+        self.profiles[saved.id] = saved
+        self.store.save_expert_profile(saved)
+        return saved
+
+    def list_expert_profiles(self) -> list[SavedExpertProfile]:
+        return sorted(
+            self.profiles.values(),
+            key=lambda profile: profile.created_at,
+            reverse=True,
+        )
+
+    def create_comparison(
+        self, request: CreateComparisonRequest
+    ) -> ComparisonRecord:
+        if request.baseline_run_id == request.candidate_run_id:
+            raise ValueError("comparison requires two different runs")
+        baseline = self.runs.get(request.baseline_run_id)
+        candidate = self.runs.get(request.candidate_run_id)
+        if baseline is None:
+            raise KeyError(request.baseline_run_id)
+        if candidate is None:
+            raise KeyError(request.candidate_run_id)
+
+        baseline_session = self.model_sessions.get(
+            baseline.run.model_session_id
+        )
+        candidate_session = self.model_sessions.get(
+            candidate.run.model_session_id
+        )
+        if baseline_session is None or candidate_session is None:
+            raise RuntimeError("comparison run references a missing model session")
+        if baseline_session.model_id != candidate_session.model_id:
+            raise ValueError("comparison runs use different models")
+        if candidate_session.profile is None:
+            raise ValueError("candidate run does not use an expert profile")
+        if baseline.run.benchmark_id != candidate.run.benchmark_id:
+            raise ValueError("comparison runs use different benchmarks")
+
+        baseline_item_ids = [item.item_id for item in baseline.run.items]
+        candidate_item_ids = [item.item_id for item in candidate.run.items]
+        if baseline_item_ids != candidate_item_ids:
+            raise ValueError(
+                "comparison runs must use the same ordered benchmark cohort"
+            )
+
+        paired_items = zip(baseline.run.items, candidate.run.items, strict=True)
+        transitions = [
+            (baseline_item.passed, candidate_item.passed)
+            for baseline_item, candidate_item in paired_items
+        ]
+        saved_profile = (
+            self.profiles.get(candidate_session.profile_id)
+            if candidate_session.profile_id is not None
+            else self._find_saved_profile(
+                candidate_session.model_id, candidate_session.profile
+            )
+        )
+        fingerprint = _profile_fingerprint(candidate_session.profile)
+        default_name = (
+            f"{saved_profile.name if saved_profile else 'Masked profile'} · "
+            f"{request.baseline_run_id[:8]} → {request.candidate_run_id[:8]}"
+        )
+        comparison = ComparisonRecord(
+            id=str(uuid4()),
+            name=request.name or default_name,
+            baseline_run_id=request.baseline_run_id,
+            candidate_run_id=request.candidate_run_id,
+            profile_id=saved_profile.id if saved_profile else None,
+            profile_fingerprint=fingerprint,
+            benchmark_id=baseline.run.benchmark_id,
+            cohort_item_ids=baseline_item_ids,
+            baseline_score=baseline.run.score,
+            candidate_score=candidate.run.score,
+            score_delta=candidate.run.score - baseline.run.score,
+            regressions=sum(base and not masked for base, masked in transitions),
+            recoveries=sum(not base and masked for base, masked in transitions),
+            retained_passes=sum(base and masked for base, masked in transitions),
+            retained_failures=sum(
+                not base and not masked for base, masked in transitions
+            ),
+        )
+        self.comparisons[comparison.id] = comparison
+        self.store.save_comparison(comparison)
+        return comparison
+
+    def list_comparisons(self) -> list[ComparisonRecord]:
+        return sorted(
+            self.comparisons.values(),
+            key=lambda comparison: comparison.created_at,
+            reverse=True,
+        )
+
+    def _find_saved_profile(
+        self, model_id: str, profile: ExpertProfile
+    ) -> SavedExpertProfile | None:
+        fingerprint = _profile_fingerprint(profile)
+        matching = [
+            saved
+            for saved in self.profiles.values()
+            if saved.model_id == model_id
+            and saved.profile_fingerprint == fingerprint
+        ]
+        return max(matching, key=lambda saved: saved.created_at, default=None)
+
     def validate_profile(self, profile) -> ProfileValidation:
         return validate_profile(profile, self.topology)
 
@@ -435,3 +640,12 @@ def _fixture_items() -> list[BenchmarkItem]:
         )
         for item_id, expression, expected, category in expressions
     ]
+
+
+def _profile_fingerprint(profile: ExpertProfile) -> str:
+    canonical = json.dumps(
+        profile.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()

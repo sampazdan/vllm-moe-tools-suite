@@ -9,7 +9,10 @@ layers, 256 experts per layer, top-8 routing, and the fork's paired NumPy teleme
 contract. The UI can load the mock model, choose fixture items, run them, inspect
 expert engagement, and create a fork-compatible profile. Model and benchmark work
 runs as persisted background jobs, and completed runs plus compressed routing
-artifacts survive application restarts.
+artifacts survive application restarts. The research archive also persists named,
+fingerprinted profile revisions and strict paired comparisons. Profiles can be
+imported/exported in the fork's version 1 JSON format and revised with a per-layer
+manual expert editor.
 
 See [ROADMAP.md](ROADMAP.md) for the complete product and agentic-coding plan.
 
@@ -134,9 +137,10 @@ steps:
    **Load this profile**. A new model session and process must be created.
 4. Run the masked cohort. The app reuses the exact baseline item IDs and exposes
    base/masked heatmaps plus a paired item-level score comparison.
-5. Restart the Pod once and confirm runs, jobs, model-session/profile provenance,
-   and compressed routing artifacts remain available. Then stop the Pod; do not
-   leave the GPU running merely to preserve the network volume.
+5. Restart the Pod once and use the archive to reopen the persisted paired
+   comparison. Confirm runs, jobs, immutable profile lineage, model-session
+   provenance, and compressed routing artifacts remain available. Then stop the
+   Pod; do not leave the GPU running merely to preserve the network volume.
 
 This is the first checkpoint worth paying for the target GPU. It validates image
 compatibility, the fork's real telemetry response, process restart semantics, and

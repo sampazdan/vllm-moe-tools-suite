@@ -72,18 +72,31 @@ def propose_fixed_budget_profile(
         dtype=np.float64,
     )
     layers: dict[str, ProfileLayer] = {}
-    retained_mass = 0.0
-    total_mass = float(np.asarray(summary.routing_mass).sum())
-    mass_values = np.asarray(summary.routing_mass, dtype=np.float64)
     for layer_index, layer_id in enumerate(summary.layer_ids):
         order = np.lexsort((np.arange(topology.num_experts), -values[layer_index]))
         keep = np.sort(order[:keep_per_layer]).astype(int).tolist()
         layers[str(layer_id)] = ProfileLayer(keep=keep)
-        retained_mass += float(mass_values[layer_index, keep].sum())
 
     profile = ExpertProfile(layers=layers)
     return ProfileProposal(
         profile=profile,
         validation=validate_profile(profile, topology),
-        observed_mass_retained=retained_mass / total_mass if total_mass else 1.0,
+        observed_mass_retained=calculate_observed_mass_retained(summary, profile),
     )
+
+
+def calculate_observed_mass_retained(
+    summary: RoutingSummary, profile: ExpertProfile
+) -> float:
+    """Calculate retained routing mass for an arbitrary valid profile."""
+
+    mass_values = np.asarray(summary.routing_mass, dtype=np.float64)
+    total_mass = float(mass_values.sum())
+    retained_mass = 0.0
+    for layer_index, layer_id in enumerate(summary.layer_ids):
+        layer = profile.layers.get(str(layer_id))
+        if layer is None:
+            retained_mass += float(mass_values[layer_index].sum())
+        else:
+            retained_mass += float(mass_values[layer_index, layer.keep].sum())
+    return retained_mass / total_mass if total_mass else 1.0

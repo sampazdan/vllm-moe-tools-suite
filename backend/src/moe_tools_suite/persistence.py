@@ -12,12 +12,15 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .domain import (
     BenchmarkRun,
+    ComparisonRecord,
     ExpertProfile,
     JobRecord,
     JobStatus,
     ModelSession,
     ModelState,
+    ProfileValidation,
     RoutingSummary,
+    SavedExpertProfile,
 )
 
 
@@ -41,6 +44,13 @@ class ModelSessionRow(Base):
     )
 
 
+class ModelSessionProfileRow(Base):
+    __tablename__ = "model_session_profiles"
+
+    model_session_id: Mapped[str] = mapped_column(String, primary_key=True)
+    profile_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+
+
 class BenchmarkRunRow(Base):
     __tablename__ = "benchmark_runs"
 
@@ -53,6 +63,51 @@ class BenchmarkRunRow(Base):
     total_items: Mapped[int] = mapped_column(Integer, nullable=False)
     items_json: Mapped[str] = mapped_column(Text, nullable=False)
     routing_artifact: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ExpertProfileRow(Base):
+    __tablename__ = "expert_profiles"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    model_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    profile_json: Mapped[str] = mapped_column(Text, nullable=False)
+    profile_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, index=True
+    )
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    source_run_id: Mapped[str | None] = mapped_column(String, index=True)
+    parent_profile_id: Mapped[str | None] = mapped_column(String, index=True)
+    metric: Mapped[str | None] = mapped_column(String)
+    validation_json: Mapped[str] = mapped_column(Text, nullable=False)
+    observed_mass_retained: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ComparisonRow(Base):
+    __tablename__ = "comparisons"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    baseline_run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    candidate_run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    profile_id: Mapped[str | None] = mapped_column(String, index=True)
+    profile_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    benchmark_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    cohort_item_ids_json: Mapped[str] = mapped_column(Text, nullable=False)
+    baseline_score: Mapped[float] = mapped_column(Float, nullable=False)
+    candidate_score: Mapped[float] = mapped_column(Float, nullable=False)
+    score_delta: Mapped[float] = mapped_column(Float, nullable=False)
+    regressions: Mapped[int] = mapped_column(Integer, nullable=False)
+    recoveries: Mapped[int] = mapped_column(Integer, nullable=False)
+    retained_passes: Mapped[int] = mapped_column(Integer, nullable=False)
+    retained_failures: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -118,6 +173,21 @@ class SqliteStore:
                 row.state = model_session.state.value
                 row.profile_json = profile_json
                 row.updated_at = now
+            profile_link = database.get(
+                ModelSessionProfileRow, model_session.id
+            )
+            if model_session.profile_id is not None:
+                if profile_link is None:
+                    database.add(
+                        ModelSessionProfileRow(
+                            model_session_id=model_session.id,
+                            profile_id=model_session.profile_id,
+                        )
+                    )
+                else:
+                    profile_link.profile_id = model_session.profile_id
+            elif profile_link is not None:
+                database.delete(profile_link)
 
     def reconcile_interrupted_sessions(self) -> int:
         active_states = {
@@ -139,6 +209,10 @@ class SqliteStore:
     def load_model_sessions(self) -> dict[str, ModelSession]:
         loaded: dict[str, ModelSession] = {}
         with self.sessions() as database:
+            profile_ids = {
+                row.model_session_id: row.profile_id
+                for row in database.query(ModelSessionProfileRow)
+            }
             rows = database.query(ModelSessionRow).order_by(
                 ModelSessionRow.created_at
             )
@@ -154,6 +228,7 @@ class SqliteStore:
                     state=row.state,
                     mode=row.mode,
                     profile=profile,
+                    profile_id=profile_ids.get(row.id),
                     created_at=_as_utc(row.created_at),
                 )
         return loaded
@@ -279,6 +354,104 @@ class SqliteStore:
                     created_at=_as_utc(row.created_at),
                 )
                 loaded[row.id] = (run, routing)
+        return loaded
+
+    def save_expert_profile(self, profile: SavedExpertProfile) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                ExpertProfileRow(
+                    id=profile.id,
+                    name=profile.name,
+                    description=profile.description,
+                    model_id=profile.model_id,
+                    profile_json=profile.profile.model_dump_json(),
+                    profile_fingerprint=profile.profile_fingerprint,
+                    source=profile.source.value,
+                    source_run_id=profile.source_run_id,
+                    parent_profile_id=profile.parent_profile_id,
+                    metric=profile.metric,
+                    validation_json=profile.validation.model_dump_json(),
+                    observed_mass_retained=profile.observed_mass_retained,
+                    created_at=profile.created_at,
+                )
+            )
+
+    def load_expert_profiles(self) -> dict[str, SavedExpertProfile]:
+        loaded: dict[str, SavedExpertProfile] = {}
+        with self.sessions() as database:
+            rows = database.query(ExpertProfileRow).order_by(
+                ExpertProfileRow.created_at
+            )
+            for row in rows:
+                loaded[row.id] = SavedExpertProfile(
+                    id=row.id,
+                    name=row.name,
+                    description=row.description,
+                    model_id=row.model_id,
+                    profile=ExpertProfile.model_validate_json(row.profile_json),
+                    profile_fingerprint=row.profile_fingerprint,
+                    source=row.source,
+                    source_run_id=row.source_run_id,
+                    parent_profile_id=row.parent_profile_id,
+                    metric=row.metric,
+                    validation=ProfileValidation.model_validate_json(
+                        row.validation_json
+                    ),
+                    observed_mass_retained=row.observed_mass_retained,
+                    created_at=_as_utc(row.created_at),
+                )
+        return loaded
+
+    def save_comparison(self, comparison: ComparisonRecord) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                ComparisonRow(
+                    id=comparison.id,
+                    name=comparison.name,
+                    baseline_run_id=comparison.baseline_run_id,
+                    candidate_run_id=comparison.candidate_run_id,
+                    profile_id=comparison.profile_id,
+                    profile_fingerprint=comparison.profile_fingerprint,
+                    benchmark_id=comparison.benchmark_id,
+                    cohort_item_ids_json=json.dumps(
+                        comparison.cohort_item_ids, separators=(",", ":")
+                    ),
+                    baseline_score=comparison.baseline_score,
+                    candidate_score=comparison.candidate_score,
+                    score_delta=comparison.score_delta,
+                    regressions=comparison.regressions,
+                    recoveries=comparison.recoveries,
+                    retained_passes=comparison.retained_passes,
+                    retained_failures=comparison.retained_failures,
+                    created_at=comparison.created_at,
+                )
+            )
+
+    def load_comparisons(self) -> dict[str, ComparisonRecord]:
+        loaded: dict[str, ComparisonRecord] = {}
+        with self.sessions() as database:
+            rows = database.query(ComparisonRow).order_by(
+                ComparisonRow.created_at
+            )
+            for row in rows:
+                loaded[row.id] = ComparisonRecord(
+                    id=row.id,
+                    name=row.name,
+                    baseline_run_id=row.baseline_run_id,
+                    candidate_run_id=row.candidate_run_id,
+                    profile_id=row.profile_id,
+                    profile_fingerprint=row.profile_fingerprint,
+                    benchmark_id=row.benchmark_id,
+                    cohort_item_ids=json.loads(row.cohort_item_ids_json),
+                    baseline_score=row.baseline_score,
+                    candidate_score=row.candidate_score,
+                    score_delta=row.score_delta,
+                    regressions=row.regressions,
+                    recoveries=row.recoveries,
+                    retained_passes=row.retained_passes,
+                    retained_failures=row.retained_failures,
+                    created_at=_as_utc(row.created_at),
+                )
         return loaded
 
     def count_rows(self, model) -> int:

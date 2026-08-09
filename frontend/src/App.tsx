@@ -3,16 +3,20 @@ import { useEffect, useMemo, useState } from "react";
 
 import { api, setCsrfToken, waitForJob } from "./api";
 import { ExpertHeatmap } from "./ExpertHeatmap";
+import { ResearchArchive } from "./ResearchArchive";
 import type {
   BenchmarkInfo,
   BenchmarkItem,
   BenchmarkRun,
+  ComparisonRecord,
+  CreateExpertProfileRequest,
   JobRecord,
   ModelRegistryEntry,
   ModelSession,
   ProfileProposal,
   RoutingSummary,
   RuntimeStatus,
+  SavedExpertProfile,
   SessionStatus,
   SystemStatus,
 } from "./types";
@@ -29,6 +33,7 @@ export default function App() {
   );
   const [proposal, setProposal] = useState<ProfileProposal | null>(null);
   const [keepPerLayer, setKeepPerLayer] = useState(64);
+  const [profileName, setProfileName] = useState("Workload profile · 64/layer");
   const [activeJob, setActiveJob] = useState<JobRecord | null>(null);
   const [metric, setMetric] = useState<"routing_mass" | "selection_counts">(
     "routing_mass",
@@ -76,6 +81,26 @@ export default function App() {
       api<BenchmarkItem[]>("/api/benchmarks/fixture-arithmetic/items"),
     enabled: accessReady,
   });
+  const runsQuery = useQuery({
+    queryKey: ["runs"],
+    queryFn: () => api<BenchmarkRun[]>("/api/runs"),
+    enabled: accessReady,
+  });
+  const modelSessionsQuery = useQuery({
+    queryKey: ["model-sessions"],
+    queryFn: () => api<ModelSession[]>("/api/model-sessions"),
+    enabled: accessReady,
+  });
+  const profilesQuery = useQuery({
+    queryKey: ["profiles"],
+    queryFn: () => api<SavedExpertProfile[]>("/api/profiles"),
+    enabled: accessReady,
+  });
+  const comparisonsQuery = useQuery({
+    queryKey: ["comparisons"],
+    queryFn: () => api<ComparisonRecord[]>("/api/comparisons"),
+    enabled: accessReady,
+  });
   const routingRun =
     routingVariant === "masked" && maskedRun ? maskedRun : baselineRun;
   const routingQuery = useQuery({
@@ -107,6 +132,7 @@ export default function App() {
       queryClient.setQueryData(["model-session-current"], modelSession);
       queryClient.invalidateQueries({ queryKey: ["status"] });
       queryClient.invalidateQueries({ queryKey: ["runtime-status"] });
+      queryClient.invalidateQueries({ queryKey: ["model-sessions"] });
     },
     onSettled: () => setActiveJob(null),
   });
@@ -141,6 +167,7 @@ export default function App() {
       setMaskedRun(null);
       setRoutingVariant("baseline");
       setProposal(null);
+      queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
     onSettled: () => setActiveJob(null),
   });
@@ -155,15 +182,32 @@ export default function App() {
           metric: metric === "selection_counts" ? "selection_count" : metric,
         }),
       }),
-    onSuccess: setProposal,
+    onSuccess: (nextProposal) => {
+      setProposal(nextProposal);
+      setProfileName(`Workload profile · ${keepPerLayer}/layer`);
+    },
+  });
+
+  const createProfile = useMutation({
+    mutationFn: (request: CreateExpertProfileRequest) =>
+      api<SavedExpertProfile>("/api/profiles", {
+        method: "POST",
+        body: JSON.stringify(request),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["profiles"] });
+    },
   });
 
   const loadProfile = useMutation({
-    mutationFn: async () => {
-      if (!proposal) throw new Error("Create a profile proposal first");
+    mutationFn: async (savedProfile: SavedExpertProfile) => {
       const job = await api<JobRecord>("/api/model-sessions", {
         method: "POST",
-        body: JSON.stringify({ model_id: modelId, profile: proposal.profile }),
+        body: JSON.stringify({
+          model_id: savedProfile.model_id,
+          profile: savedProfile.profile,
+          profile_id: savedProfile.id,
+        }),
       });
       await waitForJob(job, setActiveJob);
       return api<ModelSession>("/api/model-sessions/current");
@@ -172,8 +216,26 @@ export default function App() {
       queryClient.setQueryData(["model-session-current"], modelSession);
       queryClient.invalidateQueries({ queryKey: ["status"] });
       queryClient.invalidateQueries({ queryKey: ["runtime-status"] });
+      queryClient.invalidateQueries({ queryKey: ["model-sessions"] });
     },
     onSettled: () => setActiveJob(null),
+  });
+
+  const createComparison = useMutation({
+    mutationFn: ({ baseline, candidate }: {
+      baseline: BenchmarkRun;
+      candidate: BenchmarkRun;
+    }) =>
+      api<ComparisonRecord>("/api/comparisons", {
+        method: "POST",
+        body: JSON.stringify({
+          baseline_run_id: baseline.id,
+          candidate_run_id: candidate.id,
+        }),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["comparisons"] });
+    },
   });
 
   const runMasked = useMutation({
@@ -193,6 +255,10 @@ export default function App() {
     onSuccess: (nextRun) => {
       setMaskedRun(nextRun);
       setRoutingVariant("masked");
+      queryClient.invalidateQueries({ queryKey: ["runs"] });
+      if (baselineRun) {
+        createComparison.mutate({ baseline: baselineRun, candidate: nextRun });
+      }
     },
     onSettled: () => setActiveJob(null),
   });
@@ -202,6 +268,22 @@ export default function App() {
   const selectedCount = selectedItems.size;
   const allSelected = selectedCount === itemsQuery.data?.length;
   const currentProfile = currentModelQuery.data?.profile ?? null;
+  const profiles = profilesQuery.data ?? [];
+  const savedProposal = proposal
+    ? [createProfile.data, ...profiles].find(
+        (saved) =>
+          saved !== undefined &&
+          JSON.stringify(saved.profile) === JSON.stringify(proposal.profile),
+      )
+    : undefined;
+  const activeProfileId = currentModelQuery.data?.profile_id ?? (
+    currentProfile
+      ? profiles.find(
+        (saved) =>
+          JSON.stringify(saved.profile) === JSON.stringify(currentProfile),
+        )?.id ?? null
+      : null
+  );
   const profileMatchesProposal = Boolean(
     proposal &&
       currentProfile &&
@@ -213,11 +295,17 @@ export default function App() {
     currentModelQuery.error ||
     modelsQuery.error ||
     itemsQuery.error ||
+    runsQuery.error ||
+    modelSessionsQuery.error ||
+    profilesQuery.error ||
+    comparisonsQuery.error ||
     loadModel.error ||
     runBaseline.error ||
     proposeProfile.error ||
+    createProfile.error ||
     loadProfile.error ||
-    runMasked.error;
+    runMasked.error ||
+    createComparison.error;
   const selectedCategories = useMemo(() => {
     if (!itemsQuery.data) return [];
     return [...new Set(itemsQuery.data.map((item) => item.category))];
@@ -274,6 +362,9 @@ export default function App() {
           </a>
           <a className="nav-item" href="#compare" aria-label="Compare runs">
             ⇄<span>Compare</span>
+          </a>
+          <a className="nav-item" href="#archive" aria-label="Research archive">
+            ◷<span>Archive</span>
           </a>
         </nav>
         <span className="version">v{statusQuery.data?.version ?? "0.1"}</span>
@@ -548,7 +639,41 @@ export default function App() {
                       ? "Fork-compatible profile"
                       : proposal.validation.errors.join(", ")}
                   </span>
-                  {profileMatchesProposal ? (
+                  {!savedProposal ? (
+                    <div className="profile-save-row">
+                      <input
+                        aria-label="Expert profile name"
+                        value={profileName}
+                        onChange={(event) => setProfileName(event.target.value)}
+                      />
+                      <button
+                        className="primary-button"
+                        disabled={
+                          !proposal.validation.valid ||
+                          !profileName.trim() ||
+                          createProfile.isPending
+                        }
+                        onClick={() =>
+                          createProfile.mutate({
+                            name: profileName,
+                            description: `Fixed-budget ${metric === "routing_mass" ? "routing mass" : "selection count"} proposal from ${baselineRun?.id ?? "baseline"}.`,
+                            model_id: modelId,
+                            profile: proposal.profile,
+                            source: "proposal",
+                            source_run_id: baselineRun?.id,
+                            metric:
+                              metric === "selection_counts"
+                                ? "selection_count"
+                                : metric,
+                            observed_mass_retained:
+                              proposal.observed_mass_retained,
+                          })
+                        }
+                      >
+                        {createProfile.isPending ? "Saving…" : "Save profile"}
+                      </button>
+                    </div>
+                  ) : profileMatchesProposal ? (
                     <button
                       className="primary-button"
                       disabled={runMasked.isPending || Boolean(activeJob)}
@@ -568,7 +693,7 @@ export default function App() {
                         loadProfile.isPending ||
                         Boolean(activeJob)
                       }
-                      onClick={() => loadProfile.mutate()}
+                      onClick={() => loadProfile.mutate(savedProposal)}
                     >
                       {loadProfile.isPending
                         ? "Restarting with profile…"
@@ -679,6 +804,55 @@ export default function App() {
               </table>
             </div>
           </section>
+        )}
+
+        {model && (
+          <ResearchArchive
+            runs={runsQuery.data ?? []}
+            profiles={profiles}
+            comparisons={comparisonsQuery.data ?? []}
+            sessions={modelSessionsQuery.data ?? []}
+            modelId={model.id}
+            topology={model.topology}
+            activeProfileId={activeProfileId}
+            busy={
+              Boolean(activeJob) ||
+              loadProfile.isPending ||
+              createProfile.isPending
+            }
+            onOpenRun={(run, pairedBaseline) => {
+              setProposal(null);
+              if (pairedBaseline) {
+                setBaselineRun(pairedBaseline);
+                setMaskedRun(run);
+                setRoutingVariant("masked");
+                return;
+              }
+              const session = modelSessionsQuery.data?.find(
+                (candidate) => candidate.id === run.model_session_id,
+              );
+              if (session?.profile) {
+                setBaselineRun(null);
+                setMaskedRun(run);
+                setRoutingVariant("masked");
+              } else {
+                setBaselineRun(run);
+                setMaskedRun(null);
+                setRoutingVariant("baseline");
+              }
+            }}
+            onOpenComparison={(baseline, candidate) => {
+              setBaselineRun(baseline);
+              setMaskedRun(candidate);
+              setRoutingVariant("masked");
+              setProposal(null);
+            }}
+            onLoadProfile={(profile) => {
+              setProposal(null);
+              loadProfile.mutate(profile);
+            }}
+            onCreateProfile={(request) => createProfile.mutateAsync(request)}
+          />
         )}
 
         <footer>

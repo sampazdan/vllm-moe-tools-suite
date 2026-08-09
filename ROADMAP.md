@@ -17,9 +17,29 @@ Implementation status as of 2026-08-08:
   persisted background jobs, official HTTP-proxy/template configuration, managed
   vLLM process lifecycle, per-session logs and profile files, and the paired
   baseline-to-mask comparison UI. GPU behavior remains unverified.
+- **Profile/comparison workspace implemented locally:** named expert profiles are
+  immutable, fingerprinted, revision-linked, importable/exportable, and persisted.
+  Manual per-layer expert overrides, strict same-cohort comparisons, run/profile
+  provenance, and restart-safe archive views now work on desktop and phone.
 - **Next acceptance checkpoint:** build and push one immutable image, smoke-test the
   mock appliance through Runpod's HTTPS proxy, then validate managed A3B load,
   telemetry, profile restart, and paired rerun on the target RTX PRO 6000.
+
+Approximate milestone accounting (local implementation, not production readiness):
+
+| Milestone | Progress | Largest remaining gap |
+| --- | ---: | --- |
+| 0 · Local skeleton | 90% | CI and frontend automation |
+| 1 · Runpod appliance | 85% | Real proxy/volume acceptance |
+| 2 · Model lifecycle | 55% | Real topology, chat, stop/cancel, GPU acceptance |
+| 3 · Benchmark engine | 45% | GSM8K, Custom JSONL, richer provenance/export |
+| 4 · Profile lab | 60% | Undo/redo and additional assisted strategies |
+| 5 · Masked comparison | 65% | Routing redistribution, reports, performance mode |
+| 6–8 · Agentic/breadth | 0–5% | Harbor/Daytona and real benchmark adapters |
+
+The interactive MVP surface is roughly 55% implemented. The production-validated
+system is closer to one third complete because the container and managed fork have
+not yet crossed the real Runpod/GPU acceptance checkpoints.
 
 This repository will contain a single-user research application for measuring how
 expert eligibility changes affect a task-focused MoE model. The first useful

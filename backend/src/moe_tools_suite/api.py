@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 
 from . import __version__
 from .domain import (
     BenchmarkInfo,
     BenchmarkItem,
     BenchmarkRun,
+    ComparisonRecord,
+    CreateComparisonRequest,
+    CreateExpertProfileRequest,
     CreateModelSessionRequest,
     ExpertProfile,
     JobRecord,
@@ -17,8 +21,10 @@ from .domain import (
     ProfileProposalRequest,
     ProfileValidation,
     RoutingSummary,
+    RunDetail,
     RunRequest,
     RuntimeStatus,
+    SavedExpertProfile,
     SystemStatus,
 )
 from .lab import ResearchLab
@@ -153,6 +159,16 @@ def get_run_routing(run_id: str, request: Request) -> RoutingSummary:
     return artifacts.routing
 
 
+@router.get("/runs/{run_id}/detail", response_model=RunDetail)
+def get_run_detail(run_id: str, request: Request) -> RunDetail:
+    try:
+        return _lab(request).get_run_detail(run_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="run not found") from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @router.get("/jobs", response_model=list[JobRecord])
 def list_jobs(request: Request) -> list[JobRecord]:
     return _lab(request).list_jobs()
@@ -183,3 +199,84 @@ def propose_expert_profile(
         raise HTTPException(status_code=404, detail="run not found") from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/profiles",
+    response_model=SavedExpertProfile,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_expert_profile(
+    payload: CreateExpertProfileRequest, request: Request
+) -> SavedExpertProfile:
+    try:
+        return _lab(request).create_expert_profile(payload)
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404, detail="profile provenance not found"
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/profiles", response_model=list[SavedExpertProfile])
+def list_expert_profiles(request: Request) -> list[SavedExpertProfile]:
+    return _lab(request).list_expert_profiles()
+
+
+@router.get("/profiles/{profile_id}", response_model=SavedExpertProfile)
+def get_expert_profile(profile_id: str, request: Request) -> SavedExpertProfile:
+    profile = _lab(request).profiles.get(profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="expert profile not found")
+    return profile
+
+
+@router.get("/profiles/{profile_id}/export", response_model=ExpertProfile)
+def export_expert_profile(
+    profile_id: str, request: Request
+) -> JSONResponse:
+    profile = _lab(request).profiles.get(profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="expert profile not found")
+    return JSONResponse(
+        content=profile.profile.model_dump(mode="json"),
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="expert-profile-{profile.id}.json"'
+            )
+        },
+    )
+
+
+@router.post(
+    "/comparisons",
+    response_model=ComparisonRecord,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_comparison(
+    payload: CreateComparisonRequest, request: Request
+) -> ComparisonRecord:
+    try:
+        return _lab(request).create_comparison(payload)
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404, detail="comparison run not found"
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/comparisons", response_model=list[ComparisonRecord])
+def list_comparisons(request: Request) -> list[ComparisonRecord]:
+    return _lab(request).list_comparisons()
+
+
+@router.get("/comparisons/{comparison_id}", response_model=ComparisonRecord)
+def get_comparison(comparison_id: str, request: Request) -> ComparisonRecord:
+    comparison = _lab(request).comparisons.get(comparison_id)
+    if comparison is None:
+        raise HTTPException(status_code=404, detail="comparison not found")
+    return comparison
