@@ -1,0 +1,24 @@
+{
+  "category": "NVIDIA",
+  "containerDiskInGb": 50,
+  "dockerEntrypoint": [],
+  "dockerStartCmd": [],
+  "env": {
+    "MOE_TOOLS_AUTH_TOKEN": "{{ RUNPOD_SECRET_moe_tools_auth_token }}",
+    "MOE_TOOLS_COOKIE_SECURE": "1",
+    "MOE_TOOLS_DATA_DIR": "/workspace/moe-tools",
+    "MOE_TOOLS_MODE": "mock",
+    "MOE_TOOLS_REQUIRE_AUTH": "1"
+  },
+  "imageName": "YOUR_REGISTRY/moe-tools-test-suite:IMMUTABLE_TAG",
+  "isPublic": false,
+  "isServerless": false,
+  "name": "moe-tools-test-suite-mock",
+  "ports": [
+    "8080/http",
+    "22/tcp"
+  ],
+  "readme": "Private MoE expert-routing research appliance. Open port 8080 through Runpod's HTTPS proxy and sign in with the configured token.",
+  "volumeInGb": 150,
+  "volumeMountPath": "/workspace"
+}

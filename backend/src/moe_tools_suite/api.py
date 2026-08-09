@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
 from . import __version__
 from .domain import (
@@ -9,6 +9,7 @@ from .domain import (
     BenchmarkRun,
     CreateModelSessionRequest,
     ExpertProfile,
+    JobRecord,
     ModelRegistryEntry,
     ModelSession,
     ModelState,
@@ -17,6 +18,7 @@ from .domain import (
     ProfileValidation,
     RoutingSummary,
     RunRequest,
+    RuntimeStatus,
     SystemStatus,
 )
 from .lab import ResearchLab
@@ -44,16 +46,28 @@ def list_models(request: Request) -> list[ModelRegistryEntry]:
     return _lab(request).models
 
 
+@router.get("/runtime/status", response_model=RuntimeStatus)
+def runtime_status(request: Request) -> RuntimeStatus:
+    return _lab(request).runtime_status()
+
+
 @router.post(
     "/model-sessions",
-    response_model=ModelSession,
-    status_code=status.HTTP_201_CREATED,
+    response_model=JobRecord,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 def create_model_session(
-    payload: CreateModelSessionRequest, request: Request
-) -> ModelSession:
+    payload: CreateModelSessionRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JobRecord:
     try:
-        return _lab(request).create_model_session(payload)
+        lab = _lab(request)
+        job = lab.submit_model_session(payload)
+        background_tasks.add_task(lab.execute_job, job.id)
+        return job
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -64,6 +78,19 @@ def current_model_session(request: Request) -> ModelSession:
     if session is None:
         raise HTTPException(status_code=404, detail="no model session")
     return session
+
+
+@router.get("/model-sessions", response_model=list[ModelSession])
+def list_model_sessions(request: Request) -> list[ModelSession]:
+    return _lab(request).list_model_sessions()
+
+
+@router.get("/model-sessions/{session_id}", response_model=ModelSession)
+def get_model_session(session_id: str, request: Request) -> ModelSession:
+    model_session = _lab(request).model_sessions.get(session_id)
+    if model_session is None:
+        raise HTTPException(status_code=404, detail="model session not found")
+    return model_session
 
 
 @router.get("/benchmarks", response_model=list[BenchmarkInfo])
@@ -84,14 +111,30 @@ def list_benchmark_items(
     return lab.items
 
 
-@router.post("/runs", response_model=BenchmarkRun, status_code=status.HTTP_201_CREATED)
-async def create_run(payload: RunRequest, request: Request) -> BenchmarkRun:
+@router.post(
+    "/runs",
+    response_model=JobRecord,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_run(
+    payload: RunRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JobRecord:
     try:
-        return await _lab(request).run_benchmark(payload)
+        lab = _lab(request)
+        job = lab.submit_benchmark(payload)
+        background_tasks.add_task(lab.execute_job, job.id)
+        return job
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/runs", response_model=list[BenchmarkRun])
+def list_runs(request: Request) -> list[BenchmarkRun]:
+    return _lab(request).list_runs()
 
 
 @router.get("/runs/{run_id}", response_model=BenchmarkRun)
@@ -108,6 +151,19 @@ def get_run_routing(run_id: str, request: Request) -> RoutingSummary:
     if artifacts is None:
         raise HTTPException(status_code=404, detail="run not found")
     return artifacts.routing
+
+
+@router.get("/jobs", response_model=list[JobRecord])
+def list_jobs(request: Request) -> list[JobRecord]:
+    return _lab(request).list_jobs()
+
+
+@router.get("/jobs/{job_id}", response_model=JobRecord)
+def get_job(job_id: str, request: Request) -> JobRecord:
+    artifacts = _lab(request).jobs.get(job_id)
+    if artifacts is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return artifacts.record
 
 
 @router.post("/profiles/validate", response_model=ProfileValidation)

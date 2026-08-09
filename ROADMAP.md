@@ -9,12 +9,17 @@ Implementation status as of 2026-08-08:
   A3B mock runtime, selectable fixture benchmark, responsive React application,
   40-by-256 engagement heatmap, fixed-budget profile proposal, and Runpod-aware
   Dockerfile skeleton.
-- **Verified locally:** 10 backend tests, Ruff, the production TypeScript/Vite build,
-  desktop and 390-pixel browser workflows, shell startup syntax, and Docker Buildx
-  static validation all pass.
-- **Next:** authenticated Runpod appliance and durable state, followed by managed
-  vLLM lifecycle against the target GPU. The current Runpod image intentionally
-  defaults to mock mode until those runtime controls are complete.
+- **Verified locally:** 19 backend tests, Ruff, the production TypeScript/Vite build,
+  authenticated base-to-mask workflows in desktop and 390-pixel browser layouts,
+  shell/JSON startup syntax, and Docker Buildx static validation all pass.
+- **Milestone 1 implemented locally:** single-user token sessions and CSRF,
+  fail-closed Runpod startup, SQLite metadata plus compressed routing artifacts,
+  persisted background jobs, official HTTP-proxy/template configuration, managed
+  vLLM process lifecycle, per-session logs and profile files, and the paired
+  baseline-to-mask comparison UI. GPU behavior remains unverified.
+- **Next acceptance checkpoint:** build and push one immutable image, smoke-test the
+  mock appliance through Runpod's HTTPS proxy, then validate managed A3B load,
+  telemetry, profile restart, and paired rerun on the target RTX PRO 6000.
 
 This repository will contain a single-user research application for measuring how
 expert eligibility changes affect a task-focused MoE model. The first useful

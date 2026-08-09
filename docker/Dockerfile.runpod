@@ -41,6 +41,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUNPOD_VLLM_MAX_NUM_SEQS=8 \
     VLLM_USE_DEEP_GEMM=0 \
     MOE_TOOLS_MODE=mock \
+    MOE_TOOLS_REQUIRE_AUTH=1 \
+    MOE_TOOLS_COOKIE_SECURE=1 \
     MOE_TOOLS_APP_ROOT=/opt/moe-tools-test-suite \
     MOE_TOOLS_DATA_DIR=/workspace/moe-tools \
     MOE_TOOLS_FRONTEND_DIST=/opt/moe-tools-test-suite/frontend/dist \
@@ -63,6 +65,7 @@ RUN apt-get update \
         sysstat \
         time \
         tmux \
+        util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
@@ -99,10 +102,13 @@ RUN chmod 0755 \
         /usr/local/bin/runpod-bench \
         /usr/local/bin/make-moe-profile \
     && chmod 0644 /etc/profile.d/vllm-runpod.sh \
-    && python -c "import moe_tools_suite, torch, vllm; print(moe_tools_suite.__version__, vllm.__version__, torch.__version__)"
+    && /opt/vllm-venv/bin/python -c "import moe_tools_suite, torch, vllm; print(moe_tools_suite.__version__, vllm.__version__, torch.__version__)"
 
 WORKDIR /workspace
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null || exit 1
 
 # Inherit the Runpod base CMD. /start.sh invokes /pre_start.sh, preserving SSH,
 # the web terminal, and Jupyter while starting this application automatically.

@@ -1,32 +1,62 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from . import __version__
 from .api import router
 from .lab import ResearchLab
+from .security import SessionMiddleware, create_session_router, create_session_signer
 from .settings import Settings
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        yield
+        await application.state.lab.shutdown()
+
     app = FastAPI(
         title="MoE Tools Test Suite",
         version=__version__,
         docs_url="/api/docs",
         openapi_url="/api/openapi.json",
+        lifespan=lifespan,
     )
     app.state.lab = ResearchLab(settings)
+    app.state.session_signer = create_session_signer(settings)
+    app.add_middleware(
+        SessionMiddleware,
+        settings=settings,
+        signer=app.state.session_signer,
+    )
+    app.include_router(create_session_router(settings))
     app.include_router(router)
 
     @app.get("/healthz")
     def health() -> dict[str, str]:
         return {"status": "ok", "mode": settings.mode}
+
+    @app.get("/readyz", response_model=None)
+    def readiness() -> dict[str, str] | JSONResponse:
+        try:
+            with app.state.lab.store.engine.connect() as database:
+                database.execute(text("SELECT 1"))
+        except (OSError, SQLAlchemyError):
+            return JSONResponse(
+                {"status": "not_ready", "database": "unavailable"},
+                status_code=503,
+            )
+        return {"status": "ready", "database": "ok", "mode": settings.mode}
 
     _mount_frontend(app, settings.frontend_dist)
     return app

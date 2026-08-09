@@ -12,7 +12,34 @@ class ModelState(StrEnum):
     STARTING = "starting"
     READY = "ready"
     STOPPING = "stopping"
+    STOPPED = "stopped"
     FAILED = "failed"
+
+
+class JobKind(StrEnum):
+    MODEL_LOAD = "model_load"
+    BENCHMARK_RUN = "benchmark_run"
+
+
+class JobStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class JobRecord(BaseModel):
+    id: str
+    kind: JobKind
+    status: JobStatus
+    progress_current: Annotated[int, Field(ge=0)] = 0
+    progress_total: Annotated[int, Field(ge=0)] = 0
+    result_id: str | None = None
+    error: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
 class ModelTopology(BaseModel):
@@ -168,3 +195,25 @@ class SystemStatus(BaseModel):
     version: str
     model_state: ModelState
     data_dir: str
+
+
+class RuntimeStatus(BaseModel):
+    managed: bool
+    model_id: str
+    pid: int | None = None
+    session_id: str | None = None
+    started_at: datetime | None = None
+    log_path: str | None = None
+    profile_path: str | None = None
+    log_tail: str = ""
+
+
+class LoginRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=4096)
+
+
+class SessionStatus(BaseModel):
+    auth_required: bool
+    authenticated: bool
+    csrf_token: str | None = None
+    expires_at: datetime | None = None

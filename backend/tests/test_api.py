@@ -16,6 +16,11 @@ def test_mock_vertical_slice_creates_profile_and_masked_run(tmp_path: Path) -> N
     client = TestClient(app)
 
     assert client.get("/healthz").json() == {"status": "ok", "mode": "mock"}
+    assert client.get("/readyz").json() == {
+        "status": "ready",
+        "database": "ok",
+        "mode": "mock",
+    }
     model = client.get("/api/models").json()[0]
     assert model["topology"] == {
         "num_layers": 40,
@@ -23,25 +28,40 @@ def test_mock_vertical_slice_creates_profile_and_masked_run(tmp_path: Path) -> N
         "top_k": 8,
         "routed_layer_ids": list(range(40)),
     }
+    runtime = client.get("/api/runtime/status").json()
+    assert runtime["managed"] is False
+    assert runtime["pid"] is None
 
-    loaded = client.post(
+    load_job = client.post(
         "/api/model-sessions", json={"model_id": model["id"]}
     )
-    assert loaded.status_code == 201
-    assert loaded.json()["state"] == "ready"
+    assert load_job.status_code == 202
+    assert load_job.json()["status"] == "queued"
+    assert load_job.json()["progress_total"] == 1
+    completed_load = client.get(f"/api/jobs/{load_job.json()['id']}").json()
+    assert completed_load["status"] == "completed"
+    assert client.get("/api/model-sessions/current").json()["state"] == "ready"
 
     items = client.get(
         "/api/benchmarks/fixture-arithmetic/items"
     ).json()
-    baseline = client.post(
+    baseline_job = client.post(
         "/api/runs",
         json={
             "benchmark_id": "fixture-arithmetic",
             "item_ids": [item["id"] for item in items],
         },
     )
-    assert baseline.status_code == 201
-    baseline_run = baseline.json()
+    assert baseline_job.status_code == 202
+    assert baseline_job.json()["progress_total"] == len(items)
+    completed_baseline = client.get(
+        f"/api/jobs/{baseline_job.json()['id']}"
+    ).json()
+    assert completed_baseline["status"] == "completed"
+    assert completed_baseline["progress_current"] == len(items)
+    baseline_run = client.get(
+        f"/api/runs/{completed_baseline['result_id']}"
+    ).json()
     assert baseline_run["score"] == 10 / 12
 
     proposal = client.post(
@@ -57,20 +77,33 @@ def test_mock_vertical_slice_creates_profile_and_masked_run(tmp_path: Path) -> N
     assert proposed["validation"]["valid"]
     assert proposed["validation"]["retained_fraction"] == 0.25
 
-    masked_session = client.post(
+    masked_session_job = client.post(
         "/api/model-sessions",
         json={"model_id": model["id"], "profile": proposed["profile"]},
     )
-    assert masked_session.status_code == 201
-    masked = client.post(
+    assert masked_session_job.status_code == 202
+    completed_masked_load = client.get(
+        f"/api/jobs/{masked_session_job.json()['id']}"
+    ).json()
+    assert completed_masked_load["status"] == "completed"
+    masked_model_session = client.get(
+        f"/api/model-sessions/{completed_masked_load['result_id']}"
+    ).json()
+    assert masked_model_session["profile"] == proposed["profile"]
+    masked_job = client.post(
         "/api/runs",
         json={
             "benchmark_id": "fixture-arithmetic",
             "item_ids": [item["id"] for item in items[:2]],
         },
     )
-    assert masked.status_code == 201
-    routing = client.get(f"/api/runs/{masked.json()['id']}/routing").json()
+    assert masked_job.status_code == 202
+    completed_masked = client.get(
+        f"/api/jobs/{masked_job.json()['id']}"
+    ).json()
+    routing = client.get(
+        f"/api/runs/{completed_masked['result_id']}/routing"
+    ).json()
     first_layer_kept = set(proposed["profile"]["layers"]["0"]["keep"])
     assert all(
         count == 0

@@ -3,6 +3,7 @@ export type ModelState =
   | "starting"
   | "ready"
   | "stopping"
+  | "stopped"
   | "failed";
 
 export interface SystemStatus {
@@ -10,6 +11,45 @@ export interface SystemStatus {
   version: string;
   model_state: ModelState;
   data_dir: string;
+}
+
+export interface RuntimeStatus {
+  managed: boolean;
+  model_id: string;
+  pid: number | null;
+  session_id: string | null;
+  started_at: string | null;
+  log_path: string | null;
+  profile_path: string | null;
+  log_tail: string;
+}
+
+export interface SessionStatus {
+  auth_required: boolean;
+  authenticated: boolean;
+  csrf_token: string | null;
+  expires_at: string | null;
+}
+
+export type JobKind = "model_load" | "benchmark_run";
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface JobRecord {
+  id: string;
+  kind: JobKind;
+  status: JobStatus;
+  progress_current: number;
+  progress_total: number;
+  result_id: string | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
 }
 
 export interface ModelTopology {
@@ -26,6 +66,15 @@ export interface ModelRegistryEntry {
   revision: string | null;
   topology: ModelTopology;
   notes: string;
+}
+
+export interface ModelSession {
+  id: string;
+  model_id: string;
+  state: ModelState;
+  mode: "mock" | "vllm";
+  profile: ExpertProfile | null;
+  created_at: string;
 }
 
 export interface BenchmarkInfo {

@@ -29,6 +29,8 @@ class ModelRuntime(Protocol):
         profile: ExpertProfile | None,
     ) -> CompletionResult: ...
 
+    async def aclose(self) -> None: ...
+
 
 class MockModelRuntime:
     """Deterministic GPU-free model and routing fixture."""
@@ -74,6 +76,9 @@ class MockModelRuntime:
             completion_tokens=1,
             routing=DecodedRouting(expert_ids=ids, expert_weights=weights),
         )
+
+    async def aclose(self) -> None:
+        return None
 
 
 class VllmRuntime:
@@ -130,6 +135,9 @@ class VllmRuntime:
                 self._topology,
             ),
         )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
 
 def _eligible_experts(
