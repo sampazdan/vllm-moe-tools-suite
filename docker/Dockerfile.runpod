@@ -13,9 +13,11 @@ ARG VLLM_PRECOMPILED_WHEEL_COMMIT=b1e12d142d8c9533f857f8da13d8fc368e95a8cd
 ARG VLLM_PRECOMPILED_WHEEL_VARIANT=cu130
 ARG VLLM_IMAGE_VERSION=0.1.dev1+moe-tools
 ARG VLLM_SOURCE_REF=stage-2-worktree
+ARG IMAGE_SOURCE=https://github.com/sampazdan/vllm-moe-tools-suite
 
 LABEL org.opencontainers.image.title="MoE Tools Test Suite" \
       org.opencontainers.image.description="Interactive expert-routing and pruning research appliance" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${VLLM_SOURCE_REF}"
 
 ENV DEBIAN_FRONTEND=noninteractive \

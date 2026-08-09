@@ -10,7 +10,7 @@
     "MOE_TOOLS_MODE": "mock",
     "MOE_TOOLS_REQUIRE_AUTH": "1"
   },
-  "imageName": "YOUR_REGISTRY/moe-tools-test-suite:IMMUTABLE_TAG",
+  "imageName": "ghcr.io/sampazdan/vllm-moe-tools-suite:0.1.0",
   "isPublic": false,
   "isServerless": false,
   "name": "moe-tools-test-suite-mock",

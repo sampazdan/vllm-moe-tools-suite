@@ -94,6 +94,35 @@ docker buildx build \
   .
 ```
 
+### GitHub Container Registry
+
+The repository workflow at `.github/workflows/publish-container.yml` builds the
+same image natively for `linux/amd64` and publishes it alongside this repository
+as `ghcr.io/sampazdan/vllm-moe-tools-suite`. It checks out the vLLM fork at the
+pinned commit recorded in the workflow and uses GitHub's repository-scoped token;
+no long-lived registry password is required.
+
+Publish either by running **Publish Runpod container** from the GitHub Actions tab
+with an explicit version such as `0.1.0`, or by pushing a semantic tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The versioned image and a commit-addressed image are both produced:
+
+```text
+ghcr.io/sampazdan/vllm-moe-tools-suite:0.1.0
+ghcr.io/sampazdan/vllm-moe-tools-suite:sha-<full-application-commit>
+```
+
+The OCI source label links the package back to this repository. Keep the versioned
+tag in the Runpod template; the SHA tag is useful when an experiment must pin the
+exact application build. If the package is private, add a GitHub classic token with
+`read:packages` to Runpod's Container Registry credentials. Public packages require
+no pull credential.
+
 The image retains the official Runpod `/start.sh`, starts the app on port 8080,
 keeps managed vLLM on loopback port 8000, and writes persistent state under
 `/workspace/moe-tools`. The image defaults to mock mode. In `vllm` mode, a model
@@ -116,7 +145,7 @@ PRO 6000 for the managed-vLLM checkpoint.
 
    ```bash
    export RUNPOD_API_KEY="..."
-   export MOE_TOOLS_IMAGE="YOUR_REGISTRY/moe-tools-test-suite:IMMUTABLE_TAG"
+   export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite:0.1.0"
    ./scripts/create_runpod_template.sh
    ```
 
@@ -145,7 +174,7 @@ immutable image with the managed runtime enabled:
 
 ```bash
 export RUNPOD_API_KEY="..."
-export MOE_TOOLS_IMAGE="YOUR_REGISTRY/moe-tools-test-suite:IMMUTABLE_TAG"
+export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite:0.1.0"
 export MOE_TOOLS_TEMPLATE_MODE="vllm"
 export MOE_TOOLS_TEMPLATE_NAME="moe-tools-test-suite-a3b"
 ./scripts/create_runpod_template.sh
