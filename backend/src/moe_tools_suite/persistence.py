@@ -11,6 +11,8 @@ from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine, ev
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .domain import (
+    BenchmarkCohort,
+    BenchmarkDatasetRecord,
     BenchmarkRun,
     ComparisonRecord,
     ExpertProfile,
@@ -20,6 +22,7 @@ from .domain import (
     ModelState,
     ProfileValidation,
     RoutingSummary,
+    RunProvenance,
     SavedExpertProfile,
 )
 
@@ -68,6 +71,43 @@ class BenchmarkRunRow(Base):
     )
 
 
+class BenchmarkDatasetRow(Base):
+    __tablename__ = "benchmark_datasets"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    info_json: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class BenchmarkCohortRow(Base):
+    __tablename__ = "benchmark_cohorts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    benchmark_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    benchmark_revision: Mapped[str] = mapped_column(String, nullable=False)
+    dataset_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_template_version: Mapped[str] = mapped_column(String, nullable=False)
+    scoring_version: Mapped[str] = mapped_column(String, nullable=False)
+    item_ids_json: Mapped[str] = mapped_column(Text, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    generation_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class RunMetadataRow(Base):
+    __tablename__ = "benchmark_run_metadata"
+
+    run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    cohort_id: Mapped[str | None] = mapped_column(String, index=True)
+    scored_items: Mapped[int] = mapped_column(Integer, nullable=False)
+    provenance_json: Mapped[str | None] = mapped_column(Text)
+
+
 class ExpertProfileRow(Base):
     __tablename__ = "expert_profiles"
 
@@ -111,6 +151,13 @@ class ComparisonRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+
+
+class ComparisonMetadataRow(Base):
+    __tablename__ = "comparison_metadata"
+
+    comparison_id: Mapped[str] = mapped_column(String, primary_key=True)
+    unscored_items: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class JobRow(Base):
@@ -173,9 +220,7 @@ class SqliteStore:
                 row.state = model_session.state.value
                 row.profile_json = profile_json
                 row.updated_at = now
-            profile_link = database.get(
-                ModelSessionProfileRow, model_session.id
-            )
+            profile_link = database.get(ModelSessionProfileRow, model_session.id)
             if model_session.profile_id is not None:
                 if profile_link is None:
                     database.add(
@@ -213,9 +258,7 @@ class SqliteStore:
                 row.model_session_id: row.profile_id
                 for row in database.query(ModelSessionProfileRow)
             }
-            rows = database.query(ModelSessionRow).order_by(
-                ModelSessionRow.created_at
-            )
+            rows = database.query(ModelSessionRow).order_by(ModelSessionRow.created_at)
             for row in rows:
                 profile = (
                     ExpertProfile.model_validate_json(row.profile_json)
@@ -229,6 +272,70 @@ class SqliteStore:
                     mode=row.mode,
                     profile=profile,
                     profile_id=profile_ids.get(row.id),
+                    created_at=_as_utc(row.created_at),
+                )
+        return loaded
+
+    def save_benchmark_dataset(self, dataset: BenchmarkDatasetRecord) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                BenchmarkDatasetRow(
+                    id=dataset.id,
+                    info_json=dataset.info.model_dump_json(),
+                    content_hash=dataset.content_hash,
+                    created_at=dataset.created_at,
+                )
+            )
+
+    def load_benchmark_datasets(self) -> dict[str, BenchmarkDatasetRecord]:
+        loaded: dict[str, BenchmarkDatasetRecord] = {}
+        with self.sessions() as database:
+            rows = database.query(BenchmarkDatasetRow).order_by(
+                BenchmarkDatasetRow.created_at
+            )
+            for row in rows:
+                loaded[row.id] = BenchmarkDatasetRecord(
+                    id=row.id,
+                    info=json.loads(row.info_json),
+                    content_hash=row.content_hash,
+                    created_at=_as_utc(row.created_at),
+                )
+        return loaded
+
+    def save_cohort(self, cohort: BenchmarkCohort) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                BenchmarkCohortRow(
+                    id=cohort.id,
+                    benchmark_id=cohort.benchmark_id,
+                    benchmark_revision=cohort.benchmark_revision,
+                    dataset_content_hash=cohort.dataset_content_hash,
+                    prompt_template_version=cohort.prompt_template_version,
+                    scoring_version=cohort.scoring_version,
+                    item_ids_json=json.dumps(cohort.item_ids, separators=(",", ":")),
+                    fingerprint=cohort.fingerprint,
+                    generation_json=cohort.generation.model_dump_json(),
+                    created_at=cohort.created_at,
+                )
+            )
+
+    def load_cohorts(self) -> dict[str, BenchmarkCohort]:
+        loaded: dict[str, BenchmarkCohort] = {}
+        with self.sessions() as database:
+            rows = database.query(BenchmarkCohortRow).order_by(
+                BenchmarkCohortRow.created_at
+            )
+            for row in rows:
+                loaded[row.id] = BenchmarkCohort(
+                    id=row.id,
+                    benchmark_id=row.benchmark_id,
+                    benchmark_revision=row.benchmark_revision,
+                    dataset_content_hash=row.dataset_content_hash,
+                    prompt_template_version=row.prompt_template_version,
+                    scoring_version=row.scoring_version,
+                    item_ids=json.loads(row.item_ids_json),
+                    fingerprint=row.fingerprint,
+                    generation=json.loads(row.generation_json),
                     created_at=_as_utc(row.created_at),
                 )
         return loaded
@@ -285,7 +392,12 @@ class SqliteStore:
                 loaded[row.id] = (job, json.loads(row.payload_json))
         return loaded
 
-    def save_run(self, run: BenchmarkRun, routing: RoutingSummary) -> None:
+    def save_run(
+        self,
+        run: BenchmarkRun,
+        routing: RoutingSummary,
+        provenance: RunProvenance | None = None,
+    ) -> None:
         relative_artifact = Path("artifacts") / "routing" / f"{run.id}.npz"
         artifact_path = self.data_dir / relative_artifact
         temporary_path = artifact_path.with_name(
@@ -295,9 +407,7 @@ class SqliteStore:
             np.savez_compressed(
                 artifact,
                 layer_ids=np.asarray(routing.layer_ids, dtype=np.int32),
-                selection_counts=np.asarray(
-                    routing.selection_counts, dtype=np.int64
-                ),
+                selection_counts=np.asarray(routing.selection_counts, dtype=np.int64),
                 routing_mass=np.asarray(routing.routing_mass, dtype=np.float64),
                 total_routed_slots=np.asarray(
                     routing.total_routed_slots, dtype=np.int64
@@ -312,7 +422,7 @@ class SqliteStore:
                     benchmark_id=run.benchmark_id,
                     model_session_id=run.model_session_id,
                     status=run.status,
-                    score=run.score,
+                    score=run.score if run.score is not None else -1.0,
                     completed_items=run.completed_items,
                     total_items=run.total_items,
                     items_json=json.dumps(
@@ -323,13 +433,26 @@ class SqliteStore:
                     created_at=run.created_at,
                 )
             )
-
-    def load_runs(self) -> dict[str, tuple[BenchmarkRun, RoutingSummary]]:
-        loaded: dict[str, tuple[BenchmarkRun, RoutingSummary]] = {}
-        with self.sessions() as database:
-            rows = database.query(BenchmarkRunRow).order_by(
-                BenchmarkRunRow.created_at
+            database.merge(
+                RunMetadataRow(
+                    run_id=run.id,
+                    cohort_id=run.cohort_id,
+                    scored_items=run.scored_items,
+                    provenance_json=(
+                        provenance.model_dump_json() if provenance is not None else None
+                    ),
+                )
             )
+
+    def load_runs(
+        self,
+    ) -> dict[str, tuple[BenchmarkRun, RoutingSummary, RunProvenance | None]]:
+        loaded: dict[
+            str, tuple[BenchmarkRun, RoutingSummary, RunProvenance | None]
+        ] = {}
+        with self.sessions() as database:
+            metadata = {row.run_id: row for row in database.query(RunMetadataRow)}
+            rows = database.query(BenchmarkRunRow).order_by(BenchmarkRunRow.created_at)
             for row in rows:
                 artifact_path = self._resolve_artifact(row.routing_artifact)
                 if not artifact_path.is_file():
@@ -342,18 +465,34 @@ class SqliteStore:
                         routing_mass=artifact["routing_mass"].tolist(),
                         total_routed_slots=int(artifact["total_routed_slots"]),
                     )
+                run_metadata = metadata.get(row.id)
+                items = json.loads(row.items_json)
                 run = BenchmarkRun(
                     id=row.id,
                     benchmark_id=row.benchmark_id,
                     model_session_id=row.model_session_id,
                     status=row.status,
-                    score=row.score,
+                    score=row.score if row.score >= 0 else None,
+                    scored_items=(
+                        run_metadata.scored_items
+                        if run_metadata is not None
+                        else sum(item.get("passed") is not None for item in items)
+                    ),
                     completed_items=row.completed_items,
                     total_items=row.total_items,
-                    items=json.loads(row.items_json),
+                    items=items,
+                    cohort_id=(
+                        run_metadata.cohort_id if run_metadata is not None else None
+                    ),
                     created_at=_as_utc(row.created_at),
                 )
-                loaded[row.id] = (run, routing)
+                provenance = (
+                    RunProvenance.model_validate_json(run_metadata.provenance_json)
+                    if run_metadata is not None
+                    and run_metadata.provenance_json is not None
+                    else None
+                )
+                loaded[row.id] = (run, routing, provenance)
         return loaded
 
     def save_expert_profile(self, profile: SavedExpertProfile) -> None:
@@ -416,9 +555,21 @@ class SqliteStore:
                     cohort_item_ids_json=json.dumps(
                         comparison.cohort_item_ids, separators=(",", ":")
                     ),
-                    baseline_score=comparison.baseline_score,
-                    candidate_score=comparison.candidate_score,
-                    score_delta=comparison.score_delta,
+                    baseline_score=(
+                        comparison.baseline_score
+                        if comparison.baseline_score is not None
+                        else -1.0
+                    ),
+                    candidate_score=(
+                        comparison.candidate_score
+                        if comparison.candidate_score is not None
+                        else -1.0
+                    ),
+                    score_delta=(
+                        comparison.score_delta
+                        if comparison.score_delta is not None
+                        else -2.0
+                    ),
                     regressions=comparison.regressions,
                     recoveries=comparison.recoveries,
                     retained_passes=comparison.retained_passes,
@@ -426,13 +577,20 @@ class SqliteStore:
                     created_at=comparison.created_at,
                 )
             )
+            database.merge(
+                ComparisonMetadataRow(
+                    comparison_id=comparison.id,
+                    unscored_items=comparison.unscored_items,
+                )
+            )
 
     def load_comparisons(self) -> dict[str, ComparisonRecord]:
         loaded: dict[str, ComparisonRecord] = {}
         with self.sessions() as database:
-            rows = database.query(ComparisonRow).order_by(
-                ComparisonRow.created_at
-            )
+            metadata = {
+                row.comparison_id: row for row in database.query(ComparisonMetadataRow)
+            }
+            rows = database.query(ComparisonRow).order_by(ComparisonRow.created_at)
             for row in rows:
                 loaded[row.id] = ComparisonRecord(
                     id=row.id,
@@ -443,13 +601,20 @@ class SqliteStore:
                     profile_fingerprint=row.profile_fingerprint,
                     benchmark_id=row.benchmark_id,
                     cohort_item_ids=json.loads(row.cohort_item_ids_json),
-                    baseline_score=row.baseline_score,
-                    candidate_score=row.candidate_score,
-                    score_delta=row.score_delta,
+                    baseline_score=(
+                        row.baseline_score if row.baseline_score >= 0 else None
+                    ),
+                    candidate_score=(
+                        row.candidate_score if row.candidate_score >= 0 else None
+                    ),
+                    score_delta=(row.score_delta if row.score_delta >= -1 else None),
                     regressions=row.regressions,
                     recoveries=row.recoveries,
                     retained_passes=row.retained_passes,
                     retained_failures=row.retained_failures,
+                    unscored_items=(
+                        metadata[row.id].unscored_items if row.id in metadata else 0
+                    ),
                     created_at=_as_utc(row.created_at),
                 )
         return loaded

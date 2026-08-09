@@ -8,7 +8,7 @@ from typing import Protocol
 import httpx
 import numpy as np
 
-from .domain import ExpertProfile, ModelTopology
+from .domain import ExpertProfile, GenerationConfig, ModelTopology
 from .telemetry import DecodedRouting, decode_routing_payloads
 
 
@@ -27,6 +27,7 @@ class ModelRuntime(Protocol):
         *,
         request_key: str,
         profile: ExpertProfile | None,
+        generation: GenerationConfig | None = None,
     ) -> CompletionResult: ...
 
     async def aclose(self) -> None: ...
@@ -44,7 +45,9 @@ class MockModelRuntime:
         *,
         request_key: str,
         profile: ExpertProfile | None,
+        generation: GenerationConfig | None = None,
     ) -> CompletionResult:
+        del generation
         seed = int.from_bytes(
             hashlib.sha256(request_key.encode()).digest()[:8], "little"
         )
@@ -103,23 +106,26 @@ class VllmRuntime:
         *,
         request_key: str,
         profile: ExpertProfile | None,
+        generation: GenerationConfig | None = None,
     ) -> CompletionResult:
         del request_key, profile
+        config = generation or GenerationConfig()
+        request_payload: dict[str, object] = {
+            "model": self._model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
+        }
+        if config.seed is not None:
+            request_payload["seed"] = config.seed
         response = await self._client.post(
             "/v1/chat/completions",
-            json={
-                "model": self._model_id,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
-                "max_tokens": 64,
-            },
+            json=request_payload,
         )
         response.raise_for_status()
         payload = response.json()
         choice = payload["choices"][0]
-        if not choice.get("routed_experts") or not choice.get(
-            "routed_expert_weights"
-        ):
+        if not choice.get("routed_experts") or not choice.get("routed_expert_weights"):
             raise ValueError(
                 "vLLM response omitted routing telemetry; start the fork with "
                 "both routing capture flags"

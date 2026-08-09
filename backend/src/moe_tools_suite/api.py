@@ -1,15 +1,29 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+import csv
+import io
+from datetime import UTC, datetime
+from typing import Annotated, Literal
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
+from fastapi.responses import JSONResponse, Response
 
 from . import __version__
 from .domain import (
+    BenchmarkDatasetRecord,
     BenchmarkInfo,
-    BenchmarkItem,
+    BenchmarkItemPage,
     BenchmarkRun,
     ComparisonRecord,
     CreateComparisonRequest,
+    CreateCustomBenchmarkRequest,
     CreateExpertProfileRequest,
     CreateModelSessionRequest,
     ExpertProfile,
@@ -106,15 +120,66 @@ def list_benchmarks(request: Request) -> list[BenchmarkInfo]:
 
 @router.get(
     "/benchmarks/{benchmark_id}/items",
-    response_model=list[BenchmarkItem],
+    response_model=BenchmarkItemPage,
 )
 def list_benchmark_items(
-    benchmark_id: str, request: Request
-) -> list[BenchmarkItem]:
-    lab = _lab(request)
-    if benchmark_id != "fixture-arithmetic":
-        raise HTTPException(status_code=404, detail="benchmark not found")
-    return lab.items
+    benchmark_id: str,
+    request: Request,
+    search: str = "",
+    category: str | None = None,
+    offset: int = 0,
+    limit: int = 200,
+) -> BenchmarkItemPage:
+    try:
+        return _lab(request).list_benchmark_items(
+            benchmark_id,
+            search=search,
+            category=category,
+            offset=offset,
+            limit=limit,
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="benchmark not found") from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/benchmarks/custom",
+    response_model=BenchmarkDatasetRecord,
+    status_code=status.HTTP_201_CREATED,
+)
+def import_custom_benchmark(
+    payload: CreateCustomBenchmarkRequest,
+    request: Request,
+) -> BenchmarkDatasetRecord:
+    try:
+        return _lab(request).import_custom_benchmark(payload)
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post(
+    "/benchmarks/{benchmark_id}/prepare",
+    response_model=JobRecord,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def prepare_benchmark(
+    benchmark_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JobRecord:
+    try:
+        lab = _lab(request)
+        job = lab.submit_prepare_benchmark(benchmark_id)
+        background_tasks.add_task(lab.execute_job, job.id)
+        return job
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="benchmark not found") from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.post(
@@ -134,6 +199,8 @@ def create_run(
         return job
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="benchmark not found") from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -169,6 +236,77 @@ def get_run_detail(run_id: str, request: Request) -> RunDetail:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
+@router.get("/runs/{run_id}/export", response_model=None)
+def export_run(
+    run_id: str,
+    request: Request,
+    export_format: Annotated[Literal["json", "csv"], Query(alias="format")] = "json",
+) -> JSONResponse | Response:
+    lab = _lab(request)
+    try:
+        detail = lab.get_run_detail(run_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="run not found") from error
+    artifacts = lab.runs[run_id]
+    filename = f"benchmark-run-{run_id}.{export_format}"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if export_format == "json":
+        comparisons = [
+            comparison
+            for comparison in lab.comparisons.values()
+            if run_id in {comparison.baseline_run_id, comparison.candidate_run_id}
+        ]
+        return JSONResponse(
+            content={
+                "schema_version": 1,
+                "exported_at": datetime.now(UTC).isoformat(),
+                "detail": detail.model_dump(mode="json"),
+                "routing": artifacts.routing.model_dump(mode="json"),
+                "comparisons": [
+                    comparison.model_dump(mode="json") for comparison in comparisons
+                ],
+            },
+            headers=headers,
+        )
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "item_id",
+            "passed",
+            "scoring",
+            "latency_ms",
+            "prompt_tokens",
+            "completion_tokens",
+            "error",
+            "prompt",
+            "expected",
+            "output",
+        ]
+    )
+    for item in detail.run.items:
+        writer.writerow(
+            [
+                item.item_id,
+                item.passed,
+                item.scoring.value,
+                item.latency_ms,
+                item.prompt_tokens,
+                item.completion_tokens,
+                item.error or "",
+                item.prompt,
+                item.expected,
+                item.output,
+            ]
+        )
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers=headers,
+    )
+
+
 @router.get("/jobs", response_model=list[JobRecord])
 def list_jobs(request: Request) -> list[JobRecord]:
     return _lab(request).list_jobs()
@@ -180,6 +318,16 @@ def get_job(job_id: str, request: Request) -> JobRecord:
     if artifacts is None:
         raise HTTPException(status_code=404, detail="job not found")
     return artifacts.record
+
+
+@router.post("/jobs/{job_id}/cancel", response_model=JobRecord)
+def cancel_job(job_id: str, request: Request) -> JobRecord:
+    try:
+        return _lab(request).cancel_job(job_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="job not found") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.post("/profiles/validate", response_model=ProfileValidation)
@@ -233,9 +381,7 @@ def get_expert_profile(profile_id: str, request: Request) -> SavedExpertProfile:
 
 
 @router.get("/profiles/{profile_id}/export", response_model=ExpertProfile)
-def export_expert_profile(
-    profile_id: str, request: Request
-) -> JSONResponse:
+def export_expert_profile(profile_id: str, request: Request) -> JSONResponse:
     profile = _lab(request).profiles.get(profile_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="expert profile not found")

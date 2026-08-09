@@ -19,6 +19,7 @@ class ModelState(StrEnum):
 class JobKind(StrEnum):
     MODEL_LOAD = "model_load"
     BENCHMARK_RUN = "benchmark_run"
+    DATASET_PREPARE = "dataset_prepare"
 
 
 class JobStatus(StrEnum):
@@ -175,11 +176,33 @@ class ModelSession(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class BenchmarkKind(StrEnum):
+    FIXTURE = "fixture"
+    STANDARD = "standard"
+    CUSTOM = "custom"
+
+
+class ScoringMode(StrEnum):
+    EXACT = "exact"
+    GSM8K = "gsm8k"
+    REGEX = "regex"
+    CONTAINS = "contains"
+    UNGRADED = "ungraded"
+
+
+class GenerationConfig(BaseModel):
+    temperature: Annotated[float, Field(ge=0, le=2)] = 0
+    max_tokens: Annotated[int, Field(ge=1, le=4096)] = 512
+    seed: int | None = 0
+
+
 class BenchmarkItem(BaseModel):
     id: str
     prompt: str
-    expected: str
+    expected: str = ""
     category: str
+    scoring: ScoringMode = ScoringMode.EXACT
+    metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
 
 
 class BenchmarkInfo(BaseModel):
@@ -188,11 +211,64 @@ class BenchmarkInfo(BaseModel):
     description: str
     item_count: int
     categories: list[str]
+    kind: BenchmarkKind = BenchmarkKind.FIXTURE
+    source: str = "local"
+    revision: str = "fixture-v1"
+    split: str = "fixture"
+    license: str = "internal"
+    ready: bool = True
+    scoring: ScoringMode = ScoringMode.EXACT
+    prompt_template_version: str = "v1"
+    default_generation: GenerationConfig = Field(default_factory=GenerationConfig)
+
+
+class BenchmarkItemPage(BaseModel):
+    benchmark: BenchmarkInfo
+    items: list[BenchmarkItem]
+    total: int
+    offset: int
+    limit: int
+    categories: list[str]
+
+
+class CreateCustomBenchmarkRequest(BaseModel):
+    name: Annotated[str, Field(min_length=1, max_length=120)]
+    description: Annotated[str, Field(max_length=1000)] = ""
+    content: Annotated[str, Field(min_length=1, max_length=5_000_000)]
+
+    @field_validator("name")
+    @classmethod
+    def normalize_dataset_name(cls, name: str) -> str:
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("name cannot be blank")
+        return normalized
+
+
+class BenchmarkDatasetRecord(BaseModel):
+    id: str
+    info: BenchmarkInfo
+    content_hash: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class BenchmarkCohort(BaseModel):
+    id: str
+    benchmark_id: str
+    benchmark_revision: str
+    dataset_content_hash: str
+    prompt_template_version: str
+    scoring_version: str
+    item_ids: list[str]
+    fingerprint: str
+    generation: GenerationConfig
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class RunRequest(BaseModel):
     benchmark_id: str = "fixture-arithmetic"
     item_ids: list[str] | None = None
+    generation: GenerationConfig | None = None
 
 
 class RunItemResult(BaseModel):
@@ -200,7 +276,9 @@ class RunItemResult(BaseModel):
     prompt: str
     expected: str
     output: str
-    passed: bool
+    passed: bool | None
+    scoring: ScoringMode = ScoringMode.EXACT
+    error: str | None = None
     latency_ms: float
     prompt_tokens: int
     completion_tokens: int
@@ -211,17 +289,38 @@ class BenchmarkRun(BaseModel):
     benchmark_id: str
     model_session_id: str
     status: Literal["queued", "running", "completed", "failed", "cancelled"]
-    score: float
+    score: float | None
+    scored_items: int = 0
     completed_items: int
     total_items: int
     items: list[RunItemResult]
+    cohort_id: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class RunProvenance(BaseModel):
+    run_id: str
+    cohort_id: str
+    cohort_fingerprint: str
+    model_id: str
+    model_session_id: str
+    profile_id: str | None = None
+    profile_fingerprint: str | None = None
+    benchmark_id: str
+    benchmark_revision: str
+    dataset_content_hash: str
+    prompt_template_version: str
+    scoring_version: str
+    generation: GenerationConfig
+    app_version: str
 
 
 class RunDetail(BaseModel):
     run: BenchmarkRun
     model_session: ModelSession
     saved_profile: SavedExpertProfile | None = None
+    cohort: BenchmarkCohort | None = None
+    provenance: RunProvenance | None = None
 
 
 class CreateComparisonRequest(BaseModel):
@@ -246,13 +345,14 @@ class ComparisonRecord(BaseModel):
     profile_fingerprint: str
     benchmark_id: str
     cohort_item_ids: list[str]
-    baseline_score: float
-    candidate_score: float
-    score_delta: float
+    baseline_score: float | None
+    candidate_score: float | None
+    score_delta: float | None
     regressions: int
     recoveries: int
     retained_passes: int
     retained_failures: int
+    unscored_items: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 

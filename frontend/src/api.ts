@@ -51,8 +51,8 @@ export async function waitForJob(
     job = await api<JobRecord>(`/api/jobs/${job.id}`);
     onProgress?.(job);
   }
-  if (job.status !== "completed") {
-    throw new Error(job.error ?? `Job ${job.status}`);
+  if (job.status === "completed" || (job.status === "cancelled" && job.result_id)) {
+    return job;
   }
-  return job;
+  throw new Error(job.error ?? `Job ${job.status}`);
 }

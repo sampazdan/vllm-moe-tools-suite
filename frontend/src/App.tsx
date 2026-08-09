@@ -1,12 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { api, setCsrfToken, waitForJob } from "./api";
 import { ExpertHeatmap } from "./ExpertHeatmap";
 import { ResearchArchive } from "./ResearchArchive";
 import type {
+  BenchmarkDatasetRecord,
   BenchmarkInfo,
-  BenchmarkItem,
+  BenchmarkItemPage,
   BenchmarkRun,
   ComparisonRecord,
   CreateExpertProfileRequest,
@@ -25,6 +26,13 @@ const modelId = "Qwen/Qwen3.6-35B-A3B-FP8";
 
 export default function App() {
   const queryClient = useQueryClient();
+  const customBenchmarkInput = useRef<HTMLInputElement>(null);
+  const initializedSelection = useRef<string | null>(null);
+  const [selectedBenchmarkId, setSelectedBenchmarkId] = useState(
+    "fixture-arithmetic",
+  );
+  const [benchmarkSearch, setBenchmarkSearch] = useState("");
+  const [itemOffset, setItemOffset] = useState(0);
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
   const [baselineRun, setBaselineRun] = useState<BenchmarkRun | null>(null);
   const [maskedRun, setMaskedRun] = useState<BenchmarkRun | null>(null);
@@ -75,11 +83,27 @@ export default function App() {
     queryFn: () => api<BenchmarkInfo[]>("/api/benchmarks"),
     enabled: accessReady,
   });
+  const selectedBenchmark = benchmarksQuery.data?.find(
+    (benchmark) => benchmark.id === selectedBenchmarkId,
+  );
   const itemsQuery = useQuery({
-    queryKey: ["benchmark-items"],
-    queryFn: () =>
-      api<BenchmarkItem[]>("/api/benchmarks/fixture-arithmetic/items"),
-    enabled: accessReady,
+    queryKey: [
+      "benchmark-items",
+      selectedBenchmarkId,
+      benchmarkSearch,
+      itemOffset,
+    ],
+    queryFn: () => {
+      const params = new URLSearchParams({
+        offset: String(itemOffset),
+        limit: "100",
+      });
+      if (benchmarkSearch.trim()) params.set("search", benchmarkSearch.trim());
+      return api<BenchmarkItemPage>(
+        `/api/benchmarks/${encodeURIComponent(selectedBenchmarkId)}/items?${params}`,
+      );
+    },
+    enabled: accessReady && selectedBenchmark?.ready === true,
   });
   const runsQuery = useQuery({
     queryKey: ["runs"],
@@ -114,10 +138,16 @@ export default function App() {
   }, [sessionQuery.data]);
 
   useEffect(() => {
-    if (itemsQuery.data && selectedItems.size === 0) {
-      setSelectedItems(new Set(itemsQuery.data.map((item) => item.id)));
+    if (
+      itemsQuery.data &&
+      initializedSelection.current !== selectedBenchmarkId
+    ) {
+      setSelectedItems(
+        new Set(itemsQuery.data.items.map((item) => item.id)),
+      );
+      initializedSelection.current = selectedBenchmarkId;
     }
-  }, [itemsQuery.data, selectedItems.size]);
+  }, [itemsQuery.data, selectedBenchmarkId]);
 
   const loadModel = useMutation({
     mutationFn: async () => {
@@ -149,12 +179,64 @@ export default function App() {
     },
   });
 
+  const prepareBenchmark = useMutation({
+    mutationFn: async () => {
+      const submitted = await api<JobRecord>(
+        `/api/benchmarks/${encodeURIComponent(selectedBenchmarkId)}/prepare`,
+        { method: "POST" },
+      );
+      return waitForJob(submitted, setActiveJob);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["benchmarks"] });
+      queryClient.invalidateQueries({ queryKey: ["benchmark-items"] });
+    },
+    onSettled: () => setActiveJob(null),
+  });
+
+  const importCustomBenchmark = useMutation({
+    mutationFn: async (file: File) => {
+      const content = await file.text();
+      const name = file.name.replace(/\.jsonl$/i, "").trim() || "Custom benchmark";
+      return api<BenchmarkDatasetRecord>("/api/benchmarks/custom", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          description: `Imported from ${file.name}`,
+          content,
+        }),
+      });
+    },
+    onSuccess: (record) => {
+      initializedSelection.current = null;
+      setSelectedItems(new Set());
+      setSelectedBenchmarkId(record.id);
+      setBenchmarkSearch("");
+      setItemOffset(0);
+      setBaselineRun(null);
+      setMaskedRun(null);
+      setProposal(null);
+      queryClient.invalidateQueries({ queryKey: ["benchmarks"] });
+    },
+    onSettled: () => {
+      if (customBenchmarkInput.current) {
+        customBenchmarkInput.current.value = "";
+      }
+    },
+  });
+
+  const cancelActiveJob = useMutation({
+    mutationFn: (jobId: string) =>
+      api<JobRecord>(`/api/jobs/${jobId}/cancel`, { method: "POST" }),
+    onSuccess: (job) => setActiveJob(job),
+  });
+
   const runBaseline = useMutation({
     mutationFn: async () => {
       const submitted = await api<JobRecord>("/api/runs", {
         method: "POST",
         body: JSON.stringify({
-          benchmark_id: "fixture-arithmetic",
+          benchmark_id: selectedBenchmarkId,
           item_ids: [...selectedItems],
         }),
       });
@@ -256,7 +338,10 @@ export default function App() {
       setMaskedRun(nextRun);
       setRoutingVariant("masked");
       queryClient.invalidateQueries({ queryKey: ["runs"] });
-      if (baselineRun) {
+      if (
+        baselineRun?.status === "completed" &&
+        nextRun.status === "completed"
+      ) {
         createComparison.mutate({ baseline: baselineRun, candidate: nextRun });
       }
     },
@@ -264,9 +349,12 @@ export default function App() {
   });
 
   const model = modelsQuery.data?.[0];
-  const benchmark = benchmarksQuery.data?.[0];
+  const benchmark = selectedBenchmark;
+  const visibleItems = itemsQuery.data?.items ?? [];
   const selectedCount = selectedItems.size;
-  const allSelected = selectedCount === itemsQuery.data?.length;
+  const allVisibleSelected =
+    visibleItems.length > 0 &&
+    visibleItems.every((item) => selectedItems.has(item.id));
   const currentProfile = currentModelQuery.data?.profile ?? null;
   const profiles = profilesQuery.data ?? [];
   const savedProposal = proposal
@@ -294,11 +382,15 @@ export default function App() {
     runtimeQuery.error ||
     currentModelQuery.error ||
     modelsQuery.error ||
+    benchmarksQuery.error ||
     itemsQuery.error ||
     runsQuery.error ||
     modelSessionsQuery.error ||
     profilesQuery.error ||
     comparisonsQuery.error ||
+    prepareBenchmark.error ||
+    importCustomBenchmark.error ||
+    cancelActiveJob.error ||
     loadModel.error ||
     runBaseline.error ||
     proposeProfile.error ||
@@ -308,7 +400,7 @@ export default function App() {
     createComparison.error;
   const selectedCategories = useMemo(() => {
     if (!itemsQuery.data) return [];
-    return [...new Set(itemsQuery.data.map((item) => item.category))];
+    return itemsQuery.data.categories;
   }, [itemsQuery.data]);
   const comparisonRows = useMemo(() => {
     if (!baselineRun || !maskedRun) return [];
@@ -320,6 +412,10 @@ export default function App() {
       masked: maskedItems.get(baseline.item_id),
     }));
   }, [baselineRun, maskedRun]);
+  const pairedScoreDelta =
+    baselineRun?.score != null && maskedRun?.score != null
+      ? maskedRun.score - baselineRun.score
+      : null;
 
   if (sessionQuery.isPending) {
     return <div className="app-loading">Preparing the workbench…</div>;
@@ -342,6 +438,29 @@ export default function App() {
       const next = new Set(current);
       if (next.has(itemId)) next.delete(itemId);
       else next.add(itemId);
+      return next;
+    });
+  }
+
+  function chooseBenchmark(benchmarkId: string) {
+    initializedSelection.current = null;
+    setSelectedBenchmarkId(benchmarkId);
+    setSelectedItems(new Set());
+    setBenchmarkSearch("");
+    setItemOffset(0);
+    setBaselineRun(null);
+    setMaskedRun(null);
+    setProposal(null);
+    setRoutingVariant("baseline");
+  }
+
+  function toggleVisibleItems() {
+    setSelectedItems((current) => {
+      const next = new Set(current);
+      for (const item of visibleItems) {
+        if (allVisibleSelected) next.delete(item.id);
+        else next.add(item.id);
+      }
       return next;
     });
   }
@@ -397,10 +516,18 @@ export default function App() {
           <div className="job-banner" role="status" aria-live="polite">
             <div>
               <span className="section-label">
-                {activeJob.kind === "model_load" ? "Model job" : "Benchmark job"}
+                {activeJob.kind === "model_load"
+                  ? "Model job"
+                  : activeJob.kind === "dataset_prepare"
+                    ? "Dataset job"
+                    : "Benchmark job"}
               </span>
               <strong>
-                {activeJob.status === "queued" ? "Queued" : "Working"}
+                {activeJob.status === "queued"
+                  ? "Queued"
+                  : activeJob.status === "cancelled"
+                    ? "Cancelled"
+                    : "Working"}
               </strong>
             </div>
             <progress
@@ -408,8 +535,18 @@ export default function App() {
               value={activeJob.progress_current}
             />
             <span>
-              {activeJob.progress_current}/{activeJob.progress_total}
+              {formatProgress(activeJob)}
             </span>
+            {activeJob.kind !== "model_load" &&
+              (activeJob.status === "queued" || activeJob.status === "running") && (
+                <button
+                  className="text-button"
+                  disabled={cancelActiveJob.isPending}
+                  onClick={() => cancelActiveJob.mutate(activeJob.id)}
+                >
+                  {cancelActiveJob.isPending ? "Cancelling…" : "Cancel"}
+                </button>
+              )}
           </div>
         )}
 
@@ -465,63 +602,148 @@ export default function App() {
                 <span className="section-label">02 · Baseline</span>
                 <h2>{benchmark?.name ?? "Benchmark fixture"}</h2>
               </div>
-              <span className="count-badge">{selectedCount}/{itemsQuery.data?.length ?? 0}</span>
+              <span className="count-badge">
+                {selectedCount}/{benchmark?.item_count ?? 0}
+              </span>
             </div>
+            <label className="benchmark-select">
+              Benchmark dataset
+              <select
+                value={selectedBenchmarkId}
+                onChange={(event) => chooseBenchmark(event.target.value)}
+              >
+                {benchmarksQuery.data?.map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.name}{candidate.ready ? "" : " · prepare first"}
+                  </option>
+                ))}
+              </select>
+            </label>
             <p>{benchmark?.description}</p>
+            {benchmark && (
+              <div className="dataset-meta">
+                <span>{benchmark.kind}</span>
+                <span>{benchmark.split}</span>
+                <span>{benchmark.license}</span>
+                <span title={benchmark.revision}>
+                  rev {benchmark.revision.slice(0, 10)}
+                </span>
+              </div>
+            )}
             <div className="tag-row">
               {selectedCategories.map((category) => (
                 <span className="tag" key={category}>{category}</span>
               ))}
             </div>
+            <input
+              ref={customBenchmarkInput}
+              type="file"
+              accept="application/jsonl,.jsonl"
+              aria-label="Import custom benchmark JSONL"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) importCustomBenchmark.mutate(file);
+              }}
+              hidden
+            />
             <div className="benchmark-actions">
               <button
                 className="text-button"
-                onClick={() =>
-                  setSelectedItems(
-                    allSelected
-                      ? new Set()
-                      : new Set(itemsQuery.data?.map((item) => item.id)),
-                  )
-                }
+                disabled={importCustomBenchmark.isPending || Boolean(activeJob)}
+                onClick={() => customBenchmarkInput.current?.click()}
               >
-                {allSelected ? "Clear selection" : "Select all"}
+                {importCustomBenchmark.isPending ? "Importing…" : "Import JSONL"}
               </button>
-              <button
-                className="primary-button"
-                disabled={
-                  statusQuery.data?.model_state !== "ready" ||
-                  currentProfile !== null ||
-                  currentModelQuery.isPending ||
-                  selectedCount === 0 ||
-                  runBaseline.isPending ||
-                  Boolean(activeJob)
-                }
-                onClick={() => runBaseline.mutate()}
-              >
-                {runBaseline.isPending ? "Running…" : "Run baseline"}
-              </button>
+              {benchmark?.ready ? (
+                <button
+                  className="primary-button"
+                  disabled={
+                    statusQuery.data?.model_state !== "ready" ||
+                    currentProfile !== null ||
+                    currentModelQuery.isPending ||
+                    selectedCount === 0 ||
+                    runBaseline.isPending ||
+                    Boolean(activeJob)
+                  }
+                  onClick={() => runBaseline.mutate()}
+                >
+                  {runBaseline.isPending ? "Running…" : "Run baseline"}
+                </button>
+              ) : (
+                <button
+                  className="primary-button"
+                  disabled={prepareBenchmark.isPending || Boolean(activeJob)}
+                  onClick={() => prepareBenchmark.mutate()}
+                >
+                  {prepareBenchmark.isPending ? "Preparing…" : "Prepare dataset"}
+                </button>
+              )}
             </div>
           </article>
         </section>
 
-        <details className="item-drawer">
-          <summary>Choose benchmark items <span>{selectedCount} selected</span></summary>
-          <div className="item-list">
-            {itemsQuery.data?.map((item) => (
-              <label className="item-row" key={item.id}>
-                <input
-                  type="checkbox"
-                  checked={selectedItems.has(item.id)}
-                  onChange={() => toggleItem(item.id)}
-                />
-                <span className="item-copy">
-                  <strong>{item.prompt}</strong>
-                  <small>{item.category} · expected {item.expected}</small>
-                </span>
-              </label>
-            ))}
-          </div>
-        </details>
+        {benchmark?.ready && (
+          <details className="item-drawer">
+            <summary>
+              Choose benchmark items <span>{selectedCount} selected</span>
+            </summary>
+            <div className="item-toolbar">
+              <input
+                type="search"
+                value={benchmarkSearch}
+                placeholder="Search prompts, categories, or item IDs"
+                aria-label="Search benchmark items"
+                onChange={(event) => {
+                  setBenchmarkSearch(event.target.value);
+                  setItemOffset(0);
+                }}
+              />
+              <button className="text-button" onClick={toggleVisibleItems}>
+                {allVisibleSelected ? "Clear page" : "Select page"}
+              </button>
+              <span>
+                {itemsQuery.data?.total
+                  ? `${itemOffset + 1}–${Math.min(itemOffset + visibleItems.length, itemsQuery.data.total)} of ${itemsQuery.data.total}`
+                  : "No matching items"}
+              </span>
+              <button
+                className="text-button"
+                disabled={itemOffset === 0}
+                onClick={() => setItemOffset(Math.max(0, itemOffset - 100))}
+              >
+                Previous
+              </button>
+              <button
+                className="text-button"
+                disabled={
+                  !itemsQuery.data ||
+                  itemOffset + itemsQuery.data.limit >= itemsQuery.data.total
+                }
+                onClick={() => setItemOffset(itemOffset + 100)}
+              >
+                Next
+              </button>
+            </div>
+            <div className="item-list">
+              {visibleItems.map((item) => (
+                <label className="item-row" key={item.id}>
+                  <input
+                    type="checkbox"
+                    checked={selectedItems.has(item.id)}
+                    onChange={() => toggleItem(item.id)}
+                  />
+                  <span className="item-copy">
+                    <strong>{item.prompt}</strong>
+                    <small>
+                      {item.category} · {item.scoring}
+                      {item.expected ? ` · expected ${item.expected}` : ""}
+                    </small>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </details>
+        )}
 
         {routingRun && (
           <section className="run-summary">
@@ -529,26 +751,37 @@ export default function App() {
               <span className="section-label">
                 {routingVariant === "masked" ? "Masked run" : "Baseline run"}
               </span>
-              <h2>{Math.round(routingRun.score * 100)}% passed</h2>
+              <h2>{formatScore(routingRun.score)}</h2>
               <p>
-                {routingRun.completed_items} items completed with routing capture.
+                {routingRun.completed_items}/{routingRun.total_items} items captured
+                {routingRun.status === "cancelled" ? " before cancellation" : ""}.
               </p>
+              <div className="run-export-links">
+                <a href={`/api/runs/${routingRun.id}/export?format=json`} download>
+                  Export JSON
+                </a>
+                <a href={`/api/runs/${routingRun.id}/export?format=csv`} download>
+                  Export CSV
+                </a>
+              </div>
             </div>
             <div
               className="score-ring"
               style={
-                { "--score": `${routingRun.score * 360}deg` } as React.CSSProperties
+                {
+                  "--score": `${(routingRun.score ?? 0) * 360}deg`,
+                } as React.CSSProperties
               }
             >
               <span>{routingRun.completed_items}/{routingRun.total_items}</span>
             </div>
             <div className="transition-list">
               {routingRun.items
-                .filter((item) => !item.passed)
+                .filter((item) => item.passed === false)
                 .map((item) => (
                   <div key={item.item_id}>
                     <span>{item.item_id}</span>
-                    <strong>{item.output}</strong>
+                    <strong>{item.error ?? item.output}</strong>
                     <small>expected {item.expected}</small>
                   </div>
                 ))}
@@ -676,7 +909,11 @@ export default function App() {
                   ) : profileMatchesProposal ? (
                     <button
                       className="primary-button"
-                      disabled={runMasked.isPending || Boolean(activeJob)}
+                      disabled={
+                        baselineRun?.status !== "completed" ||
+                        runMasked.isPending ||
+                        Boolean(activeJob)
+                      }
                       onClick={() => runMasked.mutate()}
                     >
                       {runMasked.isPending
@@ -720,19 +957,21 @@ export default function App() {
             <div className="comparison-metrics">
               <CompareMetric
                 label="Baseline score"
-                value={`${Math.round(baselineRun.score * 100)}%`}
+                value={formatScore(baselineRun.score, false)}
               />
               <CompareMetric
                 label="Masked score"
-                value={`${Math.round(maskedRun.score * 100)}%`}
+                value={formatScore(maskedRun.score, false)}
               />
               <CompareMetric
                 label="Score delta"
-                value={`${maskedRun.score - baselineRun.score >= 0 ? "+" : ""}${Math.round((maskedRun.score - baselineRun.score) * 100)} pp`}
+                value={formatDelta(pairedScoreDelta)}
                 tone={
-                  maskedRun.score < baselineRun.score
+                  pairedScoreDelta == null
+                    ? "neutral"
+                    : pairedScoreDelta < 0
                     ? "negative"
-                    : maskedRun.score > baselineRun.score
+                    : pairedScoreDelta > 0
                       ? "positive"
                       : "neutral"
                 }
@@ -741,12 +980,14 @@ export default function App() {
                 label="Regressions"
                 value={String(
                   comparisonRows.filter(
-                    ({ baseline, masked }) => baseline.passed && !masked?.passed,
+                    ({ baseline, masked }) =>
+                      baseline.passed === true && masked?.passed === false,
                   ).length,
                 )}
                 tone={
                   comparisonRows.some(
-                    ({ baseline, masked }) => baseline.passed && !masked?.passed,
+                    ({ baseline, masked }) =>
+                      baseline.passed === true && masked?.passed === false,
                   )
                     ? "negative"
                     : "neutral"
@@ -767,6 +1008,8 @@ export default function App() {
                   {comparisonRows.map(({ baseline, masked }) => {
                     const transition = !masked
                       ? "missing"
+                      : baseline.passed == null || masked.passed == null
+                        ? "unscored"
                       : baseline.passed === masked.passed
                         ? baseline.passed
                           ? "retained"
@@ -781,13 +1024,13 @@ export default function App() {
                           <small>{baseline.prompt}</small>
                         </td>
                         <td
-                          className={baseline.passed ? "pass" : "fail"}
+                          className={resultClass(baseline.passed)}
                           data-label="Baseline"
                         >
                           {baseline.output}
                         </td>
                         <td
-                          className={masked?.passed ? "pass" : "fail"}
+                          className={resultClass(masked?.passed)}
                           data-label="Masked"
                         >
                           {masked?.output ?? "—"}
@@ -918,6 +1161,33 @@ function Fact({ value, label }: { value: string | number; label: string }) {
       <span>{label}</span>
     </div>
   );
+}
+
+function formatScore(score: number | null, includeLabel = true) {
+  if (score == null) return "Unscored";
+  const value = `${Math.round(score * 100)}%`;
+  return includeLabel ? `${value} passed` : value;
+}
+
+function formatDelta(delta: number | null) {
+  if (delta == null) return "—";
+  return `${delta >= 0 ? "+" : ""}${Math.round(delta * 100)} pp`;
+}
+
+function resultClass(value: boolean | null | undefined) {
+  return value == null ? "unscored" : value ? "pass" : "fail";
+}
+
+function formatProgress(job: JobRecord) {
+  if (job.kind !== "dataset_prepare") {
+    return `${job.progress_current}/${job.progress_total}`;
+  }
+  return `${formatBytes(job.progress_current)} / ${formatBytes(job.progress_total)}`;
+}
+
+function formatBytes(value: number) {
+  if (value < 1_000) return `${value} B`;
+  return `${(value / 1_000).toFixed(value < 100_000 ? 1 : 0)} kB`;
 }
 
 function CompareMetric({

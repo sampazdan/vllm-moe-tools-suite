@@ -14,7 +14,33 @@ fingerprinted profile revisions and strict paired comparisons. Profiles can be
 imported/exported in the fork's version 1 JSON format and revised with a per-layer
 manual expert editor.
 
+The benchmark workspace now has an adapter boundary for dataset loading, prompting,
+scoring, and generation defaults. It includes the deterministic fixture, the pinned
+[official GSM8K test split](https://github.com/openai/grade-school-math)
+(downloaded once and verified by size and SHA-256), and
+validated custom JSONL imports with exact, contains, regex, or ungraded scoring.
+Benchmark cohorts are immutable and fingerprint the dataset revision, selected item
+order, prompt/scorer versions, and generation settings. Runs support cooperative
+cancellation, per-item failures, provenance-rich restart recovery, and JSON or CSV
+exports. This one-request adapter layer is also the storage and reporting foundation
+for the later Harbor/Daytona agentic-coding runner; it does not execute generated
+code inside the application container.
+
 See [ROADMAP.md](ROADMAP.md) for the complete product and agentic-coding plan.
+
+## Custom benchmark JSONL
+
+Use **Import JSONL** in the benchmark card. Each non-empty line must be one object:
+
+```json
+{"id":"sum-1","prompt":"Return only the result of 2 + 2.","expected":"4","category":"smoke","scoring":"exact"}
+{"id":"workflow-1","prompt":"Inspect the repository and propose a fix.","category":"agentic","scoring":"ungraded","metadata":{"harness":"daytona"}}
+```
+
+`id` and `category` are optional; `prompt` is required. Graded items also require
+`expected`. Supported scorers are `exact`, `contains`, `regex`, and `ungraded`.
+Imports are content-addressed, validated before being stored, and limited to 2 MB
+by default (`MOE_TOOLS_MAX_CUSTOM_DATASET_BYTES`).
 
 ## Local development
 

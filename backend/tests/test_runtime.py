@@ -1,7 +1,9 @@
+import json
+
 import httpx
 import numpy as np
 import pytest
-from moe_tools_suite.domain import ModelTopology
+from moe_tools_suite.domain import GenerationConfig, ModelTopology
 from moe_tools_suite.runtime import VllmRuntime
 from moe_tools_suite.telemetry import encode_npy
 
@@ -19,6 +21,10 @@ async def test_vllm_runtime_reads_custom_choice_telemetry() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/chat/completions"
+        payload = json.loads(request.content)
+        assert payload["temperature"] == 0.25
+        assert payload["max_tokens"] == 321
+        assert payload["seed"] == 7
         return httpx.Response(
             200,
             json={
@@ -39,7 +45,14 @@ async def test_vllm_runtime_reads_custom_choice_telemetry() -> None:
     runtime = VllmRuntime("http://vllm", "model", topology, client=client)
 
     result = await runtime.complete(
-        "12 + 7", request_key="ignored", profile=None
+        "12 + 7",
+        request_key="ignored",
+        profile=None,
+        generation=GenerationConfig(
+            temperature=0.25,
+            max_tokens=321,
+            seed=7,
+        ),
     )
 
     assert result.content == "19"

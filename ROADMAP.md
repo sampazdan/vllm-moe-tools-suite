@@ -1,15 +1,15 @@
 # MoE Tools Test Suite Roadmap
 
-Status: planning document, updated 2026-08-08
+Status: active implementation plan, updated 2026-08-09
 
-Implementation status as of 2026-08-08:
+Implementation status as of 2026-08-09:
 
 - **Milestone 0 complete:** the repository now contains a tested FastAPI backend,
   fork-compatible telemetry decoder/aggregator and profile validator, deterministic
   A3B mock runtime, selectable fixture benchmark, responsive React application,
   40-by-256 engagement heatmap, fixed-budget profile proposal, and Runpod-aware
   Dockerfile skeleton.
-- **Verified locally:** 19 backend tests, Ruff, the production TypeScript/Vite build,
+- **Verified locally:** 27 backend tests, Ruff, the production TypeScript/Vite build,
   authenticated base-to-mask workflows in desktop and 390-pixel browser layouts,
   shell/JSON startup syntax, and Docker Buildx static validation all pass.
 - **Milestone 1 implemented locally:** single-user token sessions and CSRF,
@@ -21,6 +21,13 @@ Implementation status as of 2026-08-08:
   immutable, fingerprinted, revision-linked, importable/exportable, and persisted.
   Manual per-layer expert overrides, strict same-cohort comparisons, run/profile
   provenance, and restart-safe archive views now work on desktop and phone.
+- **Benchmark engine implemented locally:** adapter-owned dataset loading, prompt
+  rendering, scoring, and generation defaults now support the arithmetic fixture,
+  a checksum-verified pinned GSM8K test split, and validated custom JSONL. Runs use
+  immutable cohort fingerprints covering dataset, item order, prompt, scorer, and
+  generation settings; item errors, ungraded results, cancellation, and JSON/CSV
+  exports are first-class. Standard dataset files and custom imports persist on the
+  mounted volume.
 - **Next acceptance checkpoint:** build and push one immutable image, smoke-test the
   mock appliance through Runpod's HTTPS proxy, then validate managed A3B load,
   telemetry, profile restart, and paired rerun on the target RTX PRO 6000.
@@ -32,12 +39,12 @@ Approximate milestone accounting (local implementation, not production readiness
 | 0 · Local skeleton | 90% | CI and frontend automation |
 | 1 · Runpod appliance | 85% | Real proxy/volume acceptance |
 | 2 · Model lifecycle | 55% | Real topology, chat, stop/cancel, GPU acceptance |
-| 3 · Benchmark engine | 45% | GSM8K, Custom JSONL, richer provenance/export |
+| 3 · Benchmark engine | 78% | More standard adapters and automated frontend tests |
 | 4 · Profile lab | 60% | Undo/redo and additional assisted strategies |
 | 5 · Masked comparison | 65% | Routing redistribution, reports, performance mode |
 | 6–8 · Agentic/breadth | 0–5% | Harbor/Daytona and real benchmark adapters |
 
-The interactive MVP surface is roughly 55% implemented. The production-validated
+The interactive MVP surface is roughly 65% implemented. The production-validated
 system is closer to one third complete because the container and managed fork have
 not yet crossed the real Runpod/GPU acceptance checkpoints.
 
@@ -210,8 +217,10 @@ single-Pod appliance. The database will use a rollback journal on the network vo
 unless a target-filesystem test proves WAL locking is safe; SQLite WAL is not assumed
 safe on network filesystems. Large artifacts will be files, not database blobs.
 
-**Frontend:** React, TypeScript, Vite, Tailwind CSS, Radix primitives, TanStack Query,
-and Apache ECharts.
+**Frontend:** React, TypeScript, Vite, TanStack Query, Apache ECharts, and a
+purpose-built responsive CSS system. Native controls cover the current interaction
+set; accessible headless primitives can be added when dialogs and complex overlays
+arrive.
 
 ECharts will render the 40-by-256 expert matrix on canvas, with zoom, filtering,
 tooltips, selection, and mobile support. The production frontend will compile to

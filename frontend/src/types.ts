@@ -31,7 +31,7 @@ export interface SessionStatus {
   expires_at: string | null;
 }
 
-export type JobKind = "model_load" | "benchmark_run";
+export type JobKind = "model_load" | "benchmark_run" | "dataset_prepare";
 export type JobStatus =
   | "queued"
   | "running"
@@ -78,12 +78,35 @@ export interface ModelSession {
   created_at: string;
 }
 
+export type BenchmarkKind = "fixture" | "standard" | "custom";
+export type ScoringMode =
+  | "exact"
+  | "gsm8k"
+  | "regex"
+  | "contains"
+  | "ungraded";
+
+export interface GenerationConfig {
+  temperature: number;
+  max_tokens: number;
+  seed: number | null;
+}
+
 export interface BenchmarkInfo {
   id: string;
   name: string;
   description: string;
   item_count: number;
   categories: string[];
+  kind: BenchmarkKind;
+  source: string;
+  revision: string;
+  split: string;
+  license: string;
+  ready: boolean;
+  scoring: ScoringMode;
+  prompt_template_version: string;
+  default_generation: GenerationConfig;
 }
 
 export interface BenchmarkItem {
@@ -91,6 +114,24 @@ export interface BenchmarkItem {
   prompt: string;
   expected: string;
   category: string;
+  scoring: ScoringMode;
+  metadata: Record<string, string | number | boolean | null>;
+}
+
+export interface BenchmarkItemPage {
+  benchmark: BenchmarkInfo;
+  items: BenchmarkItem[];
+  total: number;
+  offset: number;
+  limit: number;
+  categories: string[];
+}
+
+export interface BenchmarkDatasetRecord {
+  id: string;
+  info: BenchmarkInfo;
+  content_hash: string;
+  created_at: string;
 }
 
 export interface RunItemResult {
@@ -98,7 +139,9 @@ export interface RunItemResult {
   prompt: string;
   expected: string;
   output: string;
-  passed: boolean;
+  passed: boolean | null;
+  scoring: ScoringMode;
+  error: string | null;
   latency_ms: number;
   prompt_tokens: number;
   completion_tokens: number;
@@ -109,10 +152,12 @@ export interface BenchmarkRun {
   benchmark_id: string;
   model_session_id: string;
   status: string;
-  score: number;
+  score: number | null;
+  scored_items: number;
   completed_items: number;
   total_items: number;
   items: RunItemResult[];
+  cohort_id: string | null;
   created_at: string;
 }
 
@@ -182,12 +227,13 @@ export interface ComparisonRecord {
   profile_fingerprint: string;
   benchmark_id: string;
   cohort_item_ids: string[];
-  baseline_score: number;
-  candidate_score: number;
-  score_delta: number;
+  baseline_score: number | null;
+  candidate_score: number | null;
+  score_delta: number | null;
   regressions: number;
   recoveries: number;
   retained_passes: number;
   retained_failures: number;
+  unscored_items: number;
   created_at: string;
 }

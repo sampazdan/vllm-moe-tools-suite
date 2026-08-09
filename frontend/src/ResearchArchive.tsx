@@ -63,8 +63,12 @@ export function ResearchArchive({
       const session = sessionById.get(run.model_session_id);
       return (
         !session?.profile &&
+        run.status === "completed" &&
+        candidate.status === "completed" &&
         run.benchmark_id === candidate.benchmark_id &&
-        run.items.map((item) => item.item_id).join("\0") === candidateIds
+        (run.cohort_id && candidate.cohort_id
+          ? run.cohort_id === candidate.cohort_id
+          : run.items.map((item) => item.item_id).join("\0") === candidateIds)
       );
     });
   }
@@ -153,18 +157,29 @@ export function ResearchArchive({
                   </span>
                   <time dateTime={run.created_at}>{formatDate(run.created_at)}</time>
                 </div>
-                <strong className="archive-score">{Math.round(run.score * 100)}%</strong>
+                <strong className="archive-score">
+                  {formatPercent(run.score)}
+                </strong>
                 <h3>{run.benchmark_id}</h3>
                 <p>
-                  {run.total_items} items · {shortId(run.id)}
+                  {run.completed_items}/{run.total_items} items · {shortId(run.id)}
+                  {run.status === "cancelled" ? " · partial" : ""}
                   {profiled && !baseline ? " · no matching baseline" : ""}
                 </p>
-                <button
-                  className="text-button"
-                  onClick={() => onOpenRun(run, baseline)}
-                >
-                  {profiled && baseline ? "Open paired run" : "Open run"} →
-                </button>
+                <div className="artifact-actions archive-run-actions">
+                  <button
+                    className="text-button"
+                    onClick={() => onOpenRun(run, baseline)}
+                  >
+                    {profiled && baseline ? "Open paired run" : "Open run"} →
+                  </button>
+                  <a href={`/api/runs/${run.id}/export?format=json`} download>
+                    JSON
+                  </a>
+                  <a href={`/api/runs/${run.id}/export?format=csv`} download>
+                    CSV
+                  </a>
+                </div>
               </article>
             );
           })}
@@ -244,12 +259,24 @@ export function ResearchArchive({
                     {comparison.cohort_item_ids.length} items · profile {comparison.profile_fingerprint.slice(0, 10)}
                   </p>
                 </div>
-                <ArchiveMetric label="Base" value={`${Math.round(comparison.baseline_score * 100)}%`} />
-                <ArchiveMetric label="Masked" value={`${Math.round(comparison.candidate_score * 100)}%`} />
+                <ArchiveMetric
+                  label="Base"
+                  value={formatPercent(comparison.baseline_score)}
+                />
+                <ArchiveMetric
+                  label="Masked"
+                  value={formatPercent(comparison.candidate_score)}
+                />
                 <ArchiveMetric
                   label="Delta"
-                  value={`${comparison.score_delta >= 0 ? "+" : ""}${Math.round(comparison.score_delta * 100)} pp`}
-                  tone={comparison.score_delta < 0 ? "negative" : "positive"}
+                  value={formatComparisonDelta(comparison.score_delta)}
+                  tone={
+                    comparison.score_delta == null
+                      ? "neutral"
+                      : comparison.score_delta < 0
+                        ? "negative"
+                        : "positive"
+                  }
                 />
                 <ArchiveMetric label="Regressions" value={String(comparison.regressions)} tone={comparison.regressions ? "negative" : "neutral"} />
                 <button
@@ -452,6 +479,15 @@ function ArchiveMetric({
 
 function shortId(id: string) {
   return id.slice(0, 8);
+}
+
+function formatPercent(value: number | null) {
+  return value == null ? "Unscored" : `${Math.round(value * 100)}%`;
+}
+
+function formatComparisonDelta(value: number | null) {
+  if (value == null) return "—";
+  return `${value >= 0 ? "+" : ""}${Math.round(value * 100)} pp`;
 }
 
 function formatDate(value: string) {

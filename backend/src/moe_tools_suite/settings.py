@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     auth_token: SecretStr | None = Field(default=None, repr=False)
     cookie_secure: bool = False
     session_ttl_hours: int = Field(default=24, ge=1, le=168)
+    max_custom_dataset_bytes: int = Field(default=2_000_000, ge=1_000, le=5_000_000)
 
     @model_validator(mode="after")
     def validate_security(self) -> "Settings":
