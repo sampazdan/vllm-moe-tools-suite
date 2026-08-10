@@ -1,0 +1,121 @@
+{
+  "id": "smoke-python-v1",
+  "name": "Python agent smoke pack",
+  "revision": "1",
+  "description": "Three tiny dependency-free repository tasks for sandbox, verifier, trajectory, and routing acceptance tests.",
+  "source": "bundled",
+  "ready": true,
+  "oracle_passed": true,
+  "noop_failed": true,
+  "tags": ["smoke", "python", "stdlib", "agentic"],
+  "tasks": [
+    {
+      "id": "fix-subtract",
+      "pack_id": "smoke-python-v1",
+      "name": "Fix subtraction",
+      "title": "Fix subtraction",
+      "instruction": "The subtract function in calculator.py is wrong. Fix its implementation without changing the public signature. Inspect the repository, make the smallest correct change, and run the tests before finishing.",
+      "category": "bug-fix",
+      "language": "python",
+      "tags": ["python", "bug-fix", "unit-test"],
+      "image_ref": "python:3.12-slim",
+      "working_directory": "/workspace/task",
+      "network_policy": "none",
+      "cpu": 1,
+      "memory_mb": 1024,
+      "disk_mb": 2048,
+      "timeout_seconds": 180,
+      "files": [
+        {
+          "path": "calculator.py",
+          "content": "def subtract(left: int, right: int) -> int:\n    \"\"\"Return left minus right.\"\"\"\n\n    return sum((left, right))\n"
+        },
+        {
+          "path": "tests/test_calculator.py",
+          "content": "import unittest\n\nfrom calculator import subtract\n\n\nclass SubtractTests(unittest.TestCase):\n    def test_positive_values(self) -> None:\n        self.assertEqual(subtract(9, 4), 5)\n\n    def test_negative_result(self) -> None:\n        self.assertEqual(subtract(3, 8), -5)\n\n    def test_negative_operand(self) -> None:\n        self.assertEqual(subtract(-2, 7), -9)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+        },
+        {
+          "path": "tests/__init__.py",
+          "content": ""
+        }
+      ],
+      "verifier_file_paths": ["tests/test_calculator.py", "tests/__init__.py"],
+      "verifier_command": "python -I -m unittest discover -s tests -t . -v",
+      "oracle_commands": [
+        "python -c 'from pathlib import Path; path = Path(\"calculator.py\"); path.write_text(path.read_text().replace(\"return sum((left, right))\", \"return left - right\"))'"
+      ]
+    },
+    {
+      "id": "implement-slugify",
+      "pack_id": "smoke-python-v1",
+      "name": "Implement slugify",
+      "title": "Implement slugify",
+      "instruction": "Implement text_utils.slugify. It must produce lowercase ASCII slugs, replace each run of non-alphanumeric characters with one hyphen, strip leading and trailing hyphens, and handle accented Unicode text. Use only the Python standard library and run the tests before finishing.",
+      "category": "feature",
+      "language": "python",
+      "tags": ["python", "feature", "text"],
+      "image_ref": "python:3.12-slim",
+      "working_directory": "/workspace/task",
+      "network_policy": "none",
+      "cpu": 1,
+      "memory_mb": 1024,
+      "disk_mb": 2048,
+      "timeout_seconds": 180,
+      "files": [
+        {
+          "path": "text_utils.py",
+          "content": "def slugify(value: str) -> str:\n    \"\"\"Return a URL-friendly ASCII slug.\"\"\"\n\n    raise NotImplementedError\n"
+        },
+        {
+          "path": "tests/test_text_utils.py",
+          "content": "import unittest\n\nfrom text_utils import slugify\n\n\nclass SlugifyTests(unittest.TestCase):\n    def test_words_and_punctuation(self) -> None:\n        self.assertEqual(slugify(\"Hello, World!\"), \"hello-world\")\n\n    def test_collapses_separators(self) -> None:\n        self.assertEqual(slugify(\"  Multiple___spaces  \"), \"multiple-spaces\")\n\n    def test_transliterates_accents(self) -> None:\n        self.assertEqual(slugify(\"Café Déjà Vu\"), \"cafe-deja-vu\")\n\n    def test_empty_slug(self) -> None:\n        self.assertEqual(slugify(\"---\"), \"\")\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+        },
+        {
+          "path": "tests/__init__.py",
+          "content": ""
+        }
+      ],
+      "verifier_file_paths": ["tests/test_text_utils.py", "tests/__init__.py"],
+      "verifier_command": "python -I -m unittest discover -s tests -t . -v",
+      "oracle_commands": [
+        "python -c 'from pathlib import Path; Path(\"text_utils.py\").write_text(\"\"\"import re\nimport unicodedata\n\n\ndef slugify(value: str) -> str:\n    \\\"\\\"\\\"Return a URL-friendly ASCII slug.\\\"\\\"\\\"\n\n    normalized = unicodedata.normalize(\\\"NFKD\\\", value)\n    ascii_value = normalized.encode(\\\"ascii\\\", \\\"ignore\\\").decode(\\\"ascii\\\")\n    return re.sub(r\\\"[^a-z0-9]+\\\", \\\"-\\\", ascii_value.lower()).strip(\\\"-\\\")\n\"\"\")'"
+      ]
+    },
+    {
+      "id": "repair-json-cli",
+      "pack_id": "smoke-python-v1",
+      "name": "Repair JSON CLI",
+      "title": "Repair JSON CLI",
+      "instruction": "Repair greet.py so `python greet.py Ada --repeat 3` writes exactly one compact JSON object to stdout: {\"greeting\":\"Hello, Ada!\",\"repeat\":3}. The greeting must use the supplied name and repeat must be a JSON integer. Preserve the command-line interface, use only the standard library, and run the tests before finishing.",
+      "category": "bug-fix",
+      "language": "python",
+      "tags": ["python", "cli", "json", "bug-fix"],
+      "image_ref": "python:3.12-slim",
+      "working_directory": "/workspace/task",
+      "network_policy": "none",
+      "cpu": 1,
+      "memory_mb": 1024,
+      "disk_mb": 2048,
+      "timeout_seconds": 180,
+      "files": [
+        {
+          "path": "greet.py",
+          "content": "import argparse\n\n\ndef main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"name\")\n    parser.add_argument(\"--repeat\", type=int, default=1)\n    args = parser.parse_args()\n    print({\"message\": f\"Hello {args.name}\", \"repeat\": str(args.repeat)})\n\n\nif __name__ == \"__main__\":\n    main()\n"
+        },
+        {
+          "path": "tests/test_greet.py",
+          "content": "import json\nimport subprocess\nimport sys\nimport unittest\n\n\nclass GreetCliTests(unittest.TestCase):\n    def run_cli(self, *arguments: str) -> str:\n        completed = subprocess.run(\n            [sys.executable, \"greet.py\", *arguments],\n            check=True,\n            capture_output=True,\n            text=True,\n        )\n        self.assertEqual(completed.stderr, \"\")\n        return completed.stdout\n\n    def test_compact_json_contract(self) -> None:\n        output = self.run_cli(\"Ada\", \"--repeat\", \"3\")\n        self.assertEqual(output, '{\"greeting\":\"Hello, Ada!\",\"repeat\":3}\\n')\n        self.assertEqual(\n            json.loads(output),\n            {\"greeting\": \"Hello, Ada!\", \"repeat\": 3},\n        )\n\n    def test_name_is_not_hard_coded(self) -> None:\n        payload = json.loads(self.run_cli(\"Grace\", \"--repeat\", \"1\"))\n        self.assertEqual(payload[\"greeting\"], \"Hello, Grace!\")\n        self.assertIsInstance(payload[\"repeat\"], int)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+        },
+        {
+          "path": "tests/__init__.py",
+          "content": ""
+        }
+      ],
+      "verifier_file_paths": ["tests/test_greet.py", "tests/__init__.py"],
+      "verifier_command": "python -I -m unittest discover -s tests -t . -v",
+      "oracle_commands": [
+        "python -c 'from pathlib import Path; Path(\"greet.py\").write_text(\"\"\"import argparse\nimport json\n\n\ndef main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\\\"name\\\")\n    parser.add_argument(\\\"--repeat\\\", type=int, default=1)\n    args = parser.parse_args()\n    payload = {\\\"greeting\\\": f\\\"Hello, {args.name}!\\\", \\\"repeat\\\": args.repeat}\n    print(json.dumps(payload, separators=(\\\",\\\", \\\":\\\")))\n\n\nif __name__ == \\\"__main__\\\":\n    main()\n\"\"\")'"
+      ]
+    }
+  ]
+}

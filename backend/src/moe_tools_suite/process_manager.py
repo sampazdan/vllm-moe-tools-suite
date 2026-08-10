@@ -75,6 +75,10 @@ class ManagedVllmServer:
         environment["RUNPOD_VLLM_MODEL"] = self.model_id
         environment.pop("MOE_TOOLS_AUTH_TOKEN", None)
         environment.pop("RUNPOD_API_KEY", None)
+        environment.pop("MOE_TOOLS_DAYTONA_API_KEY", None)
+        environment.pop("DAYTONA_API_KEY", None)
+        environment.pop("DAYTONA_JWT_TOKEN", None)
+        environment.pop("DAYTONA_ORGANIZATION_ID", None)
         environment.pop("MOE_PROFILE", None)
         if self.profile_path is not None:
             environment["MOE_PROFILE"] = str(self.profile_path)
@@ -144,21 +148,17 @@ class ManagedVllmServer:
             try:
                 response = await self._client.get(f"{self.base_url}/v1/models")
                 response.raise_for_status()
-                model_ids = {
-                    item["id"] for item in response.json().get("data", [])
-                }
+                model_ids = {item["id"] for item in response.json().get("data", [])}
                 if self.model_id in model_ids:
                     return
                 last_error = (
-                    f"vLLM is ready but serves {sorted(model_ids)}, "
-                    f"not {self.model_id}"
+                    f"vLLM is ready but serves {sorted(model_ids)}, not {self.model_id}"
                 )
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
                 last_error = str(error) or error.__class__.__name__
             await asyncio.sleep(self.poll_interval_seconds)
         raise RuntimeError(
-            f"vLLM was not ready after {self.startup_timeout_seconds:g}s: "
-            f"{last_error}"
+            f"vLLM was not ready after {self.startup_timeout_seconds:g}s: {last_error}"
         )
 
     def _write_profile(
@@ -245,8 +245,8 @@ class ManagedVllmServer:
             stat = stat_path.read_text()
             after_name = stat[stat.rfind(")") + 2 :].split()
             start_ticks = after_name[19]
-            command_line = command_path.read_bytes().replace(b"\0", b" ").decode(
-                errors="replace"
+            command_line = (
+                command_path.read_bytes().replace(b"\0", b" ").decode(errors="replace")
             )
         except (OSError, IndexError):
             return None

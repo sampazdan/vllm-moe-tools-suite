@@ -31,10 +31,15 @@ export interface SessionStatus {
   expires_at: string | null;
 }
 
-export type JobKind = "model_load" | "benchmark_run" | "dataset_prepare";
+export type JobKind =
+  | "model_load"
+  | "benchmark_run"
+  | "dataset_prepare"
+  | "agent_run";
 export type JobStatus =
   | "queued"
   | "running"
+  | "cancelling"
   | "completed"
   | "failed"
   | "cancelled";
@@ -90,6 +95,7 @@ export interface GenerationConfig {
   temperature: number;
   max_tokens: number;
   seed: number | null;
+  enable_thinking: boolean;
 }
 
 export interface BenchmarkInfo {
@@ -188,7 +194,7 @@ export interface ProfileProposal {
   observed_mass_retained: number;
 }
 
-export type ProfileSource = "proposal" | "manual" | "import";
+export type ProfileSource = "proposal" | "agentic" | "manual" | "import";
 
 export interface CreateExpertProfileRequest {
   name: string;
@@ -197,6 +203,7 @@ export interface CreateExpertProfileRequest {
   profile: ExpertProfile;
   source?: ProfileSource;
   source_run_id?: string | null;
+  source_trial_id?: string | null;
   parent_profile_id?: string | null;
   metric?: "routing_mass" | "selection_count" | null;
   observed_mass_retained?: number | null;
@@ -211,6 +218,7 @@ export interface SavedExpertProfile {
   profile_fingerprint: string;
   source: ProfileSource;
   source_run_id: string | null;
+  source_trial_id: string | null;
   parent_profile_id: string | null;
   metric: "routing_mass" | "selection_count" | null;
   validation: ProfileValidation;
@@ -236,4 +244,239 @@ export interface ComparisonRecord {
   retained_failures: number;
   unscored_items: number;
   created_at: string;
+}
+
+export interface AgentBudgets {
+  max_turns: number;
+  max_tokens: number;
+  max_commands: number;
+  timeout_seconds: number;
+}
+
+export interface AgentDefinition {
+  id: string;
+  label: string;
+  description: string;
+  revision: string;
+  available: boolean;
+  is_default: boolean;
+  tool_names: string[];
+  default_budgets: AgentBudgets;
+}
+
+export interface ProviderError {
+  code: string;
+  message: string;
+  retryable: boolean;
+}
+
+export interface SandboxProviderCapabilities {
+  create: boolean;
+  exec: boolean;
+  upload: boolean;
+  download: boolean;
+  delete: boolean;
+}
+
+export type SandboxProviderStatus =
+  | "not_configured"
+  | "unchecked"
+  | "ready"
+  | "error";
+
+export interface SandboxProvider {
+  id: string;
+  label: string;
+  configured: boolean;
+  credential_mode: "api_key" | "jwt" | null;
+  required_env: string[];
+  optional_env: string[];
+  region: string | null;
+  capabilities: SandboxProviderCapabilities;
+  status: SandboxProviderStatus;
+  last_checked_at: string | null;
+  error: ProviderError | null;
+}
+
+export interface ProviderPreflight {
+  configured: boolean;
+  reachable: boolean;
+  authenticated: boolean;
+  status: Exclude<SandboxProviderStatus, "unchecked">;
+  latency_ms: number | null;
+  checked_at: string;
+  api_url_host: string | null;
+  region: string | null;
+  error: ProviderError | null;
+}
+
+export interface AgentTaskPack {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  revision: string;
+  fingerprint: string;
+  task_count: number;
+  ready: boolean;
+  oracle_passed: boolean;
+  noop_failed: boolean;
+  tags: string[];
+}
+
+export interface AgentTask {
+  id: string;
+  title: string;
+  instruction: string;
+  language: string | null;
+  tags: string[];
+  timeout_seconds: number;
+}
+
+export type AgentRunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelling"
+  | "cancelled";
+
+export type AgentTrialStatus =
+  | "queued"
+  | "provisioning"
+  | "running"
+  | "verifying"
+  | "cleaning"
+  | "passed"
+  | "failed"
+  | "error"
+  | "cancelled";
+
+export interface AgentTrialSummary {
+  id: string;
+  agent_run_id: string;
+  task_id: string;
+  title: string;
+  status: AgentTrialStatus;
+  reward: number | null;
+  turns: number;
+  commands: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  inference_calls: number;
+  routed_inference_calls: number;
+  termination_reason: string | null;
+  sandbox_status: string;
+  updated_at: string;
+}
+
+export interface AgentRun {
+  id: string;
+  job_id: string;
+  task_pack_id: string;
+  task_pack_name: string;
+  model_session_id: string;
+  profile_id: string | null;
+  profile_fingerprint: string | null;
+  agent_id: string;
+  sandbox_provider_id: string;
+  compatibility_fingerprint: string;
+  status: AgentRunStatus;
+  task_ids: string[];
+  total_trials: number;
+  completed_trials: number;
+  passed_trials: number;
+  mean_reward: number | null;
+  active_trial_id: string | null;
+  trials: AgentTrialSummary[];
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface CreateAgentRunRequest {
+  task_pack_id: string;
+  task_ids: string[];
+  agent_id: string;
+  sandbox_provider_id: string;
+  model_session_id: string;
+  budgets?: AgentBudgets;
+}
+
+export interface InferenceCallSummary {
+  id: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  latency_ms: number;
+  routing_artifact_id: string | null;
+  routed_layers: number;
+  total_routed_slots: number;
+}
+
+export type TrajectoryStepType =
+  | "system"
+  | "user"
+  | "assistant"
+  | "tool"
+  | "observation"
+  | "verifier";
+
+export interface TrajectoryStep {
+  id: string;
+  sequence: number;
+  timestamp: string;
+  type: TrajectoryStepType;
+  title: string;
+  content: string;
+  tool_name: string | null;
+  command: string | null;
+  exit_code: number | null;
+  duration_ms: number | null;
+  truncated: boolean;
+  inference: InferenceCallSummary | null;
+}
+
+export interface AgentTrajectory {
+  trial_id: string;
+  format: "ATIF";
+  schema_version: string;
+  steps: TrajectoryStep[];
+  updated_at: string;
+}
+
+export interface VerifierResult {
+  status: "pending" | "passed" | "failed" | "error";
+  reward: number | null;
+  summary: string;
+  output: string;
+  exit_code: number | null;
+  duration_ms: number | null;
+}
+
+export interface AgentArtifactLink {
+  name: string;
+  media_type: string;
+  download_url: string;
+}
+
+export interface AgentTrialArtifacts {
+  trial_id: string;
+  patch: string | null;
+  patch_sha256: string | null;
+  files_changed: number;
+  additions: number;
+  deletions: number;
+  verifier: VerifierResult | null;
+  exports?: AgentArtifactLink[];
+}
+
+export interface TrialRoutingSummary extends RoutingSummary {
+  trial_id: string;
+  inference_count: number;
+  inference_calls: number;
+  captured_inference_calls: number;
+  served_tokens: number;
+  profile_id: string | null;
+  profile_fingerprint: string | null;
 }

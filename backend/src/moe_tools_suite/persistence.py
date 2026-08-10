@@ -10,6 +10,7 @@ import numpy as np
 from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
+from .agentic.domain import AgentRun, AgentTrial, InferenceCall, SandboxSession
 from .domain import (
     BenchmarkCohort,
     BenchmarkDatasetRecord,
@@ -130,6 +131,13 @@ class ExpertProfileRow(Base):
     )
 
 
+class ExpertProfileAgentTrialRow(Base):
+    __tablename__ = "expert_profile_agent_trials"
+
+    profile_id: Mapped[str] = mapped_column(String, primary_key=True)
+    trial_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+
+
 class ComparisonRow(Base):
     __tablename__ = "comparisons"
 
@@ -176,6 +184,66 @@ class JobRow(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AgentRunRow(Base):
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    model_session_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    task_pack_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class AgentTrialRow(Base):
+    __tablename__ = "agent_trials"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    task_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class AgentInferenceRow(Base):
+    __tablename__ = "agent_inferences"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    trial_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class SandboxSessionRow(Base):
+    __tablename__ = "agent_sandbox_sessions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    trial_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    provider_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    external_id: Mapped[str | None] = mapped_column(String, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 class SqliteStore:
@@ -359,7 +427,11 @@ class SqliteStore:
             )
 
     def reconcile_interrupted_jobs(self) -> int:
-        active_states = {JobStatus.QUEUED.value, JobStatus.RUNNING.value}
+        active_states = {
+            JobStatus.QUEUED.value,
+            JobStatus.RUNNING.value,
+            JobStatus.CANCELLING.value,
+        }
         reconciled = 0
         with self.sessions.begin() as database:
             rows = database.query(JobRow).filter(JobRow.status.in_(active_states))
@@ -391,6 +463,94 @@ class SqliteStore:
                 )
                 loaded[row.id] = (job, json.loads(row.payload_json))
         return loaded
+
+    def save_agent_run(self, run: AgentRun) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                AgentRunRow(
+                    id=run.id,
+                    status=run.status.value,
+                    model_session_id=run.model_session_id,
+                    task_pack_id=run.task_pack_id,
+                    record_json=run.model_dump_json(),
+                    created_at=run.created_at,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+
+    def load_agent_runs(self) -> dict[str, AgentRun]:
+        with self.sessions() as database:
+            rows = database.query(AgentRunRow).order_by(AgentRunRow.created_at)
+            return {
+                row.id: AgentRun.model_validate_json(row.record_json) for row in rows
+            }
+
+    def save_agent_trial(self, trial: AgentTrial) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                AgentTrialRow(
+                    id=trial.id,
+                    run_id=trial.run_id,
+                    task_id=trial.task_id,
+                    status=trial.status.value,
+                    record_json=trial.model_dump_json(),
+                    created_at=trial.created_at,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+
+    def load_agent_trials(self) -> dict[str, AgentTrial]:
+        with self.sessions() as database:
+            rows = database.query(AgentTrialRow).order_by(AgentTrialRow.created_at)
+            return {
+                row.id: AgentTrial.model_validate_json(row.record_json) for row in rows
+            }
+
+    def save_agent_inference(self, inference: InferenceCall) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                AgentInferenceRow(
+                    id=inference.id,
+                    trial_id=inference.trial_id,
+                    record_json=inference.model_dump_json(),
+                    created_at=inference.created_at,
+                )
+            )
+
+    def load_agent_inferences(self) -> dict[str, InferenceCall]:
+        with self.sessions() as database:
+            rows = database.query(AgentInferenceRow).order_by(
+                AgentInferenceRow.created_at
+            )
+            return {
+                row.id: InferenceCall.model_validate_json(row.record_json)
+                for row in rows
+            }
+
+    def save_sandbox_session(self, sandbox: SandboxSession) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                SandboxSessionRow(
+                    id=sandbox.id,
+                    trial_id=sandbox.trial_id,
+                    provider_id=sandbox.provider_id,
+                    state=sandbox.state.value,
+                    external_id=sandbox.external_id,
+                    record_json=sandbox.model_dump_json(),
+                    created_at=sandbox.created_at,
+                    updated_at=sandbox.updated_at,
+                )
+            )
+
+    def load_sandbox_sessions(self) -> dict[str, SandboxSession]:
+        with self.sessions() as database:
+            rows = database.query(SandboxSessionRow).order_by(
+                SandboxSessionRow.created_at
+            )
+            return {
+                row.id: SandboxSession.model_validate_json(row.record_json)
+                for row in rows
+            }
 
     def save_run(
         self,
@@ -514,10 +674,27 @@ class SqliteStore:
                     created_at=profile.created_at,
                 )
             )
+            trial_link = database.get(ExpertProfileAgentTrialRow, profile.id)
+            if profile.source_trial_id is not None:
+                if trial_link is None:
+                    database.add(
+                        ExpertProfileAgentTrialRow(
+                            profile_id=profile.id,
+                            trial_id=profile.source_trial_id,
+                        )
+                    )
+                else:
+                    trial_link.trial_id = profile.source_trial_id
+            elif trial_link is not None:
+                database.delete(trial_link)
 
     def load_expert_profiles(self) -> dict[str, SavedExpertProfile]:
         loaded: dict[str, SavedExpertProfile] = {}
         with self.sessions() as database:
+            trial_ids = {
+                row.profile_id: row.trial_id
+                for row in database.query(ExpertProfileAgentTrialRow)
+            }
             rows = database.query(ExpertProfileRow).order_by(
                 ExpertProfileRow.created_at
             )
@@ -531,6 +708,7 @@ class SqliteStore:
                     profile_fingerprint=row.profile_fingerprint,
                     source=row.source,
                     source_run_id=row.source_run_id,
+                    source_trial_id=trial_ids.get(row.id),
                     parent_profile_id=row.parent_profile_id,
                     metric=row.metric,
                     validation=ProfileValidation.model_validate_json(

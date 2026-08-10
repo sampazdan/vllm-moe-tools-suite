@@ -16,6 +16,21 @@ from fastapi import (
 from fastapi.responses import JSONResponse, Response
 
 from . import __version__
+from .agentic.atif import trajectory_to_json
+from .agentic.domain import (
+    AgentDefinition,
+    AgentRunExport,
+    AgentRunView,
+    AgentTaskInfo,
+    AgentTaskPackInfo,
+    AgentTrajectoryView,
+    AgentTrialArtifactsView,
+    AgentTrialSummary,
+    CreateAgentRunRequest,
+    ProviderPreflight,
+    SandboxProviderInfo,
+    TrialRoutingSummary,
+)
 from .domain import (
     BenchmarkDatasetRecord,
     BenchmarkInfo,
@@ -69,6 +84,188 @@ def list_models(request: Request) -> list[ModelRegistryEntry]:
 @router.get("/runtime/status", response_model=RuntimeStatus)
 def runtime_status(request: Request) -> RuntimeStatus:
     return _lab(request).runtime_status()
+
+
+@router.get("/agents", response_model=list[AgentDefinition])
+def list_agents(request: Request) -> list[AgentDefinition]:
+    return _lab(request).agentic.list_agents()
+
+
+@router.get("/sandbox-providers", response_model=list[SandboxProviderInfo])
+def list_sandbox_providers(request: Request) -> list[SandboxProviderInfo]:
+    return _lab(request).agentic.list_providers()
+
+
+@router.post(
+    "/sandbox-providers/{provider_id}/preflight",
+    response_model=ProviderPreflight,
+)
+async def preflight_sandbox_provider(
+    provider_id: str, request: Request
+) -> ProviderPreflight:
+    try:
+        return await _lab(request).agentic.preflight_provider(provider_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="provider not found") from error
+
+
+@router.get("/agent-task-packs", response_model=list[AgentTaskPackInfo])
+def list_agent_task_packs(request: Request) -> list[AgentTaskPackInfo]:
+    return _lab(request).agentic.list_task_packs()
+
+
+@router.get(
+    "/agent-task-packs/{pack_id}/tasks",
+    response_model=list[AgentTaskInfo],
+)
+def list_agent_tasks(pack_id: str, request: Request) -> list[AgentTaskInfo]:
+    try:
+        return [
+            AgentTaskInfo(
+                id=task.id,
+                title=task.title,
+                instruction=task.instruction,
+                language=task.language,
+                tags=task.tags,
+                timeout_seconds=task.timeout_seconds,
+            )
+            for task in _lab(request).agentic.list_tasks(pack_id)
+        ]
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="task pack not found") from error
+
+
+@router.post(
+    "/agent-runs",
+    response_model=JobRecord,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_agent_run(
+    payload: CreateAgentRunRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JobRecord:
+    try:
+        lab = _lab(request)
+        job = lab.submit_agent_run(payload)
+        background_tasks.add_task(lab.execute_job, job.id)
+        return job
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/agent-runs", response_model=list[AgentRunView])
+def list_agent_runs(request: Request) -> list[AgentRunView]:
+    return _lab(request).agentic.list_run_views()
+
+
+@router.get("/agent-runs/{run_id}", response_model=AgentRunView)
+def get_agent_run(run_id: str, request: Request) -> AgentRunView:
+    try:
+        return _lab(request).agentic.run_view(run_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="agent run not found") from error
+
+
+@router.post("/agent-runs/{run_id}/cancel", response_model=AgentRunView)
+def cancel_agent_run(run_id: str, request: Request) -> AgentRunView:
+    lab = _lab(request)
+    try:
+        run = lab.agentic.runs[run_id]
+        lab.cancel_job(run.job_id)
+        return lab.agentic.run_view(run_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="agent run not found") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get("/agent-runs/{run_id}/export", response_model=AgentRunExport)
+def export_agent_run(run_id: str, request: Request) -> JSONResponse:
+    try:
+        exported = _lab(request).agentic.export_run(run_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="agent run not found") from error
+    return JSONResponse(
+        content=exported.model_dump(mode="json", exclude_none=True),
+        headers={
+            "Content-Disposition": (f'attachment; filename="agent-run-{run_id}.json"')
+        },
+    )
+
+
+@router.get("/trials/{trial_id}", response_model=AgentTrialSummary)
+def get_agent_trial(trial_id: str, request: Request) -> AgentTrialSummary:
+    try:
+        return _lab(request).agentic.get_trial(trial_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="trial not found") from error
+
+
+@router.get("/trials/{trial_id}/trajectory", response_model=AgentTrajectoryView)
+def get_agent_trajectory(trial_id: str, request: Request) -> AgentTrajectoryView:
+    try:
+        return _lab(request).agentic.get_trajectory(trial_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="trajectory not found") from error
+
+
+@router.get("/trials/{trial_id}/export/atif", response_model=None)
+def export_agent_trajectory(trial_id: str, request: Request) -> Response:
+    trajectory = _lab(request).agentic.trajectories.get(trial_id)
+    if trajectory is None:
+        raise HTTPException(status_code=404, detail="trajectory not found")
+    return Response(
+        content=trajectory_to_json(trajectory),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="trajectory-{trial_id}.atif.json"'
+            )
+        },
+    )
+
+
+@router.get("/trials/{trial_id}/routing", response_model=TrialRoutingSummary)
+def get_agent_routing(trial_id: str, request: Request) -> TrialRoutingSummary:
+    try:
+        return _lab(request).agentic.get_routing(trial_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="routing not found") from error
+
+
+@router.get(
+    "/trials/{trial_id}/artifacts",
+    response_model=AgentTrialArtifactsView,
+)
+def get_agent_artifacts(trial_id: str, request: Request) -> AgentTrialArtifactsView:
+    try:
+        return _lab(request).agentic.get_artifacts(trial_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="trial not found") from error
+
+
+@router.post("/trials/{trial_id}/profile-proposal", response_model=ProfileProposal)
+def propose_agent_profile(
+    trial_id: str,
+    request: Request,
+    keep_per_layer: int = 64,
+    metric: Literal["routing_mass", "selection_count"] = "routing_mass",
+) -> ProfileProposal:
+    try:
+        return _lab(request).propose_agent_profile(
+            trial_id,
+            keep_per_layer=keep_per_layer,
+            metric=metric,
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="routing not found") from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.post(

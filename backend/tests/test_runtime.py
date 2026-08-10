@@ -25,6 +25,7 @@ async def test_vllm_runtime_reads_custom_choice_telemetry() -> None:
         assert payload["temperature"] == 0.25
         assert payload["max_tokens"] == 321
         assert payload["seed"] == 7
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
         return httpx.Response(
             200,
             json={

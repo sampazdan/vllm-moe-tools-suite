@@ -46,7 +46,11 @@ export async function waitForJob(
 ): Promise<JobRecord> {
   let job = submitted;
   onProgress?.(job);
-  while (job.status === "queued" || job.status === "running") {
+  while (
+    job.status === "queued" ||
+    job.status === "running" ||
+    job.status === "cancelling"
+  ) {
     await new Promise((resolve) => window.setTimeout(resolve, 500));
     job = await api<JobRecord>(`/api/jobs/${job.id}`);
     onProgress?.(job);

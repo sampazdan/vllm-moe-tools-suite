@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from dataclasses import dataclass
+from typing import Literal
+from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from ..domain import GenerationConfig, ModelSession, ModelTopology
+from ..persistence import SqliteStore
+from ..runtime import ModelRuntime
+from ..telemetry import AggregatedRouting, DecodedRouting, aggregate_routing
+from .artifacts import AgentArtifactStore
+from .atif import BASH_JSON_SYSTEM_PROMPT, BASH_TOOL_DEFINITION
+from .domain import InferenceCall
+
+
+class AgentAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["shell", "finish"]
+    command: str | None = Field(default=None, max_length=20_000)
+    summary: str | None = Field(default=None, max_length=20_000)
+
+
+@dataclass(frozen=True)
+class GatewayResult:
+    content: str
+    inference: InferenceCall
+    routing: DecodedRouting
+    aggregated: AggregatedRouting
+
+
+class InstrumentedAgentGateway:
+    """Run every agent turn through the routing-aware local model runtime."""
+
+    def __init__(
+        self,
+        *,
+        runtime: ModelRuntime,
+        topology: ModelTopology,
+        store: SqliteStore,
+        artifacts: AgentArtifactStore,
+    ) -> None:
+        self.runtime = runtime
+        self.topology = topology
+        self.store = store
+        self.artifacts = artifacts
+
+    async def infer(
+        self,
+        *,
+        trial_id: str,
+        trajectory_step_id: str,
+        model_session: ModelSession,
+        messages: list[dict[str, str]],
+        generation: GenerationConfig,
+        request_key: str,
+        scripted_content: str | None = None,
+    ) -> GatewayResult:
+        inference_id = str(uuid4())
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {"messages": messages, "generation": generation.model_dump()},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        started = time.perf_counter()
+        try:
+            completion = await self.runtime.complete_chat(
+                messages,
+                request_key=request_key,
+                profile=model_session.profile,
+                generation=generation,
+            )
+        except Exception as error:
+            inference = InferenceCall(
+                id=inference_id,
+                trial_id=trial_id,
+                trajectory_step_id=trajectory_step_id,
+                model_session_id=model_session.id,
+                request_hash=request_hash,
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error=_bounded_error(error),
+            )
+            self.store.save_agent_inference(inference)
+            raise
+
+        routing_artifact = self.artifacts.save_inference_routing(
+            trial_id, inference_id, completion.routing
+        )
+        inference = InferenceCall(
+            id=inference_id,
+            trial_id=trial_id,
+            trajectory_step_id=trajectory_step_id,
+            model_session_id=model_session.id,
+            request_hash=request_hash,
+            prompt_tokens=completion.prompt_tokens,
+            completion_tokens=completion.completion_tokens,
+            latency_ms=(time.perf_counter() - started) * 1000,
+            routing_artifact=routing_artifact,
+        )
+        self.store.save_agent_inference(inference)
+        return GatewayResult(
+            content=scripted_content or completion.content,
+            inference=inference,
+            routing=completion.routing,
+            aggregated=aggregate_routing(completion.routing, self.topology),
+        )
+
+
+def parse_agent_action(content: str) -> AgentAction:
+    """Parse one bounded shell/finish action from a model response."""
+
+    payload = _extract_json_object(content)
+    action = AgentAction.model_validate(payload)
+    if action.action == "shell":
+        command = (action.command or "").strip()
+        if not command:
+            raise ValueError("shell action requires a command")
+        if "\x00" in command:
+            raise ValueError("shell command contains a null byte")
+        return action.model_copy(update={"command": command})
+    summary = (action.summary or "").strip()
+    if not summary:
+        raise ValueError("finish action requires a summary")
+    return action.model_copy(update={"summary": summary})
+
+
+def system_prompt_hash() -> str:
+    return hashlib.sha256(BASH_JSON_SYSTEM_PROMPT.encode()).hexdigest()
+
+
+def tool_schema_hash() -> str:
+    return hashlib.sha256(
+        json.dumps(BASH_TOOL_DEFINITION, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _extract_json_object(content: str) -> dict[str, object]:
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(content):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(content[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError("model response did not contain a JSON action")
+
+
+def _bounded_error(error: Exception) -> str:
+    message = str(error).strip() or error.__class__.__name__
+    return message[:1000]

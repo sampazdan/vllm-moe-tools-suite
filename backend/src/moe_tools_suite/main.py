@@ -22,6 +22,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        await application.state.lab.startup()
         yield
         await application.state.lab.shutdown()
 

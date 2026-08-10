@@ -1,15 +1,15 @@
 # MoE Tools Test Suite Roadmap
 
-Status: active implementation plan, updated 2026-08-09
+Status: active implementation plan, updated 2026-08-10
 
-Implementation status as of 2026-08-09:
+Implementation status as of 2026-08-10:
 
 - **Milestone 0 complete:** the repository now contains a tested FastAPI backend,
   fork-compatible telemetry decoder/aggregator and profile validator, deterministic
   A3B mock runtime, selectable fixture benchmark, responsive React application,
   40-by-256 engagement heatmap, fixed-budget profile proposal, and Runpod-aware
   Dockerfile skeleton.
-- **Verified locally:** 27 backend tests, Ruff, the production TypeScript/Vite build,
+- **Verified locally:** 35 backend tests, Ruff, the production TypeScript/Vite build,
   authenticated base-to-mask workflows in desktop and 390-pixel browser layouts,
   shell/JSON startup syntax, and Docker Buildx static validation all pass.
 - **Milestone 1 implemented locally:** single-user token sessions and CSRF,
@@ -28,9 +28,21 @@ Implementation status as of 2026-08-09:
   generation settings; item errors, ungraded results, cancellation, and JSON/CSV
   exports are first-class. Standard dataset files and custom imports persist on the
   mounted volume.
-- **Next acceptance checkpoint:** build and push one immutable image, smoke-test the
-  mock appliance through Runpod's HTTPS proxy, then validate managed A3B load,
-  telemetry, profile restart, and paired rerun on the target RTX PRO 6000.
+- **Native agentic slice implemented locally:** `bash-json-v1` runs a bounded JSON
+  shell-action loop through an instrumented per-inference model gateway. Durable
+  agent runs/trials, `ATIF-v1.7` trajectories, verifier and routing artifacts, the
+  immutable three-task `smoke-python-v1` pack, fake/Daytona provider boundaries, an
+  API-backed trial-to-profile flow, and the agentic workbench are present.
+- **Provider and deployment safety implemented locally:** the fake provider never
+  executes a host subprocess; the remote adapter requires exact
+  [`daytona==0.192.0`](https://pypi.org/project/daytona/0.192.0/), keeps credentials
+  controller-side, labels owned sandboxes, applies task egress policy, and confirms
+  deletion. A private agentic Runpod template uses secret references rather than
+  embedding tokens.
+- **Next acceptance checkpoint:** run the bounded paid ladder: Daytona preflight,
+  one real task, all three tasks on the baseline model, a single-trial-derived
+  profile reload, the identical three tasks masked, and explicit sandbox/Pod
+  teardown. The target RTX and Daytona live lifecycles remain unverified tonight.
 
 Approximate milestone accounting (local implementation, not production readiness):
 
@@ -42,11 +54,13 @@ Approximate milestone accounting (local implementation, not production readiness
 | 3 · Benchmark engine | 78% | More standard adapters and automated frontend tests |
 | 4 · Profile lab | 60% | Undo/redo and additional assisted strategies |
 | 5 · Masked comparison | 65% | Routing redistribution, reports, performance mode |
-| 6–8 · Agentic/breadth | 0–5% | Harbor/Daytona and real benchmark adapters |
+| 6 · Agentic foundation | 70% | Live RTX/Daytona acceptance and broader harnesses |
+| 7 · Repository agentic | 10% | Full Harbor/Aider integration and public task adapters |
+| 8 · Breadth/hardening | 5% | Additional adapters, failure injection, and browser tests |
 
-The interactive MVP surface is roughly 65% implemented. The production-validated
-system is closer to one third complete because the container and managed fork have
-not yet crossed the real Runpod/GPU acceptance checkpoints.
+The interactive MVP surface is roughly two thirds implemented. Production readiness
+is substantially lower because the container, managed fork, and remote sandbox have
+not yet crossed the real Runpod/GPU/Daytona acceptance checkpoints.
 
 This repository will contain a single-user research application for measuring how
 expert eligibility changes affect a task-focused MoE model. The first useful
@@ -134,10 +148,10 @@ artifact that actually removes, compresses, or offloads weights.
 - Restart the model with a profile and rerun an identical benchmark cohort.
 - Compare base and masked runs with paired item-level and aggregate views.
 - Persist datasets, model cache, runs, profiles, logs, and provenance across Pods.
-- Treat multi-turn agentic coding as a first-class benchmark family after the
-  baseline one-request evaluation loop is reliable.
-- Preserve complete agent trajectories and associate every model inference with its
-  expert-routing telemetry.
+- Treat multi-turn agentic coding as a first-class benchmark family through a native
+  bounded controller and a replaceable remote-sandbox provider.
+- Preserve `ATIF-v1.7` agent trajectories and associate every model inference with
+  its expert-routing telemetry.
 
 ### Explicitly deferred
 
@@ -147,6 +161,10 @@ artifact that actually removes, compresses, or offloads weights.
 - Hot-swapping expert profiles without reloading vLLM.
 - Automated black-box search over thousands of masks.
 - Executing model-generated code inside the main application/model container.
+- Embedding the full Harbor runtime or importing arbitrary Harbor task packs.
+- Aider, Mini-SWE-Agent, Terminus-2, or another external agent scaffold.
+- Formal paired-comparison statistics for agentic runs and multi-trial profile
+  aggregation.
 - Multi-node or tensor-parallel deployments.
 - Selective quantization. The data model will leave room for it, but the first UI
   will not pretend that it is implemented.
@@ -257,7 +275,7 @@ flowchart LR
     App --> Jobs["Persistent job runner"]
     App --> DB["SQLite metadata"]
     Jobs --> VLLM["Managed vLLM process on 127.0.0.1:8000"]
-    Jobs --> Agent["Harbor agent controller"]
+    Jobs --> Agent["Native bash-json controller"]
     Agent --> Gateway["Instrumented local model gateway"]
     Gateway --> VLLM
     Agent --> Sandbox["Remote isolated task sandbox"]
@@ -276,39 +294,51 @@ The Runpod base image's `/start.sh` must remain in the startup chain so SSH and 
 standard Pod services are not accidentally removed. An idempotent startup hook will
 launch the web application automatically.
 
-### Agentic execution: Harbor controller plus remote sandboxes
+### Agentic execution: native controller, Harbor-compatible artifacts
 
 Runpod Pods run from custom container images and do not provide a Docker daemon or
-Docker Compose inside the GPU Pod. Agent-generated code and benchmark verifiers must
-therefore not be run by trying to add Docker-in-Docker to the application image.
+Docker Compose inside the GPU Pod. Agent-generated code and benchmark verifiers are
+therefore never executed in the application/model container or through
+Docker-in-Docker. Runpod documents this Pod boundary in its
+[image-building guide](https://docs.runpod.io/tutorials/pods/build-docker-images).
 
-The application will embed a pinned
-[Harbor](https://github.com/harbor-framework/harbor) controller. Harbor will manage
-the agent loop and use a cloud sandbox provider for each isolated task environment.
-Daytona is the initial provider choice because Harbor recommends it for horizontal
-agent evaluation and it supports both single- and multi-container tasks. The provider
-boundary remains configurable so Modal, E2B, Runloop, EC2, or another Harbor backend
-can be added later.
+The implemented scaffold is `bash-json-v1`, revision `1`, a small native loop that
+accepts exactly one JSON shell action or finish action per model turn. Its control
+process stays inside the application Pod, calls vLLM over loopback through an
+instrumented gateway, and sends shell operations only to the selected sandbox
+provider. Default limits are eight turns, eight commands, 32,768 tokens, and 300
+seconds. This keeps the measured scaffold explicit and ensures every model inference
+can be linked to the fork's routed-expert telemetry.
 
-The initial agent scaffold will be a pinned, minimal bash-oriented loop modeled on
-Mini-SWE-Agent and implemented as an external Harbor agent. Its control process stays
-inside the application Pod, calls vLLM over loopback, and sends only shell operations
-to the remote sandbox. This has three advantages:
+The artifact boundary is Harbor-compatible: trajectories use `ATIF-v1.7`, following
+Harbor's [ATIF RFC](https://github.com/harbor-framework/harbor/blob/main/rfcs/0001-trajectory-format.md),
+and the native task/provider contracts are designed to map to Harbor's
+[task](https://www.harborframework.com/docs/tasks) and
+[agent](https://www.harborframework.com/docs/agents) concepts. This is not yet an
+embedded Harbor runtime. Full Harbor task-pack import/validation, Harbor-managed
+jobs, Aider, Mini-SWE-Agent, and Terminus-2 are deferred integrations. When added,
+each external scaffold and revision will remain a separate run-contract dimension;
+results will never be silently pooled.
 
-- the model endpoint remains private and is not exposed to the sandbox or internet;
-- every inference passes through one instrumented gateway that can decode routing;
-- the scaffold is small enough that model/profile effects are not buried under a
-  complicated agent implementation.
+Two provider implementations exist:
 
-Harbor's Terminus-2 and installed agents such as Aider or OpenHands can be added as
-explicit alternative scaffolds. Results from different scaffolds will never be
-silently pooled. The measured system is always `model + expert profile + agent
-scaffold + tools + prompt + budget + sandbox + benchmark revision`.
+- `fake` is an in-memory contract double. It returns only exact scripted command
+  responses, returns exit `127` for anything else, and never invokes a local
+  subprocess.
+- `daytona` performs remote create/upload/exec/read/delete through the exact
+  [`daytona==0.192.0`](https://pypi.org/project/daytona/0.192.0/) pin. Listing
+  provider status is local; explicit preflight is a bounded read-only list request
+  that creates no sandbox. See Daytona's
+  [async SDK lifecycle](https://www.daytona.io/docs/en/python-sdk/async/async-daytona/).
 
-The sandbox provider API key remains in the controller and is never passed to the
-agent task. Network access will be disabled or allowlisted after environment setup
-whenever the benchmark permits it. Sandbox lifecycle, timeout, CPU/RAM/disk limits,
-and deletion are part of the durable job state.
+The Daytona API key remains in the controller and is never passed to the agent task.
+Real sandboxes are private and ephemeral, receive only task files plus an empty
+environment/secrets map, carry controller/run/trial ownership labels, enforce the
+requested deny/allowlist/public egress policy, and are verified before operations
+and deletion. Cleanup polls until destruction is confirmed. Sandbox session state,
+timeouts, CPU/RAM/disk requests, verifier output, deletion failures, and sanitized
+provider errors are persisted. The live Daytona lifecycle remains an acceptance
+target, not a locally verified claim.
 
 ### Model registry
 
@@ -384,7 +414,20 @@ Agentic coding is a major product track, but it should not be reduced to one
 leaderboard number. The suite will use a ladder whose rungs stress different failure
 modes and costs.
 
-#### 1. Aider Polyglot: integration and quick regression
+#### Implemented smoke rung: three native Python tasks
+
+The current `smoke-python-v1` pack is an immutable, content-addressed native pack
+with `fix-subtract`, `implement-slugify`, and `repair-json-cli`. Each task is Python
+3.12 standard-library-only, requests no egress, has a 180-second limit, and is marked
+with a passing oracle and failing no-op. This rung exists to validate controller,
+sandbox, verifier, ATIF, routing, persistence, profile lineage, and cleanup plumbing;
+three passes are not evidence of broad coding quality.
+
+The pack is Harbor-compatible by design but is not a general Harbor task-pack
+importer. The public suites and external agents below remain planned expansion after
+the real three-task lifecycle is clean.
+
+#### Planned 1. Aider Polyglot: integration and quick regression
 
 Aider Polyglot contains 225 executable Exercism tasks across C++, Go, Java,
 JavaScript, Python, and Rust. It is not a faithful substitute for long-horizon
@@ -403,7 +446,7 @@ Initial use:
   with the benchmark's native harness; do not pool those results with the default
   agent.
 
-#### 2. FeatureBench Fast: primary feature-development signal
+#### Planned 2. FeatureBench Fast: primary feature-development signal
 
 FeatureBench measures complex feature implementation rather than only bug repair. Its
 Fast split has 100 CPU-only instances and is designed for quicker evaluation, while
@@ -423,7 +466,7 @@ This is the most relevant public benchmark for the stated goal because feature w
 requires codebase discovery, planning, multi-file editing, tests, and recovery over a
 longer trajectory.
 
-#### 3. Terminal-Bench 2.1: terminal autonomy and workflow breadth
+#### Planned 3. Terminal-Bench 2.1: terminal autonomy and workflow breadth
 
 Terminal-Bench 2.1 is the corrected, continuously validated revision of Terminal-
 Bench 2.0. Its 89 tasks cover debugging, building, data processing, security, Git,
@@ -444,7 +487,7 @@ Initial use:
 Terminal-Bench 3 is still under construction as of this roadmap update, so it is not
 a reproducibility target yet.
 
-#### 4. Custom Harbor tasks: task-specific specialization
+#### Planned 4. Custom Harbor tasks: task-specific specialization
 
 Public benchmarks are useful calibration, but the product's purpose is to specialize
 models for a real workflow. The app will therefore support importing or authoring a
@@ -463,7 +506,7 @@ eligible for profile-selection runs. Private source code is sent to the configur
 sandbox provider, so the UI must display that data boundary and later support a
 self-hosted provider for sensitive repositories.
 
-#### 5. Later research/reference suites
+#### Planned 5. Later research/reference suites
 
 - **SWE-rebench V2:** promising for fresher, contamination-aware, multi-language
   repository tasks. Add it after its task images and evaluator are proven against a
@@ -486,8 +529,7 @@ more target cohorts and be validated on a held-out task pack from a different so
 ### Agentic run contract
 
 An agentic task is one benchmark item with multiple model calls and environment
-actions. The controller will store the complete Harbor Agent Trajectory Interchange
-Format (ATIF) record plus:
+actions. The controller stores an `ATIF-v1.7` trajectory plus:
 
 - benchmark/task/environment image revision and verifier result;
 - agent name, source revision, prompt, tool schema, and all agent arguments;
@@ -498,27 +540,31 @@ Format (ATIF) record plus:
 - task reward, partial metrics, termination cause, and sandbox/provider metadata.
 
 Every model turn passes through an instrumented local gateway. It forwards the
-request to vLLM, decodes the fork's custom routing arrays, stores them against the
-trajectory step, and returns the ordinary model response to the agent. The initial UI
-will aggregate engagement per inference, turn, and complete episode.
+request to the current model runtime, decodes the fork's custom routing arrays,
+stores a routing artifact and inference record against the trajectory step, and
+returns the ordinary response to the controller. The implemented trial view exposes
+the trajectory, verifier/artifact records, inference list, and aggregate routing
+heatmap.
 
 Multi-turn prompts often repeat conversation history, so raw routing counts can
 double-count earlier context. The product will label the initial aggregate as
 **served-token engagement**. Generated-token-only, novel-context, and semantic phase
 views will ship only after token-span alignment is verified against the fork. Until
-then, profile proposals can filter by episode success and turn number but will not
-claim that repeated prompt tokens are unique evidence.
+then, a proposal from trial routing is served-token evidence and must not be described
+as unique-token attribution.
 
-Agentic comparison requires a stricter compatibility fingerprint than one-request
-evaluation. It includes the benchmark/task revision, environment image digest,
-verifier, agent/scaffold revision, system prompt, tool schema, generation settings,
-turn/token/time budgets, sandbox provider, network policy, and attempt seed. A base
-and masked run with different scaffolds or budgets is not a paired comparison.
+The implemented agent-run contract fingerprint covers the immutable task pack and
+selected task revisions, agent/system/tool revisions, generation settings, budgets,
+sandbox provider/policy, attempts, and seed. The model-session/profile fingerprint is
+stored separately so the same contract can be rerun under a different profile. A
+formal agentic paired-comparison resource and UI remain deferred; morning acceptance
+must compare exported runs and reject any unintended contract mismatch manually.
 
-Agent outcomes are stochastic even at low temperature. Exploratory runs may use
-`pass@1`; conclusions about a profile should use repeated attempts and report
-`pass@k`, mean reward, confidence intervals, and success/failure transitions. The UI
-will never silently mix task attempts or choose the best attempt after the fact.
+Agent outcomes are stochastic even at low temperature. The current smoke ladder uses
+one attempt per task only to validate plumbing. Conclusions about a profile should
+use repeated attempts and eventually report `pass@k`, mean reward, confidence
+intervals, and success/failure transitions. The UI must never silently mix task
+attempts or choose the best attempt after the fact.
 
 The benchmark browser will support split/category filters, text search, seeded
 sampling, manual checkboxes, select-all-from-filter, and saved cohorts. A run stores
@@ -610,6 +656,13 @@ Each proposal produces a preview, rationale, coverage metrics, validation result
 and a diff from its parent profile. Assisted selection will not claim causal expert
 importance; only ablation or masked reruns provide causal evidence.
 
+The agentic slice currently implements only the fixed-budget path from one trial:
+`POST /api/trials/{trial_id}/profile-proposal` proposes 64 experts per layer by
+`routing_mass` by default. Saving it with `source="agentic"` and `source_trial_id`
+preserves lineage; loading it through the existing model-session flow restarts vLLM.
+Multi-trial aggregation and a one-click agentic paired-comparison workflow remain
+future work.
+
 ## Result and comparison experience
 
 A run detail page will show status, provenance, aggregate score, category scores,
@@ -685,20 +738,26 @@ POST /api/runs
 GET  /api/runs/{id}
 POST /api/runs/{id}/cancel
 GET  /api/runs/{id}/routing
-GET  /api/runs/{id}/items
-GET  /api/runs/{id}/trials
-GET  /api/trials/{id}/trajectory
-GET  /api/trials/{id}/artifacts
 
 GET  /api/agents
 GET  /api/sandbox-providers
-POST /api/agent-task-packs/validate
-POST /api/agent-task-packs
+POST /api/sandbox-providers/{id}/preflight
+GET  /api/agent-task-packs
+GET  /api/agent-task-packs/{id}/tasks
+POST /api/agent-runs
+GET  /api/agent-runs/{id}
+POST /api/agent-runs/{id}/cancel
+GET  /api/agent-runs/{id}/export
+GET  /api/trials/{id}
+GET  /api/trials/{id}/trajectory
+GET  /api/trials/{id}/export/atif
+GET  /api/trials/{id}/routing
+GET  /api/trials/{id}/artifacts
+POST /api/trials/{id}/profile-proposal
 
 POST /api/profiles/propose
 POST /api/profiles
 GET  /api/profiles/{id}
-POST /api/profiles/{id}/validate
 POST /api/comparisons
 
 GET  /api/jobs/{id}
@@ -706,8 +765,9 @@ GET  /healthz
 GET  /readyz
 ```
 
-The browser will poll model sessions, jobs, and runs. Endpoint contracts will be
-specified in OpenAPI and consumed by a generated TypeScript client.
+The browser polls model sessions, jobs, and runs. FastAPI publishes these contracts
+through OpenAPI; the current frontend uses explicit TypeScript request/response
+types rather than a generated client.
 
 ## Implementation milestones
 
@@ -788,27 +848,37 @@ same cohort, and understand both the quality delta and eligibility reduction.
 
 ### Milestone 6: agentic coding foundation
 
-- Pin Harbor, the default external agent scaffold, ATIF schema, and sandbox-provider
-  dependencies.
-- Add Daytona configuration and credential checks without passing its API key to
-  task environments.
-- Implement the instrumented local model gateway and link every agent inference to
-  routed-expert artifacts.
-- Add durable sandbox/trial lifecycle, cancellation, timeout, cleanup, and orphan
-  reconciliation.
-- Add three tiny custom agent tasks whose oracle passes and no-op fails for fast
-  end-to-end testing.
-- Add Aider Polyglot and its 12-task smoke cohort.
-- Add a trajectory viewer with turns, commands, observations, patch, verifier output,
-  token/budget usage, and per-turn expert engagement.
-- Extend comparison fingerprints and exports with scaffold/environment metadata.
+- **Implemented:** native `bash-json-v1` scaffold with bounded JSON shell actions.
+- **Implemented:** `ATIF-v1.7` models/exports and a per-inference instrumented local
+  model gateway linked to routed-expert artifacts.
+- **Implemented:** provider status/preflight plus a fake provider that cannot execute
+  host subprocesses and a lazy Daytona adapter pinned to `0.192.0`.
+- **Implemented:** controller-owned credentials, private ephemeral sandboxes, empty
+  task env/secrets, ownership labels, network policy, bounded I/O, and confirmed
+  deletion.
+- **Implemented:** durable run/trial/sandbox/inference state, cancellation and
+  restart reconciliation, artifact manifests, trajectory/routing views, and export.
+- **Implemented:** canonical verifier restoration with isolated Python execution,
+  plus startup recovery that deletes only exact-label interrupted Daytona sandboxes
+  and blocks new work while retryable cleanup remains pending.
+- **Implemented:** immutable `smoke-python-v1` with three oracle-pass/no-op-fail tasks.
+- **Implemented:** one-trial routing proposal → agentic profile lineage → model
+  profile reload → same-task rerun path.
+- **Remaining:** real RTX/Daytona create/upload/exec/read/delete and cleanup
+  acceptance, formal paired comparison, multi-trial profile aggregation, and a
+  periodic cleanup janitor beyond startup/new-run retries.
 
-Acceptance: a baseline and masked model can run the identical 12-task Aider cohort in
-isolated remote sandboxes, retain complete trajectories and routing for every model
-call, clean up every sandbox, and produce a valid paired comparison.
+Acceptance for this milestone is now the seven-trial paid ladder: one Daytona canary,
+three baseline tasks, one representative-trial profile reload, and the identical
+three masked tasks, all with valid ATIF/routing/verifier artifacts and no remote
+sandbox left behind. This is intentionally smaller than a public benchmark claim.
 
 ### Milestone 7: repository-level agentic coding
 
+- Integrate the full pinned Harbor runtime/task adapters after validating the native
+  provider and artifact boundaries.
+- Add Aider or Mini-SWE-Agent as an explicitly versioned external scaffold and add
+  Aider Polyglot with a curated 12-task smoke cohort.
 - Add FeatureBench Fast with a verified 10-task starter cohort and full Fast split.
 - Add Terminal-Bench 2.1 with a verified coding/engineering cohort and full dataset
   access.
@@ -861,9 +931,13 @@ comparable with the logical-mask experiments.
 - Run compatibility fingerprints and paired comparison statistics.
 - Job state transitions, cancellation, crash recovery, and database migrations.
 - Model-process lifecycle against a fake OpenAI-compatible server.
-- Instrumented agent-gateway linkage using a fake multi-turn vLLM response.
-- Harbor task-pack validation, ATIF ingestion, trial recovery, and sandbox cleanup
-  against a fake environment provider.
+- Instrumented per-inference agent-gateway linkage using fake multi-turn model
+  responses and routing arrays.
+- Native task-pack validation/fingerprints, `ATIF-v1.7` construction/export, trial
+  recovery, and sandbox cleanup against a fake environment provider.
+- Fake-provider tests that prove unscripted commands fail closed without invoking a
+  local process, plus mocked Daytona contract tests for preflight, ownership,
+  upload/exec/read, redaction, timeout, and deletion behavior.
 - Frontend components, expert selection interactions, accessibility, and responsive
   views.
 - Docker startup and same-origin API smoke tests.
@@ -883,16 +957,46 @@ comparable with the logical-mask experiments.
 
 ### Agentic acceptance tests
 
-1. Verify the sandbox provider independently with a Harbor oracle and no-op trial.
-2. Run one custom smoke task through the external agent and local model gateway.
-3. Confirm every model inference has a trajectory step and routed ID/weight artifact.
-4. Confirm generated code and tests execute only in the remote sandbox.
-5. Cancel a running trial and verify the sandbox is deleted and the job is recoverable.
-6. Run the pinned 12-task Aider cohort on baseline and masked model sessions.
-7. Verify scaffold, environment, budgets, and attempts match before comparison.
-8. Render/export full trajectories, verifier artifacts, routing, and `pass@k` inputs.
-9. Run an oracle-verified FeatureBench and Terminal-Bench starter task.
-10. Simulate controller and Pod restarts and reconcile orphaned remote sandboxes.
+The target RTX PRO 6000 and Daytona lifecycle were not exercised tonight. Tomorrow's
+first paid run is intentionally serialized, uses one attempt, and stops at the first
+cleanup/provenance failure:
+
+1. **Boot and pin:** deploy one immutable image with the agentic Runpod template,
+   secret references, and intended network volume. Require `/readyz`, authenticated
+   UI access, a ready baseline model session, and recorded image/fork/model/runtime/
+   GPU provenance.
+2. **Preflight:** call `POST /api/sandbox-providers/daytona/preflight`. Require
+   configured, reachable, authenticated, and ready; verify the sanitized response has
+   the expected host/region, no credential, and that the read-only list call created
+   no sandbox.
+3. **Raw one-task canary:** run only `fix-subtract` from `smoke-python-v1` with
+   `bash-json-v1`, Daytona, `attempts=1`, `seed=0`, the baseline session, and recorded
+   generation/budgets. Require reward `1`, passing verifier, valid `ATIF-v1.7`, at
+   least one linked inference/routing artifact, remote-only code/test execution, and
+   confirmed sandbox deletion.
+4. **All-three baseline:** run `fix-subtract`, `implement-slugify`, and
+   `repair-json-cli` with the identical contract. Require 3/3 for this plumbing gate,
+   complete trajectory/verifier/routing artifacts, export the run, and require zero
+   owned Daytona sandboxes.
+5. **Derive and reload:** select one representative successful baseline trial; call
+   its profile-proposal endpoint with `keep_per_layer=64&metric=routing_mass`; save
+   the result with `source="agentic"` and that `source_trial_id`. Record fingerprint,
+   lineage, metric, and observed mass, load it, and require a new ready model session
+   with the expected profile ID/document; require the masked run to report the saved
+   fingerprint. This profile is single-trial-derived, not a three-task aggregate.
+6. **Same-three masked:** rerun the exact pack revision, three task IDs/order, agent
+   revision, provider, attempts, seed, generation, and budgets using only the new
+   profile-backed session. Require complete artifacts and zero sandbox leaks. Export
+   both runs and compare reward/pass, turns, commands, tokens, termination, and
+   routing descriptively; formal paired statistics are not implemented yet.
+7. **Teardown:** verify no Daytona sandbox retains the controller/run/trial ownership
+   labels, stop or terminate the GPU Pod, and retain the network volume only
+   intentionally.
+
+This ladder is seven paid task trials total (one canary, three baseline, three
+masked). Full Harbor/Aider, cancellation/orphan recovery against live infrastructure,
+public benchmark cohorts, repeated attempts, and held-out validation follow only
+after this gate passes.
 
 Before calling deployment complete, readiness must be verified with a real browser or
 HTTP request through Runpod's public proxy, not only with the Pod's `Running` status.
@@ -934,10 +1038,10 @@ but infrastructure choices must be resolved before target-GPU or agentic accepta
 2. **Container registry:** publish to GHCR under `sampazdan`, Docker Hub, or a private
    registry? The roadmap assumes GHCR with immutable SHA tags unless directed
    otherwise.
-3. **Sandbox provider:** the agentic plan assumes Daytona first because it is Harbor's
-   recommended horizontally scalable option and supports multi-container tasks. Is
-   adding a Daytona account/API key acceptable, or should Modal, E2B, EC2, or a
-   self-hosted provider be the initial target?
+3. **Daytona account and region:** the initial provider is implemented. Before paid
+   acceptance, confirm the account/API key, `us` versus `eu` target, billing limits,
+   and whether sending the bundled or later private task files to that provider is
+   acceptable.
 4. **Private-code boundary:** will custom agent tasks contain private repositories?
    If so, the initial provider and retention policy must be approved for that data,
    or custom private tasks should wait for a self-hosted sandbox.
@@ -975,8 +1079,16 @@ behavior without executing generated code in the model Pod.
 - [vLLM benchmark CLI](https://docs.vllm.ai/en/stable/benchmarking/cli/)
 - [Qwen3.6-35B-A3B-FP8 model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)
 - [Harbor agent evaluation framework](https://github.com/harbor-framework/harbor)
+- [Harbor v0.20.0 release](https://github.com/harbor-framework/harbor/releases/tag/v0.20.0)
+- [Harbor tasks](https://www.harborframework.com/docs/tasks)
+- [Harbor agent integrations](https://www.harborframework.com/docs/agents)
 - [Harbor cloud sandbox providers](https://www.harborframework.com/docs/run-jobs/cloud-sandboxes)
 - [Harbor ATIF trajectory format](https://github.com/harbor-framework/harbor/blob/main/rfcs/0001-trajectory-format.md)
+- [Daytona Python SDK](https://www.daytona.io/docs/en/python-sdk/)
+- [Daytona async SDK lifecycle](https://www.daytona.io/docs/en/python-sdk/async/async-daytona/)
+- [Daytona API keys](https://www.daytona.io/docs/api-keys/)
+- [Daytona network limits](https://www.daytona.io/docs/en/network-limits/)
+- [Daytona Python SDK 0.192.0](https://pypi.org/project/daytona/0.192.0/)
 - [Mini-SWE-Agent](https://github.com/SWE-agent/mini-swe-agent)
 - [Aider Polyglot benchmark](https://github.com/Aider-AI/aider/blob/main/benchmark/README.md)
 - [FeatureBench](https://github.com/LiberCoders/FeatureBench)

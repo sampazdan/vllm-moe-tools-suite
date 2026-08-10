@@ -12,6 +12,8 @@ from uuid import uuid4
 import numpy as np
 
 from . import __version__
+from .agentic.controller import AgenticController
+from .agentic.domain import CreateAgentRunRequest
 from .benchmarks import BenchmarkAdapter, BenchmarkCatalog
 from .domain import (
     BenchmarkCohort,
@@ -128,6 +130,13 @@ class ResearchLab:
         self._job_guard = Lock()
         self.runtime: ModelRuntime = self._create_runtime()
         self.server = self._create_server()
+        self.agentic = AgenticController(
+            settings=settings,
+            store=self.store,
+            runtime=self.runtime,
+            topology=self.topology,
+            model_id=MODEL_ID,
+        )
 
     def _create_runtime(self) -> ModelRuntime:
         if self.settings.mode == "vllm":
@@ -153,6 +162,9 @@ class ResearchLab:
 
     def list_benchmarks(self) -> list[BenchmarkInfo]:
         return self.benchmark_catalog.list_benchmarks()
+
+    async def startup(self) -> None:
+        await self.agentic.cleanup_interrupted_sandboxes()
 
     def list_benchmark_items(
         self,
@@ -283,6 +295,27 @@ class ResearchLab:
             progress_total=1,
         )
 
+    def submit_agent_run(self, request: CreateAgentRunRequest) -> JobRecord:
+        model_session = self.model_sessions.get(request.model_session_id)
+        self.agentic.validate_run_request(request, model_session)
+        run_id = str(uuid4())
+        job_id = str(uuid4())
+        job = self._queue_job(
+            kind=JobKind.AGENT_RUN,
+            payload={"run_id": run_id},
+            progress_total=len(request.task_ids) * request.attempts,
+            job_id=job_id,
+            result_id=run_id,
+        )
+        assert model_session is not None
+        self.agentic.create_run(
+            run_id=run_id,
+            job_id=job_id,
+            request=request,
+            model_session=model_session,
+        )
+        return job
+
     async def execute_job(self, job_id: str) -> None:
         with self._job_guard:
             artifacts = self.jobs[job_id]
@@ -307,9 +340,23 @@ class ResearchLab:
                     job_id=job_id,
                     cohort_id=str(artifacts.payload["cohort_id"]),
                 )
-            else:
+            elif job.kind is JobKind.DATASET_PREPARE:
                 result = await self.benchmark_catalog.prepare(
                     str(artifacts.payload["benchmark_id"]),
+                    on_progress=lambda current, total: self._update_job_progress(
+                        job_id, current, total
+                    ),
+                    should_cancel=lambda: self._job_cancelled(job_id),
+                )
+            else:
+                run_id = str(artifacts.payload["run_id"])
+                agent_run = self.agentic.runs[run_id]
+                model_session = self.model_sessions.get(agent_run.model_session_id)
+                if model_session is None:
+                    raise RuntimeError("agent run references a missing model session")
+                result = await self.agentic.execute_run(
+                    run_id,
+                    model_session=model_session,
                     on_progress=lambda current, total: self._update_job_progress(
                         job_id, current, total
                     ),
@@ -328,7 +375,8 @@ class ResearchLab:
 
         with self._job_guard:
             job.result_id = result.id
-            if job.status is JobStatus.CANCELLED:
+            if job.status in {JobStatus.CANCELLING, JobStatus.CANCELLED}:
+                job.status = JobStatus.CANCELLED
                 job.completed_at = job.completed_at or datetime.now(UTC)
                 self.store.save_job(job, artifacts.payload)
                 return
@@ -354,8 +402,14 @@ class ResearchLab:
                 return job.model_copy(deep=True)
             if job.kind is JobKind.MODEL_LOAD:
                 raise ValueError("model-load cancellation is not implemented")
-            job.status = JobStatus.CANCELLED
-            job.completed_at = datetime.now(UTC)
+            if job.kind is JobKind.AGENT_RUN and job.status is JobStatus.RUNNING:
+                job.status = JobStatus.CANCELLING
+                self.agentic.request_cancel(str(artifacts.payload["run_id"]))
+            else:
+                job.status = JobStatus.CANCELLED
+                job.completed_at = datetime.now(UTC)
+                if job.kind is JobKind.AGENT_RUN:
+                    self.agentic.cancel_queued_run(str(artifacts.payload["run_id"]))
             self.store.save_job(job, artifacts.payload)
             return job.model_copy(deep=True)
 
@@ -367,7 +421,10 @@ class ResearchLab:
             if self.server is not None:
                 await self.server.aclose()
         finally:
-            await self.runtime.aclose()
+            try:
+                await self.agentic.aclose()
+            finally:
+                await self.runtime.aclose()
         if self.session is not None and self.session.state is ModelState.STOPPING:
             self.session.state = ModelState.STOPPED
             self.store.save_model_session(self.session)
@@ -582,19 +639,23 @@ class ResearchLab:
         kind: JobKind,
         payload: dict[str, object],
         progress_total: int,
+        job_id: str | None = None,
+        result_id: str | None = None,
     ) -> JobRecord:
         with self._job_guard:
             active = any(
-                artifacts.record.status in {JobStatus.QUEUED, JobStatus.RUNNING}
+                artifacts.record.status
+                in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CANCELLING}
                 for artifacts in self.jobs.values()
             )
             if active:
                 raise RuntimeError("another job is already active")
             job = JobRecord(
-                id=str(uuid4()),
+                id=job_id or str(uuid4()),
                 kind=kind,
                 status=JobStatus.QUEUED,
                 progress_total=progress_total,
+                result_id=result_id,
             )
             self.jobs[job.id] = JobArtifacts(record=job, payload=payload)
             self.store.save_job(job, payload)
@@ -611,7 +672,10 @@ class ResearchLab:
 
     def _job_cancelled(self, job_id: str) -> bool:
         with self._job_guard:
-            return self.jobs[job_id].record.status is JobStatus.CANCELLED
+            return self.jobs[job_id].record.status in {
+                JobStatus.CANCELLING,
+                JobStatus.CANCELLED,
+            }
 
     def list_runs(self) -> list[BenchmarkRun]:
         return sorted(
@@ -658,6 +722,8 @@ class ResearchLab:
             raise ValueError("; ".join(validation.errors))
 
         source_run = None
+        source_trial = None
+        source_routing = None
         if request.source_run_id is not None:
             source_run = self.runs.get(request.source_run_id)
             if source_run is None:
@@ -665,6 +731,18 @@ class ResearchLab:
             source_session = self.model_sessions.get(source_run.run.model_session_id)
             if source_session is None or source_session.model_id != request.model_id:
                 raise ValueError("source run belongs to a different model")
+            source_routing = source_run.routing
+        if request.source_trial_id is not None:
+            source_trial = self.agentic.trials.get(request.source_trial_id)
+            if source_trial is None:
+                raise KeyError(request.source_trial_id)
+            source_session = self.model_sessions.get(source_trial.model_session_id)
+            if source_session is None or source_session.model_id != request.model_id:
+                raise ValueError("source trial belongs to a different model")
+            try:
+                source_routing = self.agentic.get_routing(source_trial.id)
+            except KeyError as error:
+                raise ValueError("source trial has no routing telemetry") from error
 
         if request.parent_profile_id is not None:
             parent = self.profiles.get(request.parent_profile_id)
@@ -682,12 +760,13 @@ class ResearchLab:
             profile_fingerprint=_profile_fingerprint(request.profile),
             source=request.source,
             source_run_id=request.source_run_id,
+            source_trial_id=request.source_trial_id,
             parent_profile_id=request.parent_profile_id,
             metric=request.metric,
             validation=validation,
             observed_mass_retained=(
-                calculate_observed_mass_retained(source_run.routing, request.profile)
-                if source_run is not None
+                calculate_observed_mass_retained(source_routing, request.profile)
+                if source_routing is not None
                 else None
             ),
         )
@@ -827,6 +906,21 @@ class ResearchLab:
             self.topology,
             request.keep_per_layer,
             request.metric,
+        )
+
+    def propose_agent_profile(
+        self,
+        trial_id: str,
+        *,
+        keep_per_layer: int,
+        metric: str,
+    ) -> ProfileProposal:
+        routing = self.agentic.get_routing(trial_id)
+        return propose_fixed_budget_profile(
+            routing,
+            self.topology,
+            keep_per_layer,
+            metric,
         )
 
 

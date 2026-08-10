@@ -20,11 +20,13 @@ class JobKind(StrEnum):
     MODEL_LOAD = "model_load"
     BENCHMARK_RUN = "benchmark_run"
     DATASET_PREPARE = "dataset_prepare"
+    AGENT_RUN = "agent_run"
 
 
 class JobStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    CANCELLING = "cancelling"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -116,6 +118,7 @@ class ProfileValidation(BaseModel):
 
 class ProfileSource(StrEnum):
     PROPOSAL = "proposal"
+    AGENTIC = "agentic"
     MANUAL = "manual"
     IMPORT = "import"
 
@@ -127,6 +130,7 @@ class CreateExpertProfileRequest(BaseModel):
     profile: ExpertProfile
     source: ProfileSource = ProfileSource.MANUAL
     source_run_id: str | None = None
+    source_trial_id: str | None = None
     parent_profile_id: str | None = None
     metric: Literal["routing_mass", "selection_count"] | None = None
     observed_mass_retained: Annotated[float, Field(ge=0, le=1)] | None = None
@@ -143,10 +147,16 @@ class CreateExpertProfileRequest(BaseModel):
     def validate_provenance(self) -> CreateExpertProfileRequest:
         if self.source is ProfileSource.PROPOSAL and self.source_run_id is None:
             raise ValueError("proposal profiles require source_run_id")
-        if self.metric is not None and self.source_run_id is None:
-            raise ValueError("profile metric requires source_run_id")
-        if self.observed_mass_retained is not None and self.source_run_id is None:
-            raise ValueError("observed mass requires source_run_id")
+        if self.source is ProfileSource.AGENTIC and self.source_trial_id is None:
+            raise ValueError("agentic profiles require source_trial_id")
+        if self.source_run_id is not None and self.source_trial_id is not None:
+            raise ValueError("profile can reference a run or a trial, not both")
+        if self.metric is not None and not (self.source_run_id or self.source_trial_id):
+            raise ValueError("profile metric requires source routing")
+        if self.observed_mass_retained is not None and not (
+            self.source_run_id or self.source_trial_id
+        ):
+            raise ValueError("observed mass requires source routing")
         return self
 
 
@@ -159,6 +169,7 @@ class SavedExpertProfile(BaseModel):
     profile_fingerprint: str
     source: ProfileSource
     source_run_id: str | None = None
+    source_trial_id: str | None = None
     parent_profile_id: str | None = None
     metric: Literal["routing_mass", "selection_count"] | None = None
     validation: ProfileValidation
@@ -194,6 +205,7 @@ class GenerationConfig(BaseModel):
     temperature: Annotated[float, Field(ge=0, le=2)] = 0
     max_tokens: Annotated[int, Field(ge=1, le=4096)] = 512
     seed: int | None = 0
+    enable_thinking: bool = False
 
 
 class BenchmarkItem(BaseModel):

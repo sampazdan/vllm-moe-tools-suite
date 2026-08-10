@@ -1,10 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { AgenticWorkbench } from "./AgenticWorkbench";
 import { api, setCsrfToken, waitForJob } from "./api";
 import { ExpertHeatmap } from "./ExpertHeatmap";
 import { ResearchArchive } from "./ResearchArchive";
 import type {
+  AgentRun,
   BenchmarkDatasetRecord,
   BenchmarkInfo,
   BenchmarkItemPage,
@@ -43,6 +45,10 @@ export default function App() {
   const [keepPerLayer, setKeepPerLayer] = useState(64);
   const [profileName, setProfileName] = useState("Workload profile · 64/layer");
   const [activeJob, setActiveJob] = useState<JobRecord | null>(null);
+  const [agentRunActive, setAgentRunActive] = useState(false);
+  const [requestedAgentRunId, setRequestedAgentRunId] = useState<string | null>(
+    null,
+  );
   const [metric, setMetric] = useState<"routing_mass" | "selection_counts">(
     "routing_mass",
   );
@@ -123,6 +129,11 @@ export default function App() {
   const comparisonsQuery = useQuery({
     queryKey: ["comparisons"],
     queryFn: () => api<ComparisonRecord[]>("/api/comparisons"),
+    enabled: accessReady,
+  });
+  const agentRunsQuery = useQuery({
+    queryKey: ["agent-runs"],
+    queryFn: () => api<AgentRun[]>("/api/agent-runs"),
     enabled: accessReady,
   });
   const routingRun =
@@ -416,6 +427,7 @@ export default function App() {
     baselineRun?.score != null && maskedRun?.score != null
       ? maskedRun.score - baselineRun.score
       : null;
+  const workBusy = Boolean(activeJob) || agentRunActive;
 
   if (sessionQuery.isPending) {
     return <div className="app-loading">Preparing the workbench…</div>;
@@ -476,6 +488,9 @@ export default function App() {
           <a className="nav-item" href="#benchmark" aria-label="Benchmarks">
             ◫<span>Bench</span>
           </a>
+          <a className="nav-item" href="#agentic" aria-label="Agentic coding">
+            ⌘<span>Code</span>
+          </a>
           <a className="nav-item" href="#engagement" aria-label="Profiles">
             ⌁<span>Experts</span>
           </a>
@@ -525,6 +540,8 @@ export default function App() {
               <strong>
                 {activeJob.status === "queued"
                   ? "Queued"
+                  : activeJob.status === "cancelling"
+                    ? "Cleaning up"
                   : activeJob.status === "cancelled"
                     ? "Cancelled"
                     : "Working"}
@@ -584,7 +601,7 @@ export default function App() {
             <button
               className="primary-button"
               onClick={() => loadModel.mutate()}
-              disabled={loadModel.isPending || Boolean(activeJob)}
+              disabled={loadModel.isPending || workBusy}
             >
               {loadModel.isPending
                 ? "Loading…"
@@ -649,7 +666,7 @@ export default function App() {
             <div className="benchmark-actions">
               <button
                 className="text-button"
-                disabled={importCustomBenchmark.isPending || Boolean(activeJob)}
+                disabled={importCustomBenchmark.isPending || workBusy}
                 onClick={() => customBenchmarkInput.current?.click()}
               >
                 {importCustomBenchmark.isPending ? "Importing…" : "Import JSONL"}
@@ -663,7 +680,7 @@ export default function App() {
                     currentModelQuery.isPending ||
                     selectedCount === 0 ||
                     runBaseline.isPending ||
-                    Boolean(activeJob)
+                    workBusy
                   }
                   onClick={() => runBaseline.mutate()}
                 >
@@ -672,7 +689,7 @@ export default function App() {
               ) : (
                 <button
                   className="primary-button"
-                  disabled={prepareBenchmark.isPending || Boolean(activeJob)}
+                  disabled={prepareBenchmark.isPending || workBusy}
                   onClick={() => prepareBenchmark.mutate()}
                 >
                   {prepareBenchmark.isPending ? "Preparing…" : "Prepare dataset"}
@@ -745,6 +762,16 @@ export default function App() {
           </details>
         )}
 
+        <AgenticWorkbench
+          mode={statusQuery.data?.mode ?? "mock"}
+          modelState={statusQuery.data?.model_state ?? "unloaded"}
+          currentModelSession={currentModelQuery.data ?? null}
+          busy={Boolean(activeJob)}
+          requestedRunId={requestedAgentRunId}
+          onRequestedRunOpened={() => setRequestedAgentRunId(null)}
+          onActivityChange={setAgentRunActive}
+        />
+
         {routingRun && (
           <section className="run-summary">
             <div>
@@ -793,7 +820,7 @@ export default function App() {
           <section className="engagement-section" id="engagement">
             <div className="section-intro">
               <div>
-                <span className="section-label">03 · Expert engagement</span>
+                <span className="section-label">04 · Expert engagement</span>
                 <h2>The shape of this workload</h2>
               </div>
               <div className="analysis-controls">
@@ -912,7 +939,7 @@ export default function App() {
                       disabled={
                         baselineRun?.status !== "completed" ||
                         runMasked.isPending ||
-                        Boolean(activeJob)
+                        workBusy
                       }
                       onClick={() => runMasked.mutate()}
                     >
@@ -928,7 +955,7 @@ export default function App() {
                       disabled={
                         !proposal.validation.valid ||
                         loadProfile.isPending ||
-                        Boolean(activeJob)
+                        workBusy
                       }
                       onClick={() => loadProfile.mutate(savedProposal)}
                     >
@@ -947,7 +974,7 @@ export default function App() {
           <section className="comparison-section" id="compare">
             <div className="section-intro">
               <div>
-                <span className="section-label">04 · Paired comparison</span>
+                <span className="section-label">05 · Paired comparison</span>
                 <h2>What changed under the mask</h2>
               </div>
               <span className="cohort-lock">
@@ -1054,12 +1081,13 @@ export default function App() {
             runs={runsQuery.data ?? []}
             profiles={profiles}
             comparisons={comparisonsQuery.data ?? []}
+            agentRuns={agentRunsQuery.data ?? []}
             sessions={modelSessionsQuery.data ?? []}
             modelId={model.id}
             topology={model.topology}
             activeProfileId={activeProfileId}
             busy={
-              Boolean(activeJob) ||
+              workBusy ||
               loadProfile.isPending ||
               createProfile.isPending
             }
@@ -1090,6 +1118,7 @@ export default function App() {
               setRoutingVariant("masked");
               setProposal(null);
             }}
+            onOpenAgentRun={(run) => setRequestedAgentRunId(run.id)}
             onLoadProfile={(profile) => {
               setProposal(null);
               loadProfile.mutate(profile);

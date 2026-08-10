@@ -48,7 +48,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MOE_TOOLS_APP_ROOT=/opt/moe-tools-test-suite \
     MOE_TOOLS_DATA_DIR=/workspace/moe-tools \
     MOE_TOOLS_FRONTEND_DIST=/opt/moe-tools-test-suite/frontend/dist \
-    MOE_TOOLS_VLLM_BASE_URL=http://127.0.0.1:8000
+    MOE_TOOLS_VLLM_BASE_URL=http://127.0.0.1:8000 \
+    MOE_TOOLS_DAYTONA_API_URL=https://app.daytona.io/api \
+    MOE_TOOLS_DAYTONA_TARGET=us
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -70,7 +72,7 @@ RUN apt-get update \
         util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+RUN curl -LsSf https://astral.sh/uv/0.11.32/install.sh | sh \
     && uv venv --python 3.12 /opt/vllm-venv
 
 WORKDIR /opt/vllm-src
@@ -86,10 +88,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --torch-backend=auto
 
 WORKDIR /opt/moe-tools-test-suite
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync \
+        --python /opt/vllm-venv/bin/python \
+        --active \
+        --frozen \
+        --inexact \
+        --no-dev \
+        --no-install-project
 COPY backend/ backend/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python /opt/vllm-venv/bin/python .
+    uv pip install --python /opt/vllm-venv/bin/python --no-deps .
 COPY --from=frontend-build /build/frontend/dist frontend/dist
 
 COPY --from=vllm_source docker/runpod/profile.sh /etc/profile.d/vllm-runpod.sh

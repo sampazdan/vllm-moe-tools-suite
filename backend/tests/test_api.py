@@ -153,6 +153,7 @@ def test_mock_vertical_slice_creates_profile_and_masked_run(tmp_path: Path) -> N
         "temperature": 0.0,
         "max_tokens": 16,
         "seed": 0,
+        "enable_thinking": False,
     }
     json_export = client.get(f"/api/runs/{baseline_run['id']}/export")
     assert json_export.status_code == 200

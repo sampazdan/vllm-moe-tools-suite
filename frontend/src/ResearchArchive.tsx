@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 
 import type {
+  AgentRun,
   BenchmarkRun,
   ComparisonRecord,
   CreateExpertProfileRequest,
@@ -10,10 +11,11 @@ import type {
   SavedExpertProfile,
 } from "./types";
 
-type ArchiveTab = "runs" | "profiles" | "comparisons";
+type ArchiveTab = "runs" | "coding" | "profiles" | "comparisons";
 
 interface ResearchArchiveProps {
   runs: BenchmarkRun[];
+  agentRuns: AgentRun[];
   profiles: SavedExpertProfile[];
   comparisons: ComparisonRecord[];
   sessions: ModelSession[];
@@ -22,6 +24,7 @@ interface ResearchArchiveProps {
   activeProfileId: string | null;
   busy: boolean;
   onOpenRun: (run: BenchmarkRun, baseline?: BenchmarkRun) => void;
+  onOpenAgentRun: (run: AgentRun) => void;
   onOpenComparison: (baseline: BenchmarkRun, candidate: BenchmarkRun) => void;
   onLoadProfile: (profile: SavedExpertProfile) => void;
   onCreateProfile: (
@@ -31,6 +34,7 @@ interface ResearchArchiveProps {
 
 export function ResearchArchive({
   runs,
+  agentRuns,
   profiles,
   comparisons,
   sessions,
@@ -39,6 +43,7 @@ export function ResearchArchive({
   activeProfileId,
   busy,
   onOpenRun,
+  onOpenAgentRun,
   onOpenComparison,
   onLoadProfile,
   onCreateProfile,
@@ -98,22 +103,23 @@ export function ResearchArchive({
     <section className="archive-section" id="archive">
       <div className="section-intro archive-intro">
         <div>
-          <span className="section-label">05 · Research archive</span>
+          <span className="section-label">06 · Research archive</span>
           <h2>Return to every decision.</h2>
           <p>
-            Runs, profiles, and paired comparisons are stored on the mounted
-            volume and remain available after the Pod or application restarts.
+            Benchmark runs, coding trajectories, profiles, and comparisons are
+            stored on the mounted volume and survive Pod or application restarts.
           </p>
         </div>
         <div className="archive-totals" aria-label="Archive totals">
           <span><strong>{runs.length}</strong> runs</span>
+          <span><strong>{agentRuns.length}</strong> coding</span>
           <span><strong>{profiles.length}</strong> profiles</span>
           <span><strong>{comparisons.length}</strong> comparisons</span>
         </div>
       </div>
 
       <div className="archive-tabs" role="tablist" aria-label="Research archive">
-        {(["runs", "profiles", "comparisons"] as const).map((value) => (
+        {(["runs", "coding", "profiles", "comparisons"] as const).map((value) => (
           <button
             key={value}
             role="tab"
@@ -184,6 +190,49 @@ export function ResearchArchive({
             );
           })}
           {runs.length === 0 && <EmptyArtifact noun="runs" />}
+        </div>
+      )}
+
+      {tab === "coding" && (
+        <div className="archive-grid coding-archive-grid">
+          {agentRuns.map((run) => (
+            <article className="archive-card coding-archive-card" key={run.id}>
+              <div className="archive-card-topline">
+                <span className={`artifact-kind agent-run ${run.status}`}>
+                  {run.status}
+                </span>
+                <time dateTime={run.created_at}>{formatDate(run.created_at)}</time>
+              </div>
+              <strong className="archive-score">
+                {run.status === "queued"
+                  ? "—"
+                  : `${run.passed_trials}/${run.total_trials}`}
+              </strong>
+              <h3>{run.task_pack_name}</h3>
+              <p>
+                {run.sandbox_provider_id} · {run.profile_id
+                  ? `profile ${run.profile_fingerprint?.slice(0, 10) ?? run.profile_id.slice(0, 8)}`
+                  : "baseline"}
+                {run.mean_reward != null
+                  ? ` · ${Math.round(run.mean_reward * 100)}% reward`
+                  : ""}
+                <br />
+                {shortId(run.id)} · {formatAgentRunStatus(run.status)}
+              </p>
+              <div className="artifact-actions archive-run-actions">
+                <button
+                  className="text-button"
+                  onClick={() => onOpenAgentRun(run)}
+                >
+                  Open coding run →
+                </button>
+                <a href={`/api/agent-runs/${run.id}/export`} download>
+                  Export JSON
+                </a>
+              </div>
+            </article>
+          ))}
+          {agentRuns.length === 0 && <EmptyArtifact noun="coding runs" />}
         </div>
       )}
 
@@ -497,4 +546,9 @@ function formatDate(value: string) {
     hour: "numeric",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function formatAgentRunStatus(status: AgentRun["status"]) {
+  if (status === "cancelling") return "cleaning up";
+  return status;
 }

@@ -71,6 +71,10 @@ async def test_managed_server_writes_profile_and_capture_environment(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
     monkeypatch.setenv("MOE_TOOLS_AUTH_TOKEN", "must-not-reach-vllm")
     monkeypatch.setenv("RUNPOD_API_KEY", "must-not-reach-vllm")
+    monkeypatch.setenv("MOE_TOOLS_DAYTONA_API_KEY", "must-not-reach-vllm")
+    monkeypatch.setenv("DAYTONA_API_KEY", "must-not-reach-vllm")
+    monkeypatch.setenv("DAYTONA_JWT_TOKEN", "must-not-reach-vllm")
+    monkeypatch.setenv("DAYTONA_ORGANIZATION_ID", "must-not-reach-vllm")
     transport = httpx.MockTransport(
         lambda request: httpx.Response(
             200, json={"data": [{"id": MODEL_ID}]}, request=request
@@ -94,6 +98,10 @@ async def test_managed_server_writes_profile_and_capture_environment(
         assert environment["RUNPOD_VLLM_MODEL"] == MODEL_ID
         assert "MOE_TOOLS_AUTH_TOKEN" not in environment
         assert "RUNPOD_API_KEY" not in environment
+        assert "MOE_TOOLS_DAYTONA_API_KEY" not in environment
+        assert "DAYTONA_API_KEY" not in environment
+        assert "DAYTONA_JWT_TOKEN" not in environment
+        assert "DAYTONA_ORGANIZATION_ID" not in environment
         profile_path = Path(environment["MOE_PROFILE"])
         assert json.loads(profile_path.read_text()) == profile.model_dump(mode="json")
         process_record = json.loads((manager.runtime_dir / "vllm.pid").read_text())
@@ -128,9 +136,7 @@ async def test_start_stops_validated_orphan_from_previous_app_process(
         manager = _manager(tmp_path, _launcher(tmp_path), client)
         pid_file = manager.runtime_dir / "vllm.pid"
         pid_file.write_text(
-            json.dumps(
-                {"pid": 991, "session_id": "orphan", "start_ticks": "old"}
-            )
+            json.dumps({"pid": 991, "session_id": "orphan", "start_ticks": "old"})
         )
         orphan_alive = True
 

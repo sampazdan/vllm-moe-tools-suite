@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +27,27 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     session_ttl_hours: int = Field(default=24, ge=1, le=168)
     max_custom_dataset_bytes: int = Field(default=2_000_000, ge=1_000, le=5_000_000)
+    agent_controller_id: str = Field(
+        default="moe-tools-suite",
+        min_length=3,
+        max_length=80,
+        pattern=r"^[a-z0-9][a-z0-9._-]*$",
+    )
+    agent_max_output_bytes: int = Field(default=32_000, ge=1_000, le=500_000)
+    agent_max_patch_bytes: int = Field(default=200_000, ge=1_000, le=2_000_000)
+    daytona_api_key: SecretStr | None = Field(default=None, repr=False)
+    daytona_api_url: str = "https://app.daytona.io/api"
+    daytona_target: Literal["us", "eu"] = "us"
+    daytona_create_timeout_seconds: int = Field(default=180, ge=30, le=600)
+
+    @field_validator("daytona_api_key", mode="before")
+    @classmethod
+    def ignore_unresolved_daytona_secret(cls, value: object) -> object:
+        if isinstance(value, str) and (
+            "RUNPOD_SECRET_" in value or value.startswith("REPLACE")
+        ):
+            return None
+        return value
 
     @model_validator(mode="after")
     def validate_security(self) -> "Settings":

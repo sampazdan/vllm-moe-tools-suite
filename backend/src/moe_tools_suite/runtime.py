@@ -30,6 +30,15 @@ class ModelRuntime(Protocol):
         generation: GenerationConfig | None = None,
     ) -> CompletionResult: ...
 
+    async def complete_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_key: str,
+        profile: ExpertProfile | None,
+        generation: GenerationConfig | None = None,
+    ) -> CompletionResult: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -47,7 +56,23 @@ class MockModelRuntime:
         profile: ExpertProfile | None,
         generation: GenerationConfig | None = None,
     ) -> CompletionResult:
+        return await self.complete_chat(
+            [{"role": "user", "content": prompt}],
+            request_key=request_key,
+            profile=profile,
+            generation=generation,
+        )
+
+    async def complete_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_key: str,
+        profile: ExpertProfile | None,
+        generation: GenerationConfig | None = None,
+    ) -> CompletionResult:
         del generation
+        prompt = "\n".join(message.get("content", "") for message in messages)
         seed = int.from_bytes(
             hashlib.sha256(request_key.encode()).digest()[:8], "little"
         )
@@ -108,13 +133,31 @@ class VllmRuntime:
         profile: ExpertProfile | None,
         generation: GenerationConfig | None = None,
     ) -> CompletionResult:
+        return await self.complete_chat(
+            [{"role": "user", "content": prompt}],
+            request_key=request_key,
+            profile=profile,
+            generation=generation,
+        )
+
+    async def complete_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_key: str,
+        profile: ExpertProfile | None,
+        generation: GenerationConfig | None = None,
+    ) -> CompletionResult:
         del request_key, profile
         config = generation or GenerationConfig()
         request_payload: dict[str, object] = {
             "model": self._model_id,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": config.temperature,
             "max_tokens": config.max_tokens,
+            "chat_template_kwargs": {
+                "enable_thinking": config.enable_thinking,
+            },
         }
         if config.seed is not None:
             request_payload["seed"] = config.seed
