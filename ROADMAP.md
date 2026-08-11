@@ -4,21 +4,36 @@ Status: active implementation and release-gating plan, updated 2026-08-11
 
 Implementation status as of 2026-08-11:
 
-- **A previous container crossed the first live boundary:** the authenticated
-  Runpod proxy appliance and supported Qwen model ran on the target RTX PRO 6000,
-  and the native agentic flow completed work through Daytona. That live use exposed
-  two important defects: a transient browser fetch failure could abandon a still-
-  running model-load job, and several expert-profile transitions were confusing or
-  incorrect. This is evidence for the architecture, not acceptance of the current
-  release candidate.
-- **Durable job recovery is implemented in the current local candidate:** a model
+- **The immutable RC3 candidate passed bounded live acceptance:** application commit
+  `6d999f6288592f9414df1745a6371916cacc9fba`, fork commit
+  `729d4f23ae9cc27f797b8c13a9276565976637ed`, and image digest
+  `sha256:bb5e4addc10db7d2f8166d8eef05be3c032ee83533495c7d4f8d3b2dc8026362`
+  ran on a secure RTX PRO 6000 Blackwell through the authenticated public Runpod
+  proxy. The private template is `w2wkhbveg2` (`moe-tools-agentic-a3b-rc3`) with an
+  immutable image and secret references.
+- **The target model and durable-job path are live-accepted:** the 94.97 GiB GPU
+  loaded `Qwen/Qwen3.6-35B-A3B-FP8` with 34.77 GiB consumed and 48.84 GiB of KV
+  cache. A hard browser reload during load rediscovered the same durable job and PID
+  and prevented a duplicate submission. The baseline → routing → 64-experts-per-
+  layer arithmetic profile → profile-ID-only reload → identical two-item masked
+  run → comparison canary passed; both arithmetic cohorts scored `1.0`.
+- **The ordinary Daytona lifecycle is live-accepted:** unmasked `fix-subtract`
+  passed at reward `1.0` with eight turns/inference/routing calls, seven real
+  commands, the correct patch, a trusted-verifier pass, `agent_finished`, and
+  confirmed deletion.
+  The same task under the arithmetic-derived 25% profile produced a useful negative
+  transfer: reward `0`, three routed turns, no command, repetitive shell text,
+  `token_limit`, verifier failure, and confirmed deletion. This is a profile-quality
+  result, not a provider failure.
+- **Durable job recovery is implemented and accepted:** a model
   session and its queued job are persisted atomically before the API response;
   execution is scheduled and owned by the application rather than the response
   lifecycle; a disconnected response waiter cannot cancel it; identical model-load
   retries adopt the same job; and incompatible submissions return a typed conflict
   containing the recoverable active job. `GET /api/jobs/active` and the planned
   `starting` session make reload and process-restart state explicit.
-- **Browser recovery is implemented locally:** job polling treats network/5xx/429
+- **Browser recovery is implemented and accepted for hard reload:** job polling
+  treats network/5xx/429
   failures as transient with bounded backoff, wakes on reconnect or tab visibility,
   discovers the server's active job after a reload, and adopts typed conflicts. The
   UI keeps the operation and last terminal error visible instead of reverting to
@@ -53,30 +68,31 @@ Implementation status as of 2026-08-11:
   for the 807 kB ECharts-heavy bundle. In the fork, the two scheduler boundary tests
   and two SamplingParams forwarding tests pass, as does the direct request-to-
   scheduler contract check; fork Ruff and format checks are clean.
-- **Current release gate:** publish the candidate app image with the immutable fork
-  revision, rerun the canary and targeted recovery/profile checks on the RTX PRO
-  6000, run the bounded Daytona ladder, then explicitly confirm zero paid sandboxes
-  and stop the Pod. The new release candidate must not be described as live-verified
-  until this gate passes.
+- **Acceptance teardown is complete:** all Runpod Pods used for acceptance are
+  `EXITED`, and no paid Daytona sandbox remains. The scoped GPU estimate is about
+  `$2.04` (`$1.056` reported Pod billing plus a `$0.98` fallback runtime estimate;
+  the current bucket may post later). Retained storage still bills. Remaining live
+  gates are cancellation and crash/orphan failure injection plus complete masked and
+  unmasked cohorts across all three bundled tasks.
 
 Approximate milestone accounting (local implementation, not production readiness):
 
 | Milestone | Progress | Largest remaining gap |
 | --- | ---: | --- |
 | 0 · Local skeleton | 95% | Broader component/browser automation and CI image smoke |
-| 1 · Runpod appliance | 90% | Current immutable-image proxy/volume/restart acceptance |
-| 2 · Model lifecycle | 75% | Candidate recovery, stop/cancel, topology, and GPU acceptance |
+| 1 · Runpod appliance | 95% | Live cancel/crash recovery and retained-volume regression |
+| 2 · Model lifecycle | 85% | Live stop/cancel, failure injection, and performance checks |
 | 3 · Benchmark engine | 84% | More standard adapters and browser-level regression coverage |
 | 4 · Profile lab | 72% | Undo/redo, brush selection, and additional assisted strategies |
 | 5 · Masked comparison | 74% | Routing redistribution, reports, and performance mode |
-| 6 · Agentic foundation | 78% | Current RTX/Daytona gate, formal pairing, multi-trial profiles |
+| 6 · Agentic foundation | 84% | Full three-task cohorts, failure injection, and formal pairing |
 | 7 · Repository agentic | 10% | Full Harbor/Aider integration and public task adapters |
 | 8 · Breadth/hardening | 18% | Failure injection, Playwright, migrations, and recovery drills |
 
 The interactive MVP surface is roughly three quarters implemented. Production
-readiness remains lower: an earlier build proved the Runpod/GPU/Daytona boundaries,
-but the current hardening candidate still needs immutable-image acceptance and an
-intentional teardown audit before it can replace that build.
+readiness remains lower even though the immutable candidate and intentional teardown
+passed bounded acceptance: live cancellation/crash-orphan recovery, full three-task
+masked/unmasked cohorts, and repeated held-out quality trials remain outstanding.
 
 This repository will contain a single-user research application for measuring how
 expert eligibility changes affect a task-focused MoE model. The first useful
@@ -120,8 +136,9 @@ an optional non-negative `routed_experts_prompt_start`. When routed capture is
 enabled, the fork returns prompt routing beginning at that token offset followed by
 generated-token routing. The app uses it only after exact token-prefix alignment;
 ordinary clients omit it and preserve the original behavior. The container publish
-workflow pins that full SHA; the resulting combined image remains part of the
-outstanding live release gate. Negative offsets fail request validation; an offset
+workflow pins that full SHA; the accepted combined image digest is
+`sha256:bb5e4addc10db7d2f8166d8eef05be3c032ee83533495c7d4f8d3b2dc8026362`.
+Negative offsets fail request validation; an offset
 equal to or beyond the prompt length safely clamps to that length and returns no
 prompt rows rather than tripping the scheduler.
 
@@ -367,9 +384,9 @@ Daytona has allocated a sandbox but before it returns a handle, the controller n
 performs an exact-label cleanup lookup; deletion is persisted as confirmed or as
 `cleanup_pending`, never silently treated as complete. Sandbox session state,
 timeouts, CPU/RAM/disk requests, verifier output, deletion failures, and sanitized
-provider errors are persisted. An earlier build completed the ordinary Daytona
-lifecycle; this harder no-handle failure path and the current candidate still need
-the bounded live release gate.
+provider errors are persisted. The current candidate completed the ordinary live
+Daytona lifecycle with confirmed deletion. The harder no-handle, cancellation, and
+crash-orphan paths remain locally tested but not live failure-injected.
 
 ### Model registry
 
@@ -921,15 +938,19 @@ same cohort, and understand both the quality delta and eligibility reduction.
 - **Implemented:** immutable `smoke-python-v1` with three oracle-pass/no-op-fail tasks.
 - **Implemented:** one-trial routing proposal → agentic profile lineage → model
   profile reload → same-task rerun path.
-- **Remaining:** real RTX/Daytona create/upload/exec/read/delete and cleanup
-  acceptance for the current candidate, failure-injection of the no-handle cleanup
-  path, formal paired comparison, multi-trial profile aggregation, and a periodic
-  cleanup janitor beyond startup/new-run retries.
+- **Live-accepted:** immutable Runpod model/profile canary and ordinary Daytona
+  create/upload/exec/read/verify/delete on `fix-subtract`, including trusted reward,
+  routing artifacts, and confirmed deletion. The arithmetic-derived 25% mask's
+  failed rerun is retained as negative-transfer evidence rather than mislabeled as a
+  provider failure.
+- **Remaining:** live failure-injection of cancellation, no-handle cleanup, and
+  crash-orphan recovery; complete three-task masked/unmasked cohorts; formal paired
+  comparison; multi-trial profile aggregation; and a periodic cleanup janitor beyond
+  startup/new-run retries.
 
-Acceptance for this milestone is now the seven-trial paid ladder: one Daytona canary,
-three baseline tasks, one representative-trial profile reload, and the identical
-three masked tasks, all with valid ATIF/routing/verifier artifacts and no remote
-sandbox left behind. This is intentionally smaller than a public benchmark claim.
+Bounded acceptance proves the ordinary provider and artifact lifecycle, not general
+coding quality. The next milestone gate is the identical three-task baseline/masked
+cohort with zero retained sandboxes, followed by explicit live failure injection.
 
 ### Milestone 7: repository-level agentic coding
 
@@ -1013,67 +1034,63 @@ adopts an already active job or an interrupted submission outcome, validates eve
 resource/provenance transition in the base-to-profile loop, and leaves its Daytona
 step disabled unless `--daytona` is explicitly supplied.
 
-### Target-GPU acceptance tests
+### 2026-08-11 target-GPU acceptance result
 
-1. Create a Pod from the template and verify the proxy URL from outside the Pod.
-2. Authenticate and load the pinned Qwen revision.
-3. During model load, interrupt or reload the browser and require it to rediscover
-   and adopt the same active job without creating a second vLLM process.
-4. Confirm GPU/backend/topology facts and that the routing path supports eligibility.
-5. Complete one chat request.
-6. Run the public-API acceptance canary's explicit fixture cohort, profile-by-ID
-   reload, identical masked cohort, and persisted paired comparison.
-7. Run a 10-item GSM8K baseline with ID/weight capture.
-8. Create a conservative profile that keeps at least `top_k` experts per layer.
-9. Restart with the profile and rerun the exact cohort.
-10. Verify comparison provenance, scoring, telemetry, exports, and persisted state.
-11. Run a small capture-disabled baseline/profile performance comparison.
-12. Stop and restart the Pod, then verify model cache and application state survive.
+The immutable application/fork/image provenance recorded above ran on a secure
+Runpod RTX PRO 6000 Blackwell with 94.97 GiB VRAM. Public-proxy authentication
+passed. `Qwen/Qwen3.6-35B-A3B-FP8` loaded with 34.77 GiB consumed and 48.84 GiB of
+KV cache; a hard reload during loading rediscovered the same durable job and PID and
+did not submit another load.
 
-### Agentic acceptance tests
+The public-API core canary passed baseline generation, routing capture, a
+64-expert-per-layer arithmetic profile (25% eligibility), profile-ID-only reload,
+the identical two-item masked run, and persisted comparison. Baseline and masked
+arithmetic scores were both `1.0`. The FUSE checkpoint load reported 34.89 GiB and
+took roughly three minutes, with a warning that automatic prefetch was disabled;
+evaluate `--safetensors-load-strategy=prefetch` on a repeat. Masking controls expert
+eligibility behavior and does not shrink loaded weights or VRAM.
 
-An earlier image exercised the target RTX PRO 6000 and ordinary Daytona lifecycle.
-The current release candidate changes job ownership, telemetry slicing, process
-cleanup, and the handle-less sandbox failure path, so its paid gate starts fresh. It
-is intentionally serialized, uses one attempt, and stops at the first cleanup or
-provenance failure:
+### 2026-08-11 agentic acceptance result
 
-1. **Boot and pin:** deploy one immutable image with the agentic Runpod template,
-   secret references, and intended network volume. Require `/readyz`, authenticated
-   UI access, a ready baseline model session, and recorded image/fork/model/runtime/
-   GPU provenance.
-2. **Preflight:** call `POST /api/sandbox-providers/daytona/preflight`. Require
-   configured, reachable, authenticated, and ready; verify the sanitized response has
-   the expected host/region, no credential, and that the read-only list call created
-   no sandbox.
-3. **Raw one-task canary:** run only `fix-subtract` from `smoke-python-v1` with
-   `bash-json-v1`, Daytona, `attempts=1`, `seed=0`, the baseline session, and recorded
-   generation/budgets. Require reward `1`, passing verifier, valid `ATIF-v1.7`, at
-   least one linked inference/routing artifact, remote-only code/test execution, and
-   confirmed sandbox deletion.
-4. **All-three baseline:** run `fix-subtract`, `implement-slugify`, and
-   `repair-json-cli` with the identical contract. Require 3/3 for this plumbing gate,
-   complete trajectory/verifier/routing artifacts, export the run, and require zero
-   owned Daytona sandboxes.
-5. **Derive and reload:** select one representative successful baseline trial; call
-   its profile-proposal endpoint with `keep_per_layer=64&metric=routing_mass`; save
-   the result with `source="agentic"` and that `source_trial_id`. Record fingerprint,
-   lineage, metric, and observed mass, load it, and require a new ready model session
-   with the expected profile ID/document; require the masked run to report the saved
-   fingerprint. This profile is single-trial-derived, not a three-task aggregate.
-6. **Same-three masked:** rerun the exact pack revision, three task IDs/order, agent
-   revision, provider, attempts, seed, generation, and budgets using only the new
-   profile-backed session. Require complete artifacts and zero sandbox leaks. Export
-   both runs and compare reward/pass, turns, commands, tokens, termination, and
-   routing descriptively; formal paired statistics are not implemented yet.
-7. **Teardown:** verify no Daytona sandbox retains the controller/run/trial ownership
-   labels, stop or terminate the GPU Pod, and retain the network volume only
-   intentionally.
+The live unmasked `fix-subtract` control passed with reward `1.0`: eight turns,
+eight instrumented inference/routing calls, seven real Daytona commands, the correct
+`+1` to `-1` patch, a trusted-verifier pass, `agent_finished`, and confirmed sandbox
+deletion. Generated code and tests executed only in Daytona, never in the local app
+or model container.
 
-This ladder is seven paid task trials total (one canary, three baseline, three
-masked). Full Harbor/Aider, cancellation/orphan recovery against live infrastructure,
-public benchmark cohorts, repeated attempts, and held-out validation follow only
-after this gate passes.
+The same task under the arithmetic-derived 25% profile returned reward `0`: three
+routed turns, zero commands, repetitive shell text, `token_limit`, a failed trusted
+verifier, and confirmed sandbox deletion. Because remote lifecycle and cleanup still
+completed, this is a useful negative-transfer result rather than a provider failure.
+
+Template `w2wkhbveg2` is now `moe-tools-agentic-a3b-rc3`, with the immutable image
+and Hugging Face/Daytona secret references. All acceptance Pods are `EXITED`, and no
+acceptance-owned paid Daytona sandbox remains. Scoped GPU cost is estimated at
+approximately `$2.04`:
+`$1.056` in reported Pod billing plus a `$0.98` fallback runtime estimate; the
+current billing bucket may post later, and retained storage continues billing.
+
+The live paths still unverified are cancellation and crash/orphan failure injection,
+including the handle-less-create recovery branch. Complete baseline and masked
+cohorts across all three bundled tasks also remain unverified; the single failed
+masked coding trial is not a cohort-level quality conclusion.
+
+### Repeat and regression ladder
+
+1. **Pin and boot:** record the application SHA, fork SHA, image digest, private
+   template, model revision, GPU, and budget; authenticate through the public proxy.
+2. **Recovery:** hard-reload during model load and require adoption of the same job
+   and PID with no duplicate submission.
+3. **Provider control:** run read-only Daytona preflight and unmasked `fix-subtract`;
+   require reward/verifier/ATIF/routing artifacts and confirmed deletion.
+4. **Model/profile control:** repeat the two-item arithmetic baseline, routing
+   proposal, 64-per-layer profile-ID reload, identical masked run, and comparison.
+5. **Complete cohorts:** run all three bundled tasks unmasked and masked with the
+   same immutable contracts; report quality deltas independently of provider state.
+6. **Failure injection:** exercise live cancellation, crash-after-allocation, and
+   no-handle create recovery; require exact-label deletion and zero orphans.
+7. **Teardown:** confirm zero owned Daytona sandboxes, stop all paid Pods, record
+   final billing, and retain storage only intentionally.
 
 Before calling deployment complete, readiness must be verified with a real browser or
 HTTP request through Runpod's public proxy, not only with the Pod's `Running` status.
