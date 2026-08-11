@@ -89,7 +89,92 @@ export type ScoringMode =
   | "gsm8k"
   | "regex"
   | "contains"
+  | "ifeval"
+  | "livebench"
+  | "numeric"
+  | "multiple_choice"
+  | "json_schema"
+  | "executable"
+  | "instruction_constraints"
+  | "llm_judge"
   | "ungraded";
+
+export type EvaluationCriterionKind =
+  | "benchmark_default"
+  | "exact"
+  | "contains"
+  | "regex"
+  | "numeric"
+  | "multiple_choice"
+  | "json"
+  | "ungraded"
+  | "verifier";
+
+export interface EvaluationCriterion {
+  id: string;
+  kind: EvaluationCriterionKind;
+  label: string;
+  description?: string;
+  visibility: "public" | "hidden";
+  required: boolean;
+  weight: number;
+  case_sensitive: boolean;
+  strip_whitespace: boolean;
+  expected?: string | null;
+  pattern?: string | null;
+  numeric_tolerance?: number;
+  json_schema?: Record<string, unknown> | null;
+  verifier_command?: string | null;
+  verifier_timeout_seconds?: number;
+}
+
+export interface EvaluationContract {
+  version?: 1;
+  name: string;
+  description?: string;
+  criteria: EvaluationCriterion[];
+  aggregation: "all_required" | "weighted_threshold";
+  pass_threshold: number;
+  judge: LLMJudgeConfig | null;
+  judge_weight: number;
+  judge_can_override_deterministic_failure: boolean;
+  fingerprint?: string;
+}
+
+export interface LLMJudgeConfig {
+  provider: "anthropic" | "openai" | "fake";
+  model: string;
+  mode: "single" | "reference" | "pairwise";
+  rubric: string;
+  pass_threshold: number;
+  repetitions: number;
+  temperature?: number | null;
+  max_output_tokens: number;
+  input_cost_per_million_usd?: number | null;
+  output_cost_per_million_usd?: number | null;
+  rubric_hash?: string;
+  fingerprint?: string;
+}
+
+export interface ExecutionPolicy {
+  version?: 1;
+  concurrency?: number;
+  max_turns?: number | null;
+  max_tokens: number | null;
+  max_commands?: number | null;
+  timeout_seconds: number;
+  per_item_timeout_seconds?: number;
+  max_cost_usd?: number | null;
+  fail_fast?: boolean;
+  attempts?: number;
+  fingerprint?: string;
+  // Generation presentation fields are stripped before policy submission.
+  temperature?: number;
+  seed?: number | null;
+  enable_thinking?: boolean;
+  reasoning_visibility?: "off" | "compact" | "full";
+  generation_max_tokens?: number;
+}
 
 export interface GenerationConfig {
   temperature: number;
@@ -113,6 +198,8 @@ export interface BenchmarkInfo {
   scoring: ScoringMode;
   prompt_template_version: string;
   default_generation: GenerationConfig;
+  evaluation_contract?: EvaluationContract | null;
+  execution_policy?: ExecutionPolicy | null;
 }
 
 export interface BenchmarkItem {
@@ -122,6 +209,8 @@ export interface BenchmarkItem {
   category: string;
   scoring: ScoringMode;
   metadata: Record<string, string | number | boolean | null>;
+  success_criteria?: EvaluationCriterion[];
+  verifier_hash?: string | null;
 }
 
 export interface BenchmarkItemPage {
@@ -133,6 +222,21 @@ export interface BenchmarkItemPage {
   categories: string[];
 }
 
+export interface BenchmarkProblemDetail {
+  benchmark: BenchmarkInfo;
+  item: BenchmarkItem;
+  rendered_prompt: string;
+  success_criteria: {
+    summary: string;
+    public_criteria: EvaluationCriterion[];
+    hidden_criteria_count: number;
+    hidden_criteria_hash: string | null;
+    evaluation_contract_fingerprint: string;
+    public_contract: EvaluationContract | null;
+  };
+  default_execution_policy: ExecutionPolicy;
+}
+
 export interface BenchmarkDatasetRecord {
   id: string;
   info: BenchmarkInfo;
@@ -142,6 +246,7 @@ export interface BenchmarkDatasetRecord {
 
 export interface RunItemResult {
   item_id: string;
+  attempt: number;
   prompt: string;
   expected: string;
   output: string;
@@ -151,9 +256,11 @@ export interface RunItemResult {
   latency_ms: number;
   prompt_tokens: number;
   completion_tokens: number;
+  judge_budget_debit_usd?: number;
+  judge_cost_uncertain?: boolean;
 }
 
-export interface BenchmarkRun {
+export interface BenchmarkRunSummary {
   id: string;
   benchmark_id: string;
   model_session_id: string;
@@ -162,9 +269,75 @@ export interface BenchmarkRun {
   scored_items: number;
   completed_items: number;
   total_items: number;
-  items: RunItemResult[];
   cohort_id: string | null;
   created_at: string;
+  evaluation_contract_fingerprint?: string | null;
+  execution_policy_fingerprint?: string | null;
+  performance?: RunPerformance | null;
+}
+
+export interface BenchmarkRun extends BenchmarkRunSummary {
+  items: RunItemResult[];
+}
+
+export interface BenchmarkRunPage {
+  items: BenchmarkRunSummary[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export interface RunItemResultPage {
+  run_id: string;
+  items: RunItemResult[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export interface RunPerformance {
+  wall_time_ms: number;
+  model_time_ms: number;
+  evaluation_time_ms: number;
+  prompt_tokens: number;
+  reasoning_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  mean_tokens_per_second: number | null;
+  p50_tokens_per_second: number | null;
+  p95_tokens_per_second: number | null;
+  inference_cost_usd: number | null;
+  judge_cost_usd: number | null;
+  judge_equivalent_cost_usd: number | null;
+  judge_budget_debit_usd: number;
+  judge_cost_uncertain: boolean;
+  estimated_cost_usd: number | null;
+}
+
+export interface RunDetail {
+  run: BenchmarkRunSummary;
+  model_session: ModelSession;
+  saved_profile: SavedExpertProfile | null;
+  cohort: {
+    id: string;
+    item_count: number;
+    generation?: GenerationConfig;
+    evaluation_contract: EvaluationContract | null;
+    evaluation_contract_fingerprint?: string | null;
+    execution_policy: ExecutionPolicy | null;
+    execution_policy_fingerprint?: string | null;
+  } | null;
+  provenance: {
+    generation?: GenerationConfig;
+    evaluation_contract: EvaluationContract | null;
+    evaluation_contract_fingerprint: string | null;
+    hidden_criteria_count: number;
+    hidden_criteria_hash: string | null;
+    execution_policy: ExecutionPolicy | null;
+    execution_policy_fingerprint: string | null;
+    profile_id: string | null;
+    profile_fingerprint: string | null;
+  } | null;
 }
 
 export interface RoutingSummary {
@@ -173,6 +346,59 @@ export interface RoutingSummary {
   selection_counts: number[][];
   routing_mass: number[][];
   total_routed_slots: number;
+}
+
+export type RoutingSourceKind = "benchmark_run" | "agent_trial";
+
+export interface RoutingSourceReference {
+  kind: RoutingSourceKind;
+  id: string;
+  weight?: number;
+}
+
+export interface RoutingExploreSource extends RoutingSourceReference {
+  label: string;
+  status?: string | null;
+  profile_id?: string | null;
+}
+
+export interface RoutingExploreRequest {
+  sources: RoutingSourceReference[];
+  comparison_sources?: RoutingSourceReference[];
+  metric: "routing_mass" | "selection_count";
+  filters?: {
+    item_ids?: string[];
+    trial_ids?: string[];
+    step_types?: string[];
+    passed?: boolean;
+  };
+}
+
+export interface RoutingExploreResponse {
+  fingerprint: string;
+  aggregation: "weighted_source_normalized";
+  model_id: string;
+  profile_id?: string | null;
+  profile_fingerprint?: string | null;
+  layer_ids: number[];
+  num_experts: number;
+  top_k: number;
+  selection_counts: number[][];
+  routing_mass: number[][];
+  comparison_selection_counts?: number[][] | null;
+  comparison_routing_mass?: number[][] | null;
+  total_routed_slots: number;
+  captured_inference_calls?: number | null;
+  total_inference_calls?: number | null;
+  served_tokens?: number | null;
+  sources: RoutingExploreSource[];
+  comparison_sources?: RoutingExploreSource[];
+  filter_capabilities: {
+    item: boolean;
+    trial: boolean;
+    step_type: boolean;
+    outcome: boolean;
+  };
 }
 
 export interface ExpertProfile {
@@ -194,7 +420,12 @@ export interface ProfileProposal {
   observed_mass_retained: number;
 }
 
-export type ProfileSource = "proposal" | "agentic" | "manual" | "import";
+export type ProfileSource =
+  | "proposal"
+  | "agentic"
+  | "manual"
+  | "import"
+  | "multi_source";
 
 export interface CreateExpertProfileRequest {
   name: string;
@@ -207,6 +438,21 @@ export interface CreateExpertProfileRequest {
   parent_profile_id?: string | null;
   metric?: "routing_mass" | "selection_count" | null;
   observed_mass_retained?: number | null;
+  source_refs?: Array<RoutingSourceReference & { weight: number }>;
+  source_fingerprint?: string | null;
+  selection_strategy?: string | null;
+  selection_config?: Record<string, unknown>;
+}
+
+export interface ProfileSelectionStrategy {
+  kind:
+    | "manual"
+    | "fixed_per_layer"
+    | "global_budget"
+    | "cumulative_mass"
+    | "import";
+  metric: "routing_mass" | "selection_count";
+  parameters: Record<string, number | string | boolean | null>;
 }
 
 export interface SavedExpertProfile {
@@ -219,8 +465,12 @@ export interface SavedExpertProfile {
   source: ProfileSource;
   source_run_id: string | null;
   source_trial_id: string | null;
+  source_refs?: Array<RoutingSourceReference & { weight: number }>;
+  source_fingerprint?: string | null;
   parent_profile_id: string | null;
   metric: "routing_mass" | "selection_count" | null;
+  selection_strategy?: string | null;
+  selection_config?: Record<string, unknown>;
   validation: ProfileValidation;
   observed_mass_retained: number | null;
   created_at: string;
@@ -357,6 +607,8 @@ export interface AgentTrialSummary {
   agent_run_id: string;
   task_id: string;
   title: string;
+  attempt: number;
+  seed: number;
   status: AgentTrialStatus;
   reward: number | null;
   turns: number;
@@ -368,6 +620,91 @@ export interface AgentTrialSummary {
   termination_reason: string | null;
   sandbox_status: string;
   updated_at: string;
+  performance?: AgentPerformanceSummary | null;
+}
+
+export interface AgentPerformanceSummary {
+  wall_time_ms?: number | null;
+  queue_time_ms?: number | null;
+  provisioning_time_ms?: number | null;
+  model_time_ms?: number | null;
+  sandbox_time_ms?: number | null;
+  verifier_time_ms?: number | null;
+  prompt_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  completion_tokens?: number | null;
+  total_tokens?: number | null;
+  mean_tps?: number | null;
+  p50_tps?: number | null;
+  p95_tps?: number | null;
+  inference_cost_usd?: number | null;
+  judge_cost_usd?: number | null;
+  judge_cost_debit_usd?: number | null;
+  judge_cost_uncertain?: boolean;
+  estimated_cost_usd?: number | null;
+}
+
+export interface AgentRunPerformanceSummary {
+  wall_time_ms: number;
+  model_time_ms: number;
+  sandbox_time_ms: number;
+  verifier_time_ms: number;
+  prompt_tokens: number;
+  reasoning_tokens: number | null;
+  completion_tokens: number;
+  total_tokens: number;
+  reported_mean_tps: number | null;
+  reported_tps_trials: number;
+  inference_cost_usd?: number | null;
+  judge_cost_usd?: number | null;
+  estimated_cost_usd: number | null;
+}
+
+export interface AgentTrialPair {
+  task_id: string;
+  attempt: number;
+  baseline_trial_id: string;
+  candidate_trial_id: string;
+  baseline_status: AgentTrialStatus;
+  candidate_status: AgentTrialStatus;
+  baseline_reward: number | null;
+  candidate_reward: number | null;
+  reward_delta: number | null;
+  transition:
+    | "regression"
+    | "recovery"
+    | "retained_pass"
+    | "retained_failure"
+    | "unscored";
+  baseline_performance: AgentPerformanceSummary | null;
+  candidate_performance: AgentPerformanceSummary | null;
+}
+
+export interface AgentRunComparison {
+  id: string;
+  name: string;
+  baseline_run_id: string;
+  candidate_run_id: string;
+  task_pack_id: string;
+  compatibility_fingerprint: string;
+  baseline_profile_id: string | null;
+  candidate_profile_id: string | null;
+  baseline_profile_fingerprint: string | null;
+  candidate_profile_fingerprint: string | null;
+  trial_count: number;
+  baseline_passed_trials: number;
+  candidate_passed_trials: number;
+  baseline_mean_reward: number | null;
+  candidate_mean_reward: number | null;
+  mean_reward_delta: number | null;
+  regressions: number;
+  recoveries: number;
+  retained_passes: number;
+  retained_failures: number;
+  unscored: number;
+  baseline_performance: AgentRunPerformanceSummary;
+  candidate_performance: AgentRunPerformanceSummary;
+  pairs: AgentTrialPair[];
 }
 
 export interface AgentRun {
@@ -387,12 +724,16 @@ export interface AgentRun {
   completed_trials: number;
   passed_trials: number;
   mean_reward: number | null;
+  reasoning_mode?: "off" | "compact" | "full";
   active_trial_id: string | null;
   trials: AgentTrialSummary[];
   error: string | null;
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  budgets?: AgentBudgets | null;
+  execution_policy?: ExecutionPolicy | null;
+  evaluation_contract?: EvaluationContract | null;
 }
 
 export interface CreateAgentRunRequest {
@@ -402,6 +743,12 @@ export interface CreateAgentRunRequest {
   sandbox_provider_id: string;
   model_session_id: string;
   budgets?: AgentBudgets;
+  attempts?: number;
+  seed?: number;
+  generation?: GenerationConfig;
+  reasoning_mode?: "off" | "compact" | "full";
+  execution_policy?: ExecutionPolicy;
+  evaluation_contract?: EvaluationContract;
 }
 
 export interface InferenceCallSummary {
@@ -412,6 +759,17 @@ export interface InferenceCallSummary {
   routing_artifact_id: string | null;
   routed_layers: number;
   total_routed_slots: number;
+  reasoning_tokens?: number | null;
+  total_tokens?: number | null;
+  ttft_ms?: number | null;
+  prefill_ms?: number | null;
+  decode_ms?: number | null;
+  tokens_per_second?: number | null;
+  estimated_cost_usd?: number | null;
+  model_id?: string | null;
+  finish_reason?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
 }
 
 export type TrajectoryStepType =
@@ -420,7 +778,15 @@ export type TrajectoryStepType =
   | "assistant"
   | "tool"
   | "observation"
-  | "verifier";
+  | "verifier"
+  | "task"
+  | "reasoning"
+  | "model"
+  | "tool_call"
+  | "command"
+  | "stdout"
+  | "stderr"
+  | "routing";
 
 export interface TrajectoryStep {
   id: string;
@@ -435,6 +801,11 @@ export interface TrajectoryStep {
   duration_ms: number | null;
   truncated: boolean;
   inference: InferenceCallSummary | null;
+  phase?: "setup" | "reasoning" | "action" | "tool" | "verification" | null;
+  turn?: number | null;
+  stream?: "stdout" | "stderr" | null;
+  reasoning_visibility?: "explicit" | "none" | null;
+  metadata?: Record<string, unknown>;
 }
 
 export interface AgentTrajectory {
@@ -442,6 +813,7 @@ export interface AgentTrajectory {
   format: "ATIF";
   schema_version: string;
   steps: TrajectoryStep[];
+  reasoning_mode?: "off" | "compact" | "full";
   updated_at: string;
 }
 

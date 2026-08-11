@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import httpx
@@ -17,9 +18,9 @@ from moe_tools_suite.domain import (
     CreateModelSessionRequest,
     ExpertProfile,
     GenerationConfig,
-    RunRequest,
 )
 from moe_tools_suite.lab import MODEL_ID, ResearchLab
+from moe_tools_suite.main import create_app
 from moe_tools_suite.runtime import CompletionResult
 from moe_tools_suite.settings import Settings
 from moe_tools_suite.telemetry import DecodedRouting
@@ -75,6 +76,26 @@ def test_custom_jsonl_supports_graded_and_ungraded_items() -> None:
     assert adapter.score(items[3], "arbitrary trace") is None
 
 
+def test_custom_benchmark_regex_times_out_fail_closed() -> None:
+    content = json.dumps(
+        {
+            "id": "catastrophic",
+            "prompt": "Return text",
+            "expected": r"(a+)+$",
+            "scoring": "regex",
+        }
+    )
+    _, adapter = CustomBenchmarkAdapter.create(
+        CreateCustomBenchmarkRequest(name="Bounded regex", content=content)
+    )
+    started = time.perf_counter()
+
+    with pytest.raises(ValueError, match="50 ms"):
+        adapter.score(adapter.items()[0], "a" * 100_000 + "!")
+
+    assert time.perf_counter() - started < 1
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [
@@ -90,6 +111,14 @@ def test_custom_jsonl_supports_graded_and_ungraded_items() -> None:
         (
             '{"prompt":"a","expected":"a","metadata":{"nested":{}}}',
             "valid string",
+        ),
+        (
+            '{"prompt":"a","expected":"a","scoring":"ifeval"}',
+            "internal benchmark scorer",
+        ),
+        (
+            '{"prompt":"a","expected":"a","scoring":"livebench"}',
+            "internal benchmark scorer",
         ),
     ],
 )
@@ -194,34 +223,114 @@ class SlowRuntime:
 async def test_running_benchmark_can_be_cancelled_with_partial_results(
     tmp_path: Path,
 ) -> None:
-    lab = ResearchLab(
+    app = create_app(
         Settings(
             mode="mock",
             data_dir=tmp_path / "data",
             frontend_dist=tmp_path / "frontend",
         )
     )
+    lab = app.state.lab
     await lab.create_model_session(CreateModelSessionRequest(model_id=MODEL_ID))
     slow_runtime = SlowRuntime(lab)
     lab.runtime = slow_runtime
-    job = lab.submit_benchmark(
-        RunRequest(
-            benchmark_id="fixture-arithmetic",
-            item_ids=["arith-03", "arith-04"],
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            submitted = await client.post(
+                "/api/runs",
+                json={
+                    "benchmark_id": "fixture-arithmetic",
+                    "item_ids": ["arith-03", "arith-04"],
+                },
+            )
+            assert submitted.status_code == 202
+            job_id = submitted.json()["id"]
+            await asyncio.wait_for(slow_runtime.started.wait(), timeout=1)
+
+            cancelled = await client.post(f"/api/jobs/{job_id}/cancel")
+            assert cancelled.json()["status"] == "cancelling"
+            active = await client.get("/api/jobs/active")
+            assert active.json()["id"] == job_id
+            assert active.json()["status"] == "cancelling"
+
+            blocked = await client.post("/api/benchmarks/fixture-arithmetic/prepare")
+            assert blocked.status_code == 409
+            assert blocked.json()["detail"]["active_job"]["id"] == job_id
+            assert blocked.json()["detail"]["active_job"]["status"] == "cancelling"
+
+            slow_runtime.release.set()
+            await asyncio.wait_for(lab.dispatch_job(job_id), timeout=1)
+
+            persisted_job = lab.jobs[job_id].record
+            assert persisted_job.status == "cancelled"
+            assert persisted_job.result_id is not None
+            run = lab.runs[persisted_job.result_id].run
+            assert run.status == "cancelled"
+            assert run.completed_items == 1
+            assert run.total_items == 2
+            assert (await client.get("/api/jobs/active")).json() is None
+    finally:
+        slow_runtime.release.set()
+        await lab.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dataset_cancellation_exception_finishes_cancelled_and_blocks_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "frontend",
         )
     )
-    execution = asyncio.create_task(lab.execute_job(job.id))
-    await asyncio.wait_for(slow_runtime.started.wait(), timeout=1)
+    lab = app.state.lab
+    started = asyncio.Event()
+    release = asyncio.Event()
 
-    cancelled = lab.cancel_job(job.id)
-    slow_runtime.release.set()
-    await asyncio.wait_for(execution, timeout=1)
+    async def slow_prepare(
+        benchmark_id: str,
+        *,
+        on_progress,
+        should_cancel,
+    ):
+        del on_progress
+        started.set()
+        await release.wait()
+        if should_cancel():
+            raise RuntimeError("dataset preparation cancelled")
+        return lab.benchmark_catalog.get_info(benchmark_id)
 
-    persisted_job = lab.jobs[job.id].record
-    assert cancelled.status == "cancelled"
-    assert persisted_job.status == "cancelled"
-    assert persisted_job.result_id is not None
-    run = lab.runs[persisted_job.result_id].run
-    assert run.status == "cancelled"
-    assert run.completed_items == 1
-    assert run.total_items == 2
+    monkeypatch.setattr(lab.benchmark_catalog, "prepare", slow_prepare)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            submitted = await client.post("/api/benchmarks/fixture-arithmetic/prepare")
+            assert submitted.status_code == 202
+            job_id = submitted.json()["id"]
+            await asyncio.wait_for(started.wait(), timeout=1)
+
+            cancelled = await client.post(f"/api/jobs/{job_id}/cancel")
+            assert cancelled.json()["status"] == "cancelling"
+            blocked = await client.post("/api/benchmarks/fixture-arithmetic/prepare")
+            assert blocked.status_code == 409
+            assert blocked.json()["detail"]["active_job"]["id"] == job_id
+
+            release.set()
+            await asyncio.wait_for(lab.dispatch_job(job_id), timeout=1)
+            terminal = (await client.get(f"/api/jobs/{job_id}")).json()
+            assert terminal["status"] == "cancelled"
+            assert terminal["error"] is None
+            assert (await client.get("/api/jobs/active")).json() is None
+    finally:
+        release.set()
+        await lab.shutdown()

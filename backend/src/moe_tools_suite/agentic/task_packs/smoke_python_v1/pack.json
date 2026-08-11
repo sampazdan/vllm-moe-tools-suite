@@ -1,7 +1,7 @@
 {
   "id": "smoke-python-v1",
   "name": "Python agent smoke pack",
-  "revision": "1",
+  "revision": "2",
   "description": "Three tiny dependency-free repository tasks for sandbox, verifier, trajectory, and routing acceptance tests.",
   "source": "bundled",
   "ready": true,
@@ -18,7 +18,13 @@
       "category": "bug-fix",
       "language": "python",
       "tags": ["python", "bug-fix", "unit-test"],
+      "success_criteria": [
+        "subtract preserves its public two-integer signature and returns left minus right.",
+        "Positive inputs, negative results, and negative operands pass the protected tests.",
+        "The trusted verifier exits successfully after canonical tests are restored."
+      ],
       "image_ref": "python:3.12-slim",
+      "image_digest": "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
       "working_directory": "/workspace/task",
       "network_policy": "none",
       "cpu": 1,
@@ -32,15 +38,17 @@
         },
         {
           "path": "tests/test_calculator.py",
-          "content": "import unittest\n\nfrom calculator import subtract\n\n\nclass SubtractTests(unittest.TestCase):\n    def test_positive_values(self) -> None:\n        self.assertEqual(subtract(9, 4), 5)\n\n    def test_negative_result(self) -> None:\n        self.assertEqual(subtract(3, 8), -5)\n\n    def test_negative_operand(self) -> None:\n        self.assertEqual(subtract(-2, 7), -9)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+          "content": "import json\nimport os\nimport secrets\nimport subprocess\nimport sys\n\nallow_unprivileged = os.environ.get(\"MOE_TOOLS_VERIFIER_DEV_MODE\") == \"1\"\ndef demote() -> None:\n    if os.geteuid() == 0:\n        os.setgroups([])\n        os.setgid(65534)\n        os.setuid(65534)\n    elif not allow_unprivileged:\n        os._exit(126)\n\nchild_env = {\"PATH\": os.environ.get(\"PATH\", \"/usr/local/bin:/usr/bin:/bin\"), \"PYTHONDONTWRITEBYTECODE\": \"1\", \"PYTHONHASHSEED\": \"0\"}\nprobe = '''import json\nimport sys\nsys.path.insert(0, \".\")\nfrom calculator import subtract\nleft, right = json.loads(sys.stdin.read())\nsys.stdout.write(json.dumps(subtract(left, right)))\n'''\ncases = [(9, 4), (3, 8), (-2, 7)]\nfor _ in range(4):\n    cases.append((secrets.randbelow(2_000_001) - 1_000_000, secrets.randbelow(2_000_001) - 1_000_000))\nfor left, right in cases:\n    completed = subprocess.run(\n        [sys.executable, \"-I\", \"-c\", probe],\n        input=json.dumps([left, right]),\n        capture_output=True,\n        text=True,\n        timeout=10,\n        check=False,\n        cwd=\".\",\n        env=child_env,\n        preexec_fn=demote,\n    )\n    if completed.returncode != 0 or completed.stderr:\n        raise AssertionError(completed.stderr or \"calculator probe failed\")\n    try:\n        actual = json.loads(completed.stdout)\n    except json.JSONDecodeError as error:\n        raise AssertionError(\"calculator returned invalid output\") from error\n    if type(actual) is not int or actual != left - right:\n        raise AssertionError(f\"subtract({left}, {right}) returned {actual!r}\")\nprint(f\"verified {len(cases)} isolated subtraction probes\")\n"
         },
         {
           "path": "tests/__init__.py",
           "content": ""
         }
       ],
+      "submission_file_paths": ["calculator.py"],
       "verifier_file_paths": ["tests/test_calculator.py", "tests/__init__.py"],
-      "verifier_command": "python -I -m unittest discover -s tests -t . -v",
+      "oracle_file_paths": [],
+      "verifier_command": "python -I tests/test_calculator.py",
       "oracle_commands": [
         "python -c 'from pathlib import Path; path = Path(\"calculator.py\"); path.write_text(path.read_text().replace(\"return sum((left, right))\", \"return left - right\"))'"
       ]
@@ -54,7 +62,13 @@
       "category": "feature",
       "language": "python",
       "tags": ["python", "feature", "text"],
+      "success_criteria": [
+        "slugify returns lowercase ASCII with each separator run collapsed to one hyphen.",
+        "Leading and trailing hyphens are removed, accents are transliterated, and empty slugs work.",
+        "The implementation uses only the Python standard library and passes the protected tests."
+      ],
       "image_ref": "python:3.12-slim",
+      "image_digest": "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
       "working_directory": "/workspace/task",
       "network_policy": "none",
       "cpu": 1,
@@ -68,15 +82,17 @@
         },
         {
           "path": "tests/test_text_utils.py",
-          "content": "import unittest\n\nfrom text_utils import slugify\n\n\nclass SlugifyTests(unittest.TestCase):\n    def test_words_and_punctuation(self) -> None:\n        self.assertEqual(slugify(\"Hello, World!\"), \"hello-world\")\n\n    def test_collapses_separators(self) -> None:\n        self.assertEqual(slugify(\"  Multiple___spaces  \"), \"multiple-spaces\")\n\n    def test_transliterates_accents(self) -> None:\n        self.assertEqual(slugify(\"Café Déjà Vu\"), \"cafe-deja-vu\")\n\n    def test_empty_slug(self) -> None:\n        self.assertEqual(slugify(\"---\"), \"\")\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+          "content": "import json\nimport os\nimport re\nimport secrets\nimport subprocess\nimport sys\nimport unicodedata\n\nallow_unprivileged = os.environ.get(\"MOE_TOOLS_VERIFIER_DEV_MODE\") == \"1\"\ndef demote() -> None:\n    if os.geteuid() == 0:\n        os.setgroups([])\n        os.setgid(65534)\n        os.setuid(65534)\n    elif not allow_unprivileged:\n        os._exit(126)\n\nchild_env = {\"PATH\": os.environ.get(\"PATH\", \"/usr/local/bin:/usr/bin:/bin\"), \"PYTHONDONTWRITEBYTECODE\": \"1\", \"PYTHONHASHSEED\": \"0\"}\nprobe = '''import json\nimport sys\nsys.path.insert(0, \".\")\nfrom text_utils import slugify\nvalue = json.loads(sys.stdin.read())\nsys.stdout.write(json.dumps(slugify(value)))\n'''\ndef expected(value: str) -> str:\n    normalized = unicodedata.normalize(\"NFKD\", value)\n    ascii_value = normalized.encode(\"ascii\", \"ignore\").decode(\"ascii\")\n    return re.sub(r\"[^a-z0-9]+\", \"-\", ascii_value.lower()).strip(\"-\")\n\ncases = [\"Hello, World!\", \"  Multiple___spaces  \", \"Café Déjà Vu\", \"---\"]\nfor _ in range(3):\n    cases.append(f\"  Café_{secrets.token_hex(5)} !!! Déjà  \")\nfor value in cases:\n    completed = subprocess.run(\n        [sys.executable, \"-I\", \"-c\", probe],\n        input=json.dumps(value),\n        capture_output=True,\n        text=True,\n        timeout=10,\n        check=False,\n        cwd=\".\",\n        env=child_env,\n        preexec_fn=demote,\n    )\n    if completed.returncode != 0 or completed.stderr:\n        raise AssertionError(completed.stderr or \"slugify probe failed\")\n    try:\n        actual = json.loads(completed.stdout)\n    except json.JSONDecodeError as error:\n        raise AssertionError(\"slugify returned invalid output\") from error\n    wanted = expected(value)\n    if type(actual) is not str or actual != wanted:\n        raise AssertionError(f\"slugify returned {actual!r}, expected {wanted!r}\")\nprint(f\"verified {len(cases)} isolated slug probes\")\n"
         },
         {
           "path": "tests/__init__.py",
           "content": ""
         }
       ],
+      "submission_file_paths": ["text_utils.py"],
       "verifier_file_paths": ["tests/test_text_utils.py", "tests/__init__.py"],
-      "verifier_command": "python -I -m unittest discover -s tests -t . -v",
+      "oracle_file_paths": [],
+      "verifier_command": "python -I tests/test_text_utils.py",
       "oracle_commands": [
         "python -c 'from pathlib import Path; Path(\"text_utils.py\").write_text(\"\"\"import re\nimport unicodedata\n\n\ndef slugify(value: str) -> str:\n    \\\"\\\"\\\"Return a URL-friendly ASCII slug.\\\"\\\"\\\"\n\n    normalized = unicodedata.normalize(\\\"NFKD\\\", value)\n    ascii_value = normalized.encode(\\\"ascii\\\", \\\"ignore\\\").decode(\\\"ascii\\\")\n    return re.sub(r\\\"[^a-z0-9]+\\\", \\\"-\\\", ascii_value.lower()).strip(\\\"-\\\")\n\"\"\")'"
       ]
@@ -90,7 +106,13 @@
       "category": "bug-fix",
       "language": "python",
       "tags": ["python", "cli", "json", "bug-fix"],
+      "success_criteria": [
+        "The CLI emits exactly one compact JSON object and no stderr for a successful invocation.",
+        "The greeting uses the supplied name and repeat is a JSON integer, not a string.",
+        "The existing CLI arguments remain compatible and the protected tests pass."
+      ],
       "image_ref": "python:3.12-slim",
+      "image_digest": "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
       "working_directory": "/workspace/task",
       "network_policy": "none",
       "cpu": 1,
@@ -104,15 +126,17 @@
         },
         {
           "path": "tests/test_greet.py",
-          "content": "import json\nimport subprocess\nimport sys\nimport unittest\n\n\nclass GreetCliTests(unittest.TestCase):\n    def run_cli(self, *arguments: str) -> str:\n        completed = subprocess.run(\n            [sys.executable, \"greet.py\", *arguments],\n            check=True,\n            capture_output=True,\n            text=True,\n        )\n        self.assertEqual(completed.stderr, \"\")\n        return completed.stdout\n\n    def test_compact_json_contract(self) -> None:\n        output = self.run_cli(\"Ada\", \"--repeat\", \"3\")\n        self.assertEqual(output, '{\"greeting\":\"Hello, Ada!\",\"repeat\":3}\\n')\n        self.assertEqual(\n            json.loads(output),\n            {\"greeting\": \"Hello, Ada!\", \"repeat\": 3},\n        )\n\n    def test_name_is_not_hard_coded(self) -> None:\n        payload = json.loads(self.run_cli(\"Grace\", \"--repeat\", \"1\"))\n        self.assertEqual(payload[\"greeting\"], \"Hello, Grace!\")\n        self.assertIsInstance(payload[\"repeat\"], int)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+          "content": "import json\nimport os\nimport secrets\nimport subprocess\nimport sys\n\nallow_unprivileged = os.environ.get(\"MOE_TOOLS_VERIFIER_DEV_MODE\") == \"1\"\ndef demote() -> None:\n    if os.geteuid() == 0:\n        os.setgroups([])\n        os.setgid(65534)\n        os.setuid(65534)\n    elif not allow_unprivileged:\n        os._exit(126)\n\nchild_env = {\"PATH\": os.environ.get(\"PATH\", \"/usr/local/bin:/usr/bin:/bin\"), \"PYTHONDONTWRITEBYTECODE\": \"1\", \"PYTHONHASHSEED\": \"0\"}\ncases = [(\"Ada\", 3), (\"Grace\", 1)]\nfor _ in range(3):\n    cases.append((f\"user-{secrets.token_hex(5)}\", secrets.randbelow(9) + 1))\nfor name, repeat in cases:\n    completed = subprocess.run(\n        [sys.executable, \"greet.py\", name, \"--repeat\", str(repeat)],\n        capture_output=True,\n        text=True,\n        timeout=10,\n        check=False,\n        cwd=\".\",\n        env=child_env,\n        preexec_fn=demote,\n    )\n    expected = json.dumps(\n        {\"greeting\": f\"Hello, {name}!\", \"repeat\": repeat},\n        separators=(\",\", \":\"),\n    ) + \"\\n\"\n    if completed.returncode != 0 or completed.stderr or completed.stdout != expected:\n        raise AssertionError(\n            f\"greet CLI mismatch: rc={completed.returncode}, stdout={completed.stdout!r}, stderr={completed.stderr!r}\"\n        )\nprint(f\"verified {len(cases)} isolated CLI probes\")\n"
         },
         {
           "path": "tests/__init__.py",
           "content": ""
         }
       ],
+      "submission_file_paths": ["greet.py"],
       "verifier_file_paths": ["tests/test_greet.py", "tests/__init__.py"],
-      "verifier_command": "python -I -m unittest discover -s tests -t . -v",
+      "oracle_file_paths": [],
+      "verifier_command": "python -I tests/test_greet.py",
       "oracle_commands": [
         "python -c 'from pathlib import Path; Path(\"greet.py\").write_text(\"\"\"import argparse\nimport json\n\n\ndef main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\\\"name\\\")\n    parser.add_argument(\\\"--repeat\\\", type=int, default=1)\n    args = parser.parse_args()\n    payload = {\\\"greeting\\\": f\\\"Hello, {args.name}!\\\", \\\"repeat\\\": args.repeat}\n    print(json.dumps(payload, separators=(\\\",\\\", \\\":\\\")))\n\n\nif __name__ == \\\"__main__\\\":\n    main()\n\"\"\")'"
       ]

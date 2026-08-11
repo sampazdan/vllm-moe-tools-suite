@@ -15,7 +15,7 @@ from ..runtime import ModelRuntime
 from ..telemetry import AggregatedRouting, DecodedRouting, aggregate_routing
 from .artifacts import AgentArtifactStore
 from .atif import BASH_JSON_SYSTEM_PROMPT, BASH_TOOL_DEFINITION
-from .domain import InferenceCall
+from .domain import InferenceCall, utc_now
 
 
 class AgentAction(BaseModel):
@@ -29,6 +29,7 @@ class AgentAction(BaseModel):
 @dataclass(frozen=True)
 class GatewayResult:
     content: str
+    reasoning: str | None
     inference: InferenceCall
     routing: DecodedRouting
     aggregated: AggregatedRouting
@@ -69,6 +70,7 @@ class InstrumentedAgentGateway:
                 separators=(",", ":"),
             ).encode()
         ).hexdigest()
+        started_at = utc_now()
         started = time.perf_counter()
         try:
             completion = await self.runtime.complete_chat(
@@ -85,6 +87,8 @@ class InstrumentedAgentGateway:
                 model_session_id=model_session.id,
                 request_hash=request_hash,
                 latency_ms=(time.perf_counter() - started) * 1000,
+                started_at=started_at,
+                completed_at=utc_now(),
                 error=_bounded_error(error),
             )
             self.store.save_agent_inference(inference)
@@ -100,13 +104,28 @@ class InstrumentedAgentGateway:
             model_session_id=model_session.id,
             request_hash=request_hash,
             prompt_tokens=completion.prompt_tokens,
+            reasoning_tokens=completion.reasoning_tokens,
             completion_tokens=completion.completion_tokens,
             latency_ms=(time.perf_counter() - started) * 1000,
+            time_to_first_token_ms=(completion.performance.time_to_first_token_ms),
+            generation_time_ms=completion.performance.generation_time_ms,
+            queue_time_ms=completion.performance.queue_time_ms,
+            mean_inter_token_latency_ms=(
+                completion.performance.mean_inter_token_latency_ms
+            ),
+            tokens_per_second=completion.performance.tokens_per_second,
+            reasoning_content=(
+                completion.reasoning[:200_000] if completion.reasoning else None
+            ),
+            finish_reason=completion.finish_reason,
+            started_at=started_at,
+            completed_at=utc_now(),
             routing_artifact=routing_artifact,
         )
         self.store.save_agent_inference(inference)
         return GatewayResult(
             content=scripted_content or completion.content,
+            reasoning=completion.reasoning,
             inference=inference,
             routing=completion.routing,
             aggregated=aggregate_routing(completion.routing, self.topology),

@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Iterable
 from importlib import resources
+from pathlib import PurePosixPath
 
 from .atif import BASH_JSON_SYSTEM_PROMPT, BASH_TOOL_DEFINITION
 from .domain import (
@@ -20,7 +21,11 @@ from .domain import (
 DEFAULT_AGENT_ID = "bash-json-v1"
 DEFAULT_TASK_PACK_ID = "smoke-python-v1"
 
-BUNDLED_TASK_PACK_PACKAGES = ("moe_tools_suite.agentic.task_packs.smoke_python_v1",)
+BUNDLED_TASK_PACK_PACKAGES = (
+    "moe_tools_suite.agentic.task_packs.smoke_python_v1",
+    "moe_tools_suite.agentic.task_packs.repo_engineering_v1",
+    "moe_tools_suite.agentic.task_packs.aider_polyglot_python_canary_v1",
+)
 
 
 def _canonical_hash(value: object) -> str:
@@ -30,6 +35,21 @@ def _canonical_hash(value: object) -> str:
         separators=(",", ":"),
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_bundled_text_resource(package: str, value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"invalid bundled task-pack resource {value!r}")
+    path = PurePosixPath(value)
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise ValueError(f"invalid bundled task-pack resource {value!r}")
+    resource = resources.files(package)
+    for part in path.parts:
+        resource = resource.joinpath(part)
+    try:
+        return resource.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"invalid bundled task file resource {value!r}") from error
 
 
 DEFAULT_AGENT = AgentDescriptor(
@@ -65,7 +85,35 @@ def load_bundled_task_pack(package: str) -> AgentTaskPack:
         raise ValueError(f"invalid bundled task pack resource {package!r}") from error
     if not isinstance(payload, dict):
         raise ValueError(f"bundled task pack {package!r} must contain a JSON object")
-    fingerprint = hashlib.sha256(raw).hexdigest()
+    resolved_resources = False
+    for task in payload.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        if "instruction_resource" in task:
+            if "instruction" in task:
+                raise ValueError(
+                    "bundled task cannot define both instruction and "
+                    "instruction_resource"
+                )
+            task["instruction"] = _read_bundled_text_resource(
+                package, task.pop("instruction_resource")
+            )
+            resolved_resources = True
+        for file in task.get("files", []):
+            if not isinstance(file, dict) or "resource" not in file:
+                continue
+            resource_path = file.pop("resource")
+            if "content" in file:
+                raise ValueError(
+                    "bundled task file cannot define both content and resource"
+                )
+            file["content"] = _read_bundled_text_resource(package, resource_path)
+            resolved_resources = True
+    fingerprint = (
+        _canonical_hash(payload)
+        if resolved_resources
+        else hashlib.sha256(raw).hexdigest()
+    )
     payload["content_hash"] = fingerprint
     payload["fingerprint"] = fingerprint
     try:
@@ -175,6 +223,9 @@ def agent_run_contract_fingerprint(
             "image_ref": task.image_ref,
             "image_digest": task.image_digest,
             "verifier_hash": hashlib.sha256(task.verifier_command.encode()).hexdigest(),
+            "submission_file_paths": task.submission_file_paths,
+            "verifier_file_paths": task.verifier_file_paths,
+            "oracle_file_paths": task.oracle_file_paths,
             "network_policy": task.network_policy.value,
             "allowed_hosts": task.allowed_hosts,
             "cpu": task.cpu,
@@ -198,7 +249,18 @@ def agent_run_contract_fingerprint(
             "attempts": request.attempts,
             "seed": request.seed,
             "generation": request.generation.model_dump(mode="json"),
+            "thinking_enabled": request.reasoning_mode.value != "off",
             "budgets": request.budgets.model_dump(mode="json"),
+            "evaluation_contract_fingerprint": (
+                request.evaluation_contract.fingerprint
+                if request.evaluation_contract is not None
+                else None
+            ),
+            "execution_policy_fingerprint": (
+                request.execution_policy.fingerprint
+                if request.execution_policy is not None
+                else None
+            ),
         }
     )
 

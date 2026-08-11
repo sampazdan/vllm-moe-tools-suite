@@ -1,8 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { activeJobFromConflict, api } from "./api";
-import { ExpertHeatmap } from "./ExpertHeatmap";
+import { AppLink } from "./AppShell";
+import {
+  evaluationContractPayload,
+  executionPolicyPayload,
+  generationConfigPayload,
+} from "./contracts";
+import {
+  defaultEvaluationContract,
+  defaultExecutionPolicy,
+  EvaluationControls,
+} from "./EvaluationControls";
+import { ExpertExplorer } from "./ExpertExplorer";
+import { normalizeEngagementMatrix } from "./expertSelection";
 import { TrajectoryViewer } from "./TrajectoryViewer";
 import type {
   AgentDefinition,
@@ -24,6 +36,9 @@ import type {
   SavedExpertProfile,
   SystemStatus,
   TrialRoutingSummary,
+  RoutingExploreResponse,
+  EvaluationContract,
+  ExecutionPolicy,
 } from "./types";
 
 const MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8";
@@ -37,6 +52,7 @@ interface AgenticWorkbenchProps {
   onRequestedRunOpened: () => void;
   onActivityChange: (active: boolean) => void;
   onJobConflict: (job: JobRecord) => void;
+  commandCenter?: boolean;
 }
 
 export function AgenticWorkbench({
@@ -48,6 +64,7 @@ export function AgenticWorkbench({
   onRequestedRunOpened,
   onActivityChange,
   onJobConflict,
+  commandCenter = false,
 }: AgenticWorkbenchProps) {
   const queryClient = useQueryClient();
   const [selectedPackId, setSelectedPackId] = useState("");
@@ -60,6 +77,21 @@ export function AgenticWorkbench({
   const [selectedTrialId, setSelectedTrialId] = useState<string | null>(null);
   const [preflight, setPreflight] = useState<ProviderPreflight | null>(null);
   const [runNotice, setRunNotice] = useState<string | null>(null);
+  const openedRequestedRun = useRef<string | null>(null);
+  const [executionPolicy, setExecutionPolicy] = useState<ExecutionPolicy>(() =>
+    defaultExecutionPolicy(true),
+  );
+  const [evaluationContract, setEvaluationContract] =
+    useState<EvaluationContract>(() =>
+      defaultEvaluationContract("Trusted coding verifier", {
+        kind: "benchmark_default",
+        label: "Protected test suite passes",
+        description:
+          "The trusted verifier runs after the agent stops, including after a budget limit.",
+        weight: 1,
+        visibility: "public",
+      }),
+    );
 
   const agentsQuery = useQuery({
     queryKey: ["agents"],
@@ -179,6 +211,18 @@ export function AgenticWorkbench({
   }, [agents, selectedAgentId]);
 
   useEffect(() => {
+    if (!selectedAgent) return;
+    const budgets = selectedAgent.default_budgets;
+    setExecutionPolicy((current) => ({
+      ...current,
+      max_turns: budgets.max_turns,
+      max_tokens: budgets.max_tokens,
+      max_commands: budgets.max_commands,
+      timeout_seconds: budgets.timeout_seconds,
+    }));
+  }, [selectedAgent?.id]);
+
+  useEffect(() => {
     if (selectedProviderId || providers.length === 0) return;
     const preferred =
       mode === "mock"
@@ -196,7 +240,8 @@ export function AgenticWorkbench({
   }, [selectedProviderId]);
 
   useEffect(() => {
-    if (!requestedRunId) return;
+    if (!requestedRunId || openedRequestedRun.current === requestedRunId) return;
+    openedRequestedRun.current = requestedRunId;
     setActiveRunId(requestedRunId);
     setSelectedTrialId(null);
     onRequestedRunOpened();
@@ -337,12 +382,35 @@ export function AgenticWorkbench({
       agent_id: selectedAgent.id,
       sandbox_provider_id: selectedProvider.id,
       model_session_id: currentModelSession.id,
-      budgets: selectedAgent.default_budgets,
+      budgets: {
+        max_turns:
+          executionPolicy.max_turns ?? selectedAgent.default_budgets.max_turns,
+        max_tokens:
+          executionPolicy.max_tokens ?? selectedAgent.default_budgets.max_tokens,
+        max_commands:
+          executionPolicy.max_commands ??
+          selectedAgent.default_budgets.max_commands,
+        timeout_seconds: executionPolicy.timeout_seconds,
+      },
+      attempts: executionPolicy.attempts ?? 1,
+      seed: executionPolicy.seed ?? 0,
+      generation: generationConfigPayload(executionPolicy, {
+        temperature: 0,
+        max_tokens: 2048,
+        seed: 0,
+        enable_thinking: true,
+      }),
+      reasoning_mode: executionPolicy.reasoning_visibility ?? "compact",
+      execution_policy: executionPolicyPayload(executionPolicy),
+      evaluation_contract: evaluationContractPayload(evaluationContract),
     });
   }
 
   return (
-    <section className="agentic-section" id="agentic">
+    <section
+      className={`agentic-section ${commandCenter ? "agentic-command-workbench" : ""} ${activeRun ? "has-active-run" : ""}`}
+      id="agentic"
+    >
       <div className="section-intro agentic-intro">
         <div>
           <span className="section-label">03 · Agentic coding</span>
@@ -511,10 +579,10 @@ export function AgenticWorkbench({
           <p>{selectedAgent?.description}</p>
           {selectedAgent && (
             <dl className="agent-budget-list">
-              <div><dt>Turns</dt><dd>{selectedAgent.default_budgets.max_turns}</dd></div>
-              <div><dt>Tokens</dt><dd>{formatCompactNumber(selectedAgent.default_budgets.max_tokens)}</dd></div>
-              <div><dt>Commands</dt><dd>{selectedAgent.default_budgets.max_commands}</dd></div>
-              <div><dt>Time</dt><dd>{formatMinutes(selectedAgent.default_budgets.timeout_seconds)}</dd></div>
+              <div><dt>Turns</dt><dd>{executionPolicy.max_turns ?? "—"}</dd></div>
+              <div><dt>Total tokens</dt><dd>{executionPolicy.max_tokens == null ? "—" : formatCompactNumber(executionPolicy.max_tokens)}</dd></div>
+              <div><dt>Commands</dt><dd>{executionPolicy.max_commands ?? "—"}</dd></div>
+              <div><dt>Time</dt><dd>{formatMinutes(executionPolicy.timeout_seconds)}</dd></div>
             </dl>
           )}
           <button
@@ -524,7 +592,7 @@ export function AgenticWorkbench({
           >
             {startRun.isPending
               ? "Starting trial…"
-              : `Start ${selectedTaskIds.size}-task smoke`}
+              : `Start ${selectedTaskIds.size}-task run`}
           </button>
           {!canStart && !isActiveRun(activeRun?.status) && (
             <small className="start-guidance">
@@ -533,6 +601,21 @@ export function AgenticWorkbench({
           )}
         </article>
       </div>
+
+      <details className="agent-contract-drawer" open={commandCenter && !activeRun}>
+        <summary>
+          <span>Evaluation & execution contract</span>
+          <small>Success is independent from turns, tokens, commands, and time</small>
+        </summary>
+        <EvaluationControls
+          contract={evaluationContract}
+          policy={executionPolicy}
+          onContractChange={setEvaluationContract}
+          onPolicyChange={setExecutionPolicy}
+          agentic
+          readOnly={isActiveRun(activeRun?.status)}
+        />
+      </details>
 
       {activeRun && (
         <AgentRunMonitor
@@ -577,6 +660,17 @@ function AgentRunMonitor({
 }) {
   const live = isActiveRun(run.status);
   const progressTotal = Math.max(run.total_trials, 1);
+  const [mobilePanel, setMobilePanel] = useState<
+    "tasks" | "trajectory" | "experts"
+  >("trajectory");
+  const routedTrialIds = run.trials
+    .filter((trial) => trial.routed_inference_calls > 0)
+    .map((trial) => trial.id);
+  const wholeRunProfileHref = routedTrialIds.length
+    ? `/profiles/new?${routedTrialIds.map((trialId) =>
+        `trial=${encodeURIComponent(trialId)}`
+      ).join("&")}`
+    : null;
   return (
     <div className="agent-run-monitor">
       <header className="agent-run-header" aria-live="polite">
@@ -603,6 +697,11 @@ function AgentRunMonitor({
           >
             Export coding run
           </a>
+          {wholeRunProfileHref && (
+            <AppLink className="agent-run-export" href={wholeRunProfileHref}>
+              Profile whole run
+            </AppLink>
+          )}
           {live ? (
             <button
               className="danger-text-button"
@@ -627,13 +726,31 @@ function AgentRunMonitor({
 
       {run.error && <div className="agentic-error">{run.error}</div>}
 
+      <div className="agent-mobile-tabs" role="tablist">
+        {(["tasks", "trajectory", "experts"] as const).map((panel) => (
+          <button
+            key={panel}
+            className={mobilePanel === panel ? "selected" : ""}
+            onClick={() => setMobilePanel(panel)}
+          >
+            {panel}
+          </button>
+        ))}
+      </div>
+
       <div className="agent-live-grid">
-        <aside className="trial-rail" aria-label="Coding task trials">
+        <aside
+          className={`trial-rail agent-mobile-panel ${mobilePanel === "tasks" ? "active" : ""}`}
+          aria-label="Coding task trials"
+        >
           {run.trials.map((trial, index) => (
             <button
               className={trial.id === selectedTrial?.id ? "selected" : ""}
               key={trial.id}
-              onClick={() => onSelectTrial(trial.id)}
+              onClick={() => {
+                onSelectTrial(trial.id);
+                setMobilePanel("trajectory");
+              }}
             >
               <span className={`trial-index ${trial.status}`}>{index + 1}</span>
               <span>
@@ -654,30 +771,38 @@ function AgentRunMonitor({
             </div>
           )}
         </aside>
-        {selectedTrial ? (
-          <TrajectoryViewer
-            trial={selectedTrial}
-            trajectory={trajectory}
-            artifacts={artifacts}
-            live={isActiveTrial(selectedTrial.status)}
-          />
-        ) : (
-          <div className="trajectory-placeholder">
-            <span>◇</span>
-            <p>The selected task trajectory will open here.</p>
-          </div>
-        )}
+        <div className={`agent-trajectory-pane agent-mobile-panel ${mobilePanel === "trajectory" ? "active" : ""}`}>
+          {selectedTrial ? (
+            <TrajectoryViewer
+              trial={selectedTrial}
+              trajectory={trajectory}
+              artifacts={artifacts}
+              live={isActiveTrial(selectedTrial.status)}
+            />
+          ) : (
+            <div className="trajectory-placeholder">
+              <span>◇</span>
+              <p>The selected task trajectory will open here.</p>
+            </div>
+          )}
+        </div>
+        <aside className={`agent-expert-pane agent-mobile-panel ${mobilePanel === "experts" ? "active" : ""}`}>
+          {selectedTrial ? (
+            <TrialRoutingCard
+              key={selectedTrial.id}
+              trial={selectedTrial}
+              routing={routing}
+              profileId={run.profile_id}
+              profileFingerprint={run.profile_fingerprint}
+            />
+          ) : (
+            <div className="trajectory-placeholder">
+              <span>⌁</span>
+              <p>Select a trial to inspect expert routing.</p>
+            </div>
+          )}
+        </aside>
       </div>
-
-      {selectedTrial && (
-        <TrialRoutingCard
-          key={selectedTrial.id}
-          trial={selectedTrial}
-          routing={routing}
-          profileId={run.profile_id}
-          profileFingerprint={run.profile_fingerprint}
-        />
-      )}
     </div>
   );
 }
@@ -739,6 +864,39 @@ function TrialRoutingCard({
   }
 
   const profileError = proposeProfile.error || saveProfile.error;
+  const explorerData: RoutingExploreResponse | null = routing
+    ? {
+        fingerprint: `agent_trial:${trial.id}`,
+        aggregation: "weighted_source_normalized",
+        model_id: MODEL_ID,
+        profile_id: routing.profile_id,
+        profile_fingerprint: routing.profile_fingerprint,
+        layer_ids: routing.layer_ids,
+        num_experts: routing.selection_counts[0]?.length ?? 256,
+        top_k: 8,
+        selection_counts: normalizeEngagementMatrix(routing.selection_counts),
+        routing_mass: normalizeEngagementMatrix(routing.routing_mass),
+        total_routed_slots: routing.total_routed_slots,
+        captured_inference_calls: routing.captured_inference_calls,
+        total_inference_calls: routing.inference_calls,
+        served_tokens: routing.served_tokens,
+        sources: [
+          {
+            kind: "agent_trial",
+            id: trial.id,
+            label: trial.title,
+            status: trial.status,
+            profile_id: routing.profile_id,
+          },
+        ],
+        filter_capabilities: {
+          item: false,
+          trial: true,
+          step_type: false,
+          outcome: true,
+        },
+      }
+    : null;
 
   return (
     <section className="agent-routing-panel">
@@ -770,11 +928,17 @@ function TrialRoutingCard({
       <div className="agent-profile-loop">
         <div className="agent-profile-loop-copy">
           <span className="section-label">Trace → expert profile</span>
-          <strong>Turn this task’s routing into a reusable mask.</strong>
+          <strong>Turn this task’s routing into a custom reusable mask.</strong>
           <p>
-            Keep the 64 highest-mass experts per routed layer, then save the
-            immutable proposal to the research archive.
+            Open the full Profile Studio for layer-by-layer manual selection,
+            global budgets, retained-mass targets, and multi-workload sources.
           </p>
+          <AppLink
+            className="primary-button agent-custom-profile-link"
+            href={`/profiles/new?trial=${encodeURIComponent(trial.id)}`}
+          >
+            Open custom Profile Studio
+          </AppLink>
         </div>
         {proposal ? (
           <>
@@ -826,13 +990,13 @@ function TrialRoutingCard({
           </>
         ) : (
           <button
-            className="primary-button agent-profile-propose"
+            className="text-button agent-profile-propose"
             disabled={!routing || proposeProfile.isPending}
             onClick={() => proposeProfile.mutate()}
           >
             {proposeProfile.isPending
               ? "Building profile…"
-              : "Create 64/layer profile"}
+              : "Quick 64/layer proposal"}
           </button>
         )}
         {savedProfile && (
@@ -846,13 +1010,8 @@ function TrialRoutingCard({
           </p>
         )}
       </div>
-      {routing ? (
-        <details>
-          <summary>Open expert routing</summary>
-          <div className="agent-routing-heatmap">
-            <ExpertHeatmap summary={routing} metric="routing_mass" />
-          </div>
-        </details>
+      {explorerData ? (
+        <ExpertExplorer data={explorerData} title="Trial engagement" />
       ) : (
         <p className="routing-waiting-copy">
           {trial.routed_inference_calls

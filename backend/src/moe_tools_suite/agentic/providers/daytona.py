@@ -472,6 +472,11 @@ class DaytonaSandboxProvider:
                 timeout=self._config.file_timeout_seconds + 1,
             )
         except Exception as exc:
+            if _is_not_found(exc):
+                raise SandboxProviderError(
+                    "file_not_found",
+                    "The requested sandbox file was not found.",
+                ) from exc
             _raise_provider_error(exc)
         if content is None:
             raise SandboxProviderError(

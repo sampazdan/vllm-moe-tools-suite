@@ -7,7 +7,17 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
-from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine, event
+from sqlalchemy import (
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    event,
+    inspect,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .agentic.domain import AgentRun, AgentTrial, InferenceCall, SandboxSession
@@ -16,10 +26,13 @@ from .domain import (
     BenchmarkDatasetRecord,
     BenchmarkRun,
     ComparisonRecord,
+    EvaluationContract,
+    ExecutionPolicy,
     ExpertProfile,
     JobKind,
     JobRecord,
     JobStatus,
+    LLMJudgeResult,
     ModelSession,
     ModelState,
     ProfileValidation,
@@ -96,6 +109,10 @@ class BenchmarkCohortRow(Base):
     item_ids_json: Mapped[str] = mapped_column(Text, nullable=False)
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     generation_json: Mapped[str] = mapped_column(Text, nullable=False)
+    evaluation_contract_json: Mapped[str | None] = mapped_column(Text)
+    execution_policy_json: Mapped[str | None] = mapped_column(Text)
+    evaluation_contract_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    execution_policy_fingerprint: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -108,6 +125,7 @@ class RunMetadataRow(Base):
     cohort_id: Mapped[str | None] = mapped_column(String, index=True)
     scored_items: Mapped[int] = mapped_column(Integer, nullable=False)
     provenance_json: Mapped[str | None] = mapped_column(Text)
+    record_json: Mapped[str | None] = mapped_column(Text)
 
 
 class ExpertProfileRow(Base):
@@ -127,6 +145,7 @@ class ExpertProfileRow(Base):
     metric: Mapped[str | None] = mapped_column(String)
     validation_json: Mapped[str] = mapped_column(Text, nullable=False)
     observed_mass_retained: Mapped[float | None] = mapped_column(Float)
+    metadata_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -247,6 +266,23 @@ class SandboxSessionRow(Base):
     )
 
 
+class JudgeEvaluationRow(Base):
+    __tablename__ = "judge_evaluations"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    request_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    provider: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    config_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    rubric_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class SqliteStore:
     """Durable metadata and routing artifacts for one application writer."""
 
@@ -263,6 +299,35 @@ class SqliteStore:
         event.listen(self.engine, "connect", _configure_sqlite)
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
         Base.metadata.create_all(self.engine)
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Apply additive SQLite migrations required by persisted API contracts."""
+        additions = {
+            "benchmark_cohorts": {
+                "evaluation_contract_json": "TEXT",
+                "execution_policy_json": "TEXT",
+                "evaluation_contract_fingerprint": "VARCHAR(64)",
+                "execution_policy_fingerprint": "VARCHAR(64)",
+            },
+            "benchmark_run_metadata": {"record_json": "TEXT"},
+            "expert_profiles": {"metadata_json": "TEXT"},
+        }
+        with self.engine.begin() as connection:
+            inspector = inspect(connection)
+            for table_name, columns in additions.items():
+                existing = {
+                    column["name"] for column in inspector.get_columns(table_name)
+                }
+                for column_name, column_type in columns.items():
+                    if column_name in existing:
+                        continue
+                    connection.execute(
+                        text(
+                            f'ALTER TABLE "{table_name}" '
+                            f'ADD COLUMN "{column_name}" {column_type}'
+                        )
+                    )
 
     def save_model_session(self, model_session: ModelSession) -> None:
         now = datetime.now(UTC)
@@ -468,6 +533,20 @@ class SqliteStore:
                     item_ids_json=json.dumps(cohort.item_ids, separators=(",", ":")),
                     fingerprint=cohort.fingerprint,
                     generation_json=cohort.generation.model_dump_json(),
+                    evaluation_contract_json=(
+                        cohort.evaluation_contract.model_dump_json()
+                        if cohort.evaluation_contract is not None
+                        else None
+                    ),
+                    execution_policy_json=(
+                        cohort.execution_policy.model_dump_json()
+                        if cohort.execution_policy is not None
+                        else None
+                    ),
+                    evaluation_contract_fingerprint=(
+                        cohort.evaluation_contract_fingerprint
+                    ),
+                    execution_policy_fingerprint=(cohort.execution_policy_fingerprint),
                     created_at=cohort.created_at,
                 )
             )
@@ -489,6 +568,22 @@ class SqliteStore:
                     item_ids=json.loads(row.item_ids_json),
                     fingerprint=row.fingerprint,
                     generation=json.loads(row.generation_json),
+                    evaluation_contract=(
+                        EvaluationContract.model_validate_json(
+                            row.evaluation_contract_json
+                        )
+                        if row.evaluation_contract_json is not None
+                        else None
+                    ),
+                    execution_policy=(
+                        ExecutionPolicy.model_validate_json(row.execution_policy_json)
+                        if row.execution_policy_json is not None
+                        else None
+                    ),
+                    evaluation_contract_fingerprint=(
+                        row.evaluation_contract_fingerprint
+                    ),
+                    execution_policy_fingerprint=(row.execution_policy_fingerprint),
                     created_at=_as_utc(row.created_at),
                 )
         return loaded
@@ -686,6 +781,7 @@ class SqliteStore:
                     provenance_json=(
                         provenance.model_dump_json() if provenance is not None else None
                     ),
+                    record_json=run.model_dump_json(exclude={"items"}),
                 )
             )
 
@@ -712,25 +808,30 @@ class SqliteStore:
                     )
                 run_metadata = metadata.get(row.id)
                 items = json.loads(row.items_json)
-                run = BenchmarkRun(
-                    id=row.id,
-                    benchmark_id=row.benchmark_id,
-                    model_session_id=row.model_session_id,
-                    status=row.status,
-                    score=row.score if row.score >= 0 else None,
-                    scored_items=(
-                        run_metadata.scored_items
-                        if run_metadata is not None
-                        else sum(item.get("passed") is not None for item in items)
-                    ),
-                    completed_items=row.completed_items,
-                    total_items=row.total_items,
-                    items=items,
-                    cohort_id=(
-                        run_metadata.cohort_id if run_metadata is not None else None
-                    ),
-                    created_at=_as_utc(row.created_at),
-                )
+                if run_metadata is not None and run_metadata.record_json is not None:
+                    run_record = json.loads(run_metadata.record_json)
+                    run_record["items"] = items
+                    run = BenchmarkRun.model_validate(run_record)
+                else:
+                    run = BenchmarkRun(
+                        id=row.id,
+                        benchmark_id=row.benchmark_id,
+                        model_session_id=row.model_session_id,
+                        status=row.status,
+                        score=row.score if row.score >= 0 else None,
+                        scored_items=(
+                            run_metadata.scored_items
+                            if run_metadata is not None
+                            else sum(item.get("passed") is not None for item in items)
+                        ),
+                        completed_items=row.completed_items,
+                        total_items=row.total_items,
+                        items=items,
+                        cohort_id=(
+                            run_metadata.cohort_id if run_metadata is not None else None
+                        ),
+                        created_at=_as_utc(row.created_at),
+                    )
                 provenance = (
                     RunProvenance.model_validate_json(run_metadata.provenance_json)
                     if run_metadata is not None
@@ -756,6 +857,18 @@ class SqliteStore:
                     metric=profile.metric,
                     validation_json=profile.validation.model_dump_json(),
                     observed_mass_retained=profile.observed_mass_retained,
+                    metadata_json=json.dumps(
+                        {
+                            "source_refs": [
+                                ref.model_dump(mode="json")
+                                for ref in profile.source_refs
+                            ],
+                            "source_fingerprint": profile.source_fingerprint,
+                            "selection_strategy": profile.selection_strategy,
+                            "selection_config": profile.selection_config,
+                        },
+                        separators=(",", ":"),
+                    ),
                     created_at=profile.created_at,
                 )
             )
@@ -784,6 +897,11 @@ class SqliteStore:
                 ExpertProfileRow.created_at
             )
             for row in rows:
+                profile_metadata = (
+                    json.loads(row.metadata_json)
+                    if row.metadata_json is not None
+                    else {}
+                )
                 loaded[row.id] = SavedExpertProfile(
                     id=row.id,
                     name=row.name,
@@ -794,8 +912,12 @@ class SqliteStore:
                     source=row.source,
                     source_run_id=row.source_run_id,
                     source_trial_id=trial_ids.get(row.id),
+                    source_refs=profile_metadata.get("source_refs", []),
+                    source_fingerprint=profile_metadata.get("source_fingerprint"),
                     parent_profile_id=row.parent_profile_id,
                     metric=row.metric,
+                    selection_strategy=profile_metadata.get("selection_strategy"),
+                    selection_config=profile_metadata.get("selection_config", {}),
                     validation=ProfileValidation.model_validate_json(
                         row.validation_json
                     ),
@@ -803,6 +925,34 @@ class SqliteStore:
                     created_at=_as_utc(row.created_at),
                 )
         return loaded
+
+    def get_judge_result(self, request_hash: str) -> LLMJudgeResult | None:
+        with self.sessions() as database:
+            row = (
+                database.query(JudgeEvaluationRow)
+                .filter(JudgeEvaluationRow.request_hash == request_hash)
+                .one_or_none()
+            )
+            return (
+                LLMJudgeResult.model_validate_json(row.result_json)
+                if row is not None
+                else None
+            )
+
+    def save_judge_result(self, result: LLMJudgeResult) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                JudgeEvaluationRow(
+                    id=result.id,
+                    request_hash=result.request_hash,
+                    provider=result.provider.value,
+                    model=result.model,
+                    config_fingerprint=result.config_fingerprint,
+                    rubric_hash=result.rubric_hash,
+                    result_json=result.model_dump_json(),
+                    created_at=result.created_at,
+                )
+            )
 
     def save_comparison(self, comparison: ComparisonRecord) -> None:
         with self.sessions.begin() as database:

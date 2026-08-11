@@ -6,6 +6,17 @@ app_root="${MOE_TOOLS_APP_ROOT:-/opt/moe-tools-test-suite}"
 data_root="${MOE_TOOLS_DATA_DIR:-/workspace/moe-tools}"
 log_dir="${data_root}/logs"
 pid_file="${data_root}/app.pid"
+startup_timeout="${MOE_TOOLS_APP_STARTUP_TIMEOUT_SECONDS:-300}"
+
+if [[ ! "${startup_timeout}" =~ ^[0-9]+$ ]]; then
+    echo "MOE_TOOLS_APP_STARTUP_TIMEOUT_SECONDS must be an integer from 5 to 900." >&2
+    exit 2
+fi
+startup_timeout=$((10#${startup_timeout}))
+if (( startup_timeout < 5 || startup_timeout > 900 )); then
+    echo "MOE_TOOLS_APP_STARTUP_TIMEOUT_SECONDS must be an integer from 5 to 900." >&2
+    exit 2
+fi
 
 if [[ "${MOE_TOOLS_REQUIRE_AUTH:-1}" == "1" ]]; then
     auth_token="${MOE_TOOLS_AUTH_TOKEN:-}"
@@ -25,8 +36,14 @@ mkdir -p \
     /workspace/profiles \
     /workspace/results
 
-ln -sfn /opt/vllm-src /workspace/vllm-src
-ln -sfn "${app_root}" /workspace/moe-tools-test-suite
+for link_path in /workspace/vllm-src /workspace/moe-tools-test-suite; do
+    if [[ -e "${link_path}" && ! -L "${link_path}" ]]; then
+        echo "Refusing to replace non-symlink path ${link_path}." >&2
+        exit 2
+    fi
+done
+ln -sfnT /opt/vllm-src /workspace/vllm-src
+ln -sfnT "${app_root}" /workspace/moe-tools-test-suite
 
 if [[ -f "${pid_file}" ]]; then
     existing_pid="$(<"${pid_file}")"
@@ -71,20 +88,34 @@ setsid /opt/vllm-venv/bin/python -m uvicorn \
     --host 0.0.0.0 \
     --port 8080 \
     >"${log_dir}/app.log" 2>&1 < /dev/null &
-echo "$!" >"${pid_file}"
+app_pid="$!"
+echo "${app_pid}" >"${pid_file}"
 
-for _ in {1..30}; do
+deadline=$((SECONDS + startup_timeout))
+while (( SECONDS < deadline )); do
     if curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null; then
         echo "MoE Tools Test Suite is ready on port 8080 (PID $(<"${pid_file}"))."
         exit 0
     fi
-    if ! kill -0 "$(<"${pid_file}")" 2>/dev/null; then
+    if ! kill -0 "${app_pid}" 2>/dev/null; then
+        rm -f "${pid_file}"
         tail -n 80 "${log_dir}/app.log" >&2
         exit 1
     fi
     sleep 1
 done
 
-echo "MoE Tools Test Suite did not become ready within 30 seconds." >&2
+echo "MoE Tools Test Suite did not become ready within ${startup_timeout} seconds." >&2
 tail -n 80 "${log_dir}/app.log" >&2
+kill -TERM -- "-${app_pid}" 2>/dev/null || kill -TERM "${app_pid}" 2>/dev/null || true
+for _ in {1..50}; do
+    if ! kill -0 "${app_pid}" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+if kill -0 "${app_pid}" 2>/dev/null; then
+    kill -KILL -- "-${app_pid}" 2>/dev/null || kill -KILL "${app_pid}" 2>/dev/null || true
+fi
+rm -f "${pid_file}"
 exit 1

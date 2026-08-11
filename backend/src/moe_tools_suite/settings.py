@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +12,7 @@ class Settings(BaseSettings):
         env_prefix="MOE_TOOLS_",
         env_file=".env",
         extra="ignore",
+        populate_by_name=True,
     )
 
     mode: Literal["mock", "vllm"] = "mock"
@@ -35,14 +36,47 @@ class Settings(BaseSettings):
     )
     agent_max_output_bytes: int = Field(default=32_000, ge=1_000, le=500_000)
     agent_max_patch_bytes: int = Field(default=200_000, ge=1_000, le=2_000_000)
+    agent_cleanup_retry_seconds: float = Field(default=30, ge=0.01, le=3600)
     daytona_api_key: SecretStr | None = Field(default=None, repr=False)
     daytona_api_url: str = "https://app.daytona.io/api"
     daytona_target: Literal["us", "eu"] = "us"
     daytona_create_timeout_seconds: int = Field(default=180, ge=30, le=600)
+    anthropic_api_key: SecretStr | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices(
+            "anthropic_api_key",
+            "MOE_TOOLS_ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEY",
+        ),
+    )
+    openai_api_key: SecretStr | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices(
+            "openai_api_key",
+            "MOE_TOOLS_OPENAI_API_KEY",
+            "OPENAI_API_KEY",
+        ),
+    )
+    anthropic_api_url: str = "https://api.anthropic.com"
+    openai_api_url: str = "https://api.openai.com"
+    anthropic_judge_model: str = "claude-sonnet-5"
+    openai_judge_model: str = "gpt-5"
+    judge_timeout_seconds: float = Field(default=120, ge=5, le=600)
 
     @field_validator("daytona_api_key", mode="before")
     @classmethod
     def ignore_unresolved_daytona_secret(cls, value: object) -> object:
+        if isinstance(value, str) and (
+            "RUNPOD_SECRET_" in value or value.startswith("REPLACE")
+        ):
+            return None
+        return value
+
+    @field_validator("anthropic_api_key", "openai_api_key", mode="before")
+    @classmethod
+    def ignore_unresolved_judge_secret(cls, value: object) -> object:
         if isinstance(value, str) and (
             "RUNPOD_SECRET_" in value or value.startswith("REPLACE")
         ):

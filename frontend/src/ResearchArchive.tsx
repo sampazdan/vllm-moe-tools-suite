@@ -8,7 +8,7 @@ import {
 } from "./profileEditor";
 import type {
   AgentRun,
-  BenchmarkRun,
+  BenchmarkRunSummary,
   ComparisonRecord,
   CreateExpertProfileRequest,
   ExpertProfile,
@@ -20,7 +20,7 @@ import type {
 type ArchiveTab = "runs" | "coding" | "profiles" | "comparisons";
 
 interface ResearchArchiveProps {
-  runs: BenchmarkRun[];
+  runs: BenchmarkRunSummary[];
   agentRuns: AgentRun[];
   profiles: SavedExpertProfile[];
   comparisons: ComparisonRecord[];
@@ -29,9 +29,9 @@ interface ResearchArchiveProps {
   topology: ModelTopology;
   activeProfileId: string | null;
   busy: boolean;
-  onOpenRun: (run: BenchmarkRun, baseline?: BenchmarkRun) => void;
+  onOpenRun: (run: BenchmarkRunSummary, baseline?: BenchmarkRunSummary) => void;
   onOpenAgentRun: (run: AgentRun) => void;
-  onOpenComparison: (baseline: BenchmarkRun, candidate: BenchmarkRun) => void;
+  onOpenComparison: (baseline: BenchmarkRunSummary, candidate: BenchmarkRunSummary) => void;
   onLoadProfile: (profile: SavedExpertProfile) => void;
   onCreateProfile: (
     request: CreateExpertProfileRequest,
@@ -69,8 +69,7 @@ export function ResearchArchive({
     [runs],
   );
 
-  function compatibleBaseline(candidate: BenchmarkRun) {
-    const candidateIds = candidate.items.map((item) => item.item_id).join("\0");
+  function compatibleBaseline(candidate: BenchmarkRunSummary) {
     return runs.find((run) => {
       const session = sessionById.get(run.model_session_id);
       return (
@@ -79,9 +78,8 @@ export function ResearchArchive({
         run.status === "completed" &&
         candidate.status === "completed" &&
         run.benchmark_id === candidate.benchmark_id &&
-        (run.cohort_id && candidate.cohort_id
-          ? run.cohort_id === candidate.cohort_id
-          : run.items.map((item) => item.item_id).join("\0") === candidateIds)
+        run.cohort_id !== null &&
+        run.cohort_id === candidate.cohort_id
       );
     });
   }

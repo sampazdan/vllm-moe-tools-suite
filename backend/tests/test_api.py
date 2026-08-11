@@ -1,13 +1,215 @@
+import csv
 import json
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from moe_tools_suite.agentic.domain import CreateAgentRunRequest
-from moe_tools_suite.domain import CreateModelSessionRequest
-from moe_tools_suite.lab import MODEL_ID
+from moe_tools_suite.api import _csv_row
+from moe_tools_suite.domain import (
+    BenchmarkCohort,
+    BenchmarkRun,
+    CreateModelSessionRequest,
+    GenerationConfig,
+    RoutingSummary,
+    RunItemResult,
+)
+from moe_tools_suite.lab import MODEL_ID, RunArtifacts
 from moe_tools_suite.main import create_app
 from moe_tools_suite.settings import Settings
+
+
+def test_csv_export_neutralizes_spreadsheet_formulas() -> None:
+    row = next(
+        csv.reader(
+            [
+                _csv_row(
+                    [
+                        "=1+1",
+                        "+SUM(A1:A2)",
+                        "-2+3",
+                        "@IMPORTXML()",
+                        "\tcommand",
+                        "\rcarriage",
+                        -4,
+                        "ordinary",
+                    ]
+                )
+            ]
+        )
+    )
+    assert row[:6] == [
+        "'=1+1",
+        "'+SUM(A1:A2)",
+        "'-2+3",
+        "'@IMPORTXML()",
+        "'\tcommand",
+        "'\rcarriage",
+    ]
+    assert row[6:] == ["-4", "ordinary"]
+
+
+def test_large_run_archive_and_item_history_are_bounded_and_paginated(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
+    )
+    lab = app.state.lab
+    client = TestClient(app)
+    load_job = client.post("/api/model-sessions", json={"model_id": MODEL_ID}).json()
+    assert client.get(f"/api/jobs/{load_job['id']}").json()["status"] == "completed"
+    assert lab.session is not None
+    item_count = 12_032
+    cohort = BenchmarkCohort(
+        id="mmlu-pro-full-cohort",
+        benchmark_id="mmlu-pro-full",
+        benchmark_revision="v1",
+        dataset_content_hash="a" * 64,
+        prompt_template_version="v1",
+        scoring_version="v1",
+        item_ids=[f"mmlu-{index:05d}" for index in range(item_count)],
+        fingerprint="b" * 64,
+        generation=GenerationConfig(),
+    )
+    lab.cohorts[cohort.id] = cohort
+    run = BenchmarkRun(
+        id="mmlu-pro-full-run",
+        benchmark_id="mmlu-pro-full",
+        model_session_id=lab.session.id,
+        status="completed",
+        score=0.5,
+        scored_items=item_count,
+        completed_items=item_count,
+        total_items=item_count,
+        cohort_id=cohort.id,
+        items=[
+            RunItemResult(
+                item_id=f"mmlu-{index:05d}",
+                prompt="p",
+                expected="A",
+                output="A",
+                passed=True,
+                latency_ms=1,
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+            for index in range(item_count)
+        ],
+    )
+    lab.runs[run.id] = RunArtifacts(
+        run=run,
+        routing=RoutingSummary(
+            run_id=run.id,
+            layer_ids=lab.topology.routed_layer_ids,
+            selection_counts=[
+                [0] * lab.topology.num_experts for _ in lab.topology.routed_layer_ids
+            ],
+            routing_mass=[
+                [0.0] * lab.topology.num_experts for _ in lab.topology.routed_layer_ids
+            ],
+            total_routed_slots=0,
+        ),
+    )
+
+    archive = client.get("/api/runs", params={"limit": 1})
+    assert archive.status_code == 200
+    assert len(archive.content) < 2_000
+    assert archive.json()["total"] == 1
+    assert "items" not in archive.json()["items"][0]
+
+    summary = client.get(f"/api/runs/{run.id}")
+    detail = client.get(f"/api/runs/{run.id}/detail")
+    assert "items" not in summary.json()
+    assert "items" not in detail.json()["run"]
+    assert len(detail.content) < 5_000
+    assert detail.json()["cohort"]["item_count"] == item_count
+
+    first_page = client.get(
+        f"/api/runs/{run.id}/items",
+        params={"limit": 100},
+    ).json()
+    final_page = client.get(
+        f"/api/runs/{run.id}/items",
+        params={"offset": 12_000, "limit": 100},
+    ).json()
+    assert first_page["total"] == item_count
+    assert len(first_page["items"]) == 100
+    assert first_page["items"][0]["item_id"] == "mmlu-00000"
+    assert len(final_page["items"]) == 32
+    assert final_page["items"][-1]["item_id"] == "mmlu-12031"
+    assert (
+        client.get(f"/api/runs/{run.id}/items", params={"limit": 251}).status_code
+        == 422
+    )
+
+
+def test_comparison_rejects_legacy_runs_without_verifiable_cohort(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
+    )
+    client = TestClient(app)
+    load = client.post("/api/model-sessions", json={"model_id": MODEL_ID}).json()
+    assert client.get(f"/api/jobs/{load['id']}").json()["status"] == "completed"
+    baseline_job = client.post(
+        "/api/runs",
+        json={"benchmark_id": "fixture-arithmetic", "item_ids": ["arith-03"]},
+    ).json()
+    baseline_id = client.get(f"/api/jobs/{baseline_job['id']}").json()["result_id"]
+    proposal = client.post(
+        "/api/profiles/propose",
+        json={
+            "run_id": baseline_id,
+            "keep_per_layer": 64,
+            "metric": "routing_mass",
+        },
+    ).json()
+    profile = client.post(
+        "/api/profiles",
+        json={
+            "name": "Legacy comparison profile",
+            "model_id": MODEL_ID,
+            "profile": proposal["profile"],
+            "source": "proposal",
+            "source_run_id": baseline_id,
+            "metric": "routing_mass",
+        },
+    ).json()
+    masked_load = client.post(
+        "/api/model-sessions",
+        json={"model_id": MODEL_ID, "profile_id": profile["id"]},
+    ).json()
+    assert client.get(f"/api/jobs/{masked_load['id']}").json()["status"] == "completed"
+    candidate_job = client.post(
+        "/api/runs",
+        json={"benchmark_id": "fixture-arithmetic", "item_ids": ["arith-03"]},
+    ).json()
+    candidate_id = client.get(f"/api/jobs/{candidate_job['id']}").json()["result_id"]
+    for run_id in (baseline_id, candidate_id):
+        artifacts = app.state.lab.runs[run_id]
+        artifacts.provenance = None
+        artifacts.run.cohort_id = None
+
+    response = client.post(
+        "/api/comparisons",
+        json={
+            "baseline_run_id": baseline_id,
+            "candidate_run_id": candidate_id,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "legacy run comparability cannot be verified" in response.json()["detail"]
 
 
 def test_lost_model_load_response_can_be_discovered_and_retried(
@@ -196,9 +398,10 @@ def test_custom_benchmark_import_browse_and_ungraded_scoring(
     ).json()
     completed = client.get(f"/api/jobs/{run_job['id']}").json()
     run = client.get(f"/api/runs/{completed['result_id']}").json()
+    run_items = client.get(f"/api/runs/{run['id']}/items").json()["items"]
     assert run["score"] == 1.0
     assert run["scored_items"] == 1
-    assert run["items"][1]["passed"] is None
+    assert run_items[1]["passed"] is None
 
     restarted = TestClient(create_app(settings))
     restored = next(
@@ -267,7 +470,7 @@ def test_mock_vertical_slice_creates_profile_and_masked_run(tmp_path: Path) -> N
     baseline_run = client.get(f"/api/runs/{completed_baseline['result_id']}").json()
     assert baseline_run["score"] == 10 / 12
     baseline_detail = client.get(f"/api/runs/{baseline_run['id']}/detail").json()
-    assert baseline_detail["cohort"]["item_ids"] == [item["id"] for item in items]
+    assert baseline_detail["cohort"]["item_count"] == len(items)
     assert baseline_detail["provenance"]["dataset_content_hash"]
     assert baseline_detail["provenance"]["generation"] == {
         "temperature": 0.0,
@@ -278,10 +481,16 @@ def test_mock_vertical_slice_creates_profile_and_masked_run(tmp_path: Path) -> N
     json_export = client.get(f"/api/runs/{baseline_run['id']}/export")
     assert json_export.status_code == 200
     assert json_export.json()["detail"]["run"]["id"] == baseline_run["id"]
+    assert len(json_export.json()["detail"]["run"]["items"]) == len(items)
+    assert json_export.json()["detail"]["cohort"]["item_ids"] == [
+        item["id"] for item in items
+    ]
+    assert "content-length" not in json_export.headers
     assert "attachment" in json_export.headers["content-disposition"]
     csv_export = client.get(f"/api/runs/{baseline_run['id']}/export?format=csv")
     assert csv_export.status_code == 200
     assert csv_export.text.startswith("item_id,passed,scoring")
+    assert "content-length" not in csv_export.headers
 
     proposal = client.post(
         "/api/profiles/propose",
@@ -369,6 +578,42 @@ def test_mock_vertical_slice_creates_profile_and_masked_run(tmp_path: Path) -> N
     run_detail = client.get(f"/api/runs/{masked_run_id}/detail").json()
     assert run_detail["saved_profile"]["id"] == saved_profile["id"]
     assert run_detail["model_session"]["profile"] == proposed["profile"]
+
+    explorer_response = client.post(
+        "/api/routing/explore",
+        json={
+            "sources": [{"kind": "benchmark_run", "id": baseline_run["id"]}],
+            "comparison_sources": [{"kind": "benchmark_run", "id": masked_run_id}],
+            "metric": "selection_count",
+        },
+    )
+    assert explorer_response.status_code == 200
+    explorer = explorer_response.json()
+    assert explorer["model_id"] == model["id"]
+    assert explorer["profile_fingerprint"] is None
+    raw_total = sum(sum(row) for row in routing["selection_counts"])
+    for normalized_row, raw_row in zip(
+        explorer["comparison_selection_counts"],
+        routing["selection_counts"],
+        strict=True,
+    ):
+        assert normalized_row == pytest.approx([value / raw_total for value in raw_row])
+    assert explorer["comparison_sources"][0]["profile_id"] == saved_profile["id"]
+    assert explorer["filter_capabilities"] == {
+        "item": False,
+        "trial": False,
+        "step_type": False,
+        "outcome": False,
+    }
+    unsupported_filter = client.post(
+        "/api/routing/explore",
+        json={
+            "sources": [{"kind": "benchmark_run", "id": baseline_run["id"]}],
+            "filters": {"item_ids": [items[0]["id"]]},
+        },
+    )
+    assert unsupported_filter.status_code == 422
+    assert "item filtering is unavailable" in unsupported_filter.json()["detail"]
 
     comparison_response = client.post(
         "/api/comparisons",

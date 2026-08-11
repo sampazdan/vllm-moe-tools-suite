@@ -5,6 +5,7 @@ import json
 import re
 from pathlib import Path
 
+from ..bounded_regex import bounded_regex_search, validate_bounded_regex
 from ..domain import (
     BenchmarkDatasetRecord,
     BenchmarkInfo,
@@ -107,7 +108,7 @@ class CustomBenchmarkAdapter:
         if item.scoring is ScoringMode.CONTAINS:
             return expected in actual
         if item.scoring is ScoringMode.REGEX:
-            return re.search(expected, actual) is not None
+            return bounded_regex_search(expected, actual)
         raise ValueError(f"unsupported custom scoring mode {item.scoring}")
 
 
@@ -153,8 +154,15 @@ def parse_custom_jsonl(content: str) -> list[BenchmarkItem]:
             raise ValueError(
                 f"line {line_number} has an unsupported scoring mode"
             ) from error
-        if scoring is ScoringMode.GSM8K:
-            raise ValueError(f"line {line_number} cannot use the internal gsm8k scorer")
+        if scoring in {
+            ScoringMode.GSM8K,
+            ScoringMode.IFEVAL,
+            ScoringMode.LIVEBENCH,
+            ScoringMode.MULTIPLE_CHOICE,
+        }:
+            raise ValueError(
+                f"line {line_number} cannot use an internal benchmark scorer"
+            )
         expected = payload.get("expected", "")
         if not isinstance(expected, str):
             raise ValueError(f"line {line_number} expected must be a string")
@@ -166,8 +174,8 @@ def parse_custom_jsonl(content: str) -> list[BenchmarkItem]:
             raise ValueError(f"line {line_number} expected value is too large")
         if scoring is ScoringMode.REGEX:
             try:
-                re.compile(expected)
-            except re.error as error:
+                validate_bounded_regex(expected)
+            except ValueError as error:
                 raise ValueError(
                     f"line {line_number} has an invalid regular expression"
                 ) from error

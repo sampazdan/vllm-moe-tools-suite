@@ -222,22 +222,26 @@ def make_command_observation(
     tool_call_id: str,
     result: CommandResult,
 ) -> AtifObservation:
-    output = result.stdout
+    streams = []
+    if result.stdout or not result.stderr:
+        streams.append(("stdout", result.stdout))
     if result.stderr:
-        output = f"{output}\n[stderr]\n{result.stderr}" if output else result.stderr
+        streams.append(("stderr", result.stderr))
     return AtifObservation(
         results=[
             AtifObservationResult(
                 source_call_id=tool_call_id,
-                content=output,
+                content=content,
                 timestamp=utc_now(),
                 extra={
                     "exit_code": result.exit_code,
                     "duration_ms": result.duration_ms,
                     "timed_out": result.timed_out,
                     "truncated": result.truncated,
+                    "stream": stream,
                 },
             )
+            for stream, content in streams
         ]
     )
 
@@ -355,6 +359,7 @@ def trajectory_to_view(
                 type=TrajectoryStepType.SYSTEM,
                 title="System prompt",
                 content=step.message,
+                phase="system",
             )
             continue
         if step.source is AtifSource.USER:
@@ -364,16 +369,29 @@ def trajectory_to_view(
                 type=TrajectoryStepType.SYSTEM,
                 title="Task instruction",
                 content=step.message,
+                phase="task",
             )
             continue
 
         inference = inference_by_step.get(step.step_id) or _metrics_inference(step)
+        if step.reasoning_content:
+            add_step(
+                id=f"atif-{step.step_id}-reasoning",
+                timestamp=timestamp,
+                type=TrajectoryStepType.REASONING,
+                title="Explicit model reasoning",
+                content=step.reasoning_content,
+                phase="reasoning",
+                reasoning_visibility="explicit",
+            )
         add_step(
             id=f"atif-{step.step_id}-assistant",
             timestamp=timestamp,
             type=TrajectoryStepType.ASSISTANT,
             title="Agent response",
             content=step.message,
+            phase="response",
+            reasoning_visibility=("explicit" if step.reasoning_content else "none"),
             inference=inference,
         )
         calls = step.tool_calls or []
@@ -391,6 +409,7 @@ def trajectory_to_view(
                 content=json.dumps(call.arguments, indent=2, sort_keys=True),
                 tool_name=call.function_name,
                 command=command,
+                phase="command",
             )
         if step.observation is not None:
             for result_index, result in enumerate(step.observation.results, start=1):
@@ -401,6 +420,12 @@ def trajectory_to_view(
                     type=TrajectoryStepType.OBSERVATION,
                     title="Command observation",
                     content=result.content,
+                    phase="observation",
+                    stream=(
+                        extra.get("stream")
+                        if extra.get("stream") in {"stdout", "stderr"}
+                        else None
+                    ),
                     exit_code=_optional_int(extra.get("exit_code")),
                     duration_ms=_optional_float(extra.get("duration_ms")),
                     truncated=bool(extra.get("truncated", False)),
@@ -415,6 +440,7 @@ def trajectory_to_view(
             content=verifier.output,
             exit_code=verifier.exit_code,
             duration_ms=verifier.duration_ms,
+            phase="verifier",
         )
 
     latest_timestamp = updated_at or max(

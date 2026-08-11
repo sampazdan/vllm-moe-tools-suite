@@ -79,6 +79,10 @@ class ManagedVllmServer:
         environment.pop("DAYTONA_API_KEY", None)
         environment.pop("DAYTONA_JWT_TOKEN", None)
         environment.pop("DAYTONA_ORGANIZATION_ID", None)
+        environment.pop("MOE_TOOLS_ANTHROPIC_API_KEY", None)
+        environment.pop("ANTHROPIC_API_KEY", None)
+        environment.pop("MOE_TOOLS_OPENAI_API_KEY", None)
+        environment.pop("OPENAI_API_KEY", None)
         environment.pop("MOE_PROFILE", None)
         if self.profile_path is not None:
             environment["MOE_PROFILE"] = str(self.profile_path)

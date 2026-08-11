@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,14 @@ def test_completed_run_and_routing_survive_application_restart(
     assert completed_job["status"] == "completed"
     run_id = completed_job["result_id"]
     created = first_client.get(f"/api/runs/{run_id}").json()
+    with first_app.state.lab.store.sessions() as database:
+        record_json = database.execute(
+            text(
+                "SELECT record_json FROM benchmark_run_metadata WHERE run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        ).scalar_one()
+    assert "items" not in json.loads(record_json)
 
     proposal = first_client.post(
         "/api/profiles/propose",
@@ -94,7 +103,8 @@ def test_completed_run_and_routing_survive_application_restart(
 
     assert second_client.get("/api/system/status").json()["model_state"] == "unloaded"
     restored = second_client.get("/api/runs").json()
-    assert {run["id"] for run in restored} == {run_id, masked_run_id}
+    assert restored["total"] == 2
+    assert {run["id"] for run in restored["items"]} == {run_id, masked_run_id}
     routing = second_client.get(f"/api/runs/{run_id}/routing").json()
     assert routing["run_id"] == run_id
     assert routing["total_routed_slots"] > 0

@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "harness": {
+    "id": "harbor",
+    "name": "Harbor",
+    "source_url": "https://github.com/harbor-framework/harbor",
+    "revision": "488af1b12b3b728b9364ab5e1bb663bd3e0ae643",
+    "license": "Apache-2.0",
+    "trajectory_format": "ATIF"
+  },
+  "task_packs": [
+    {
+      "id": "terminal-bench-2.1-engineering-15",
+      "name": "Terminal-Bench 2.1 · engineering 15",
+      "family": "terminal-bench",
+      "upstream_version": "2.1",
+      "source_url": "https://github.com/harbor-framework/terminal-bench-2-1",
+      "source_revision": "ffccbe05ee73a9d59518217f294ad711bda39304",
+      "license": "Apache-2.0",
+      "upstream_task_count": 89,
+      "adapter_path": "native Harbor task format",
+      "distribution": "lazy_official_git_download",
+      "preparation_state": "source_pinned",
+      "curated_selection": "Fifteen verified upstream task IDs selected for software engineering, debugging, systems, security, databases, and serving coverage. This is an application cohort, not an official Terminal-Bench score.",
+      "curated_task_ids": [
+        "break-filter-js-from-html",
+        "build-cython-ext",
+        "cancel-async-tasks",
+        "configure-git-webserver",
+        "custom-memory-heap-crash",
+        "db-wal-recovery",
+        "extract-elf",
+        "fix-code-vulnerability",
+        "fix-git",
+        "git-leak-recovery",
+        "kv-store-grpc",
+        "llm-inference-batching-scheduler",
+        "nginx-request-logging",
+        "pypi-server",
+        "query-optimize"
+      ],
+      "public_problem_fields": [
+        "id",
+        "instruction",
+        "category",
+        "resource_requirements",
+        "timeout_seconds"
+      ],
+      "success_criteria": "The task's trusted upstream Harbor verifier must return a passing reward after the agent finishes.",
+      "verifier_asset_policy": "Download verifier and oracle assets only into the isolated runner; never return them from public problem APIs or model context.",
+      "assets_prepared": false,
+      "oracle_passed": false,
+      "noop_failed": false,
+      "limitations": [
+        "The Harbor runner adapter and container/image compatibility have not yet been integrated into this application.",
+        "Every converted task must pass an oracle run and fail a no-op run before this pack can become launchable.",
+        "Results from this curated cohort are not an official Terminal-Bench aggregate."
+      ]
+    },
+    {
+      "id": "aider-polyglot-balanced-12",
+      "name": "Aider Polyglot · balanced 12",
+      "family": "aider-polyglot",
+      "upstream_version": "1.0",
+      "source_url": "https://github.com/laude-institute/harbor-datasets",
+      "source_revision": "f30b14415dd733c83627204bad0af69a89ceb46f",
+      "license": "Source repository license not declared; task component licenses require per-task review; Harbor adapter Apache-2.0",
+      "upstream_task_count": 225,
+      "adapter_path": "adapters/aider_polyglot",
+      "distribution": "lazy_official_git_download",
+      "preparation_state": "source_pinned",
+      "curated_selection": "Two real Harbor registry tasks per language, selected deterministically from C++, Go, Java, JavaScript, Python, and Rust. It is a fast language-coverage cohort, not an official Aider leaderboard score.",
+      "curated_task_ids": [
+        "polyglot_cpp_zebra-puzzle",
+        "polyglot_cpp_yacht",
+        "polyglot_go_zebra-puzzle",
+        "polyglot_go_wordy",
+        "polyglot_java_zipper",
+        "polyglot_java_zebra-puzzle",
+        "polyglot_javascript_zipper",
+        "polyglot_javascript_zebra-puzzle",
+        "polyglot_python_zipper",
+        "polyglot_python_zebra-puzzle",
+        "polyglot_rust_xorcism",
+        "polyglot_rust_wordy"
+      ],
+      "public_problem_fields": [
+        "id",
+        "instruction",
+        "language",
+        "editable_files",
+        "timeout_seconds"
+      ],
+      "success_criteria": "All trusted exercise tests selected by the upstream Harbor verifier must pass after the edit.",
+      "verifier_asset_policy": "Keep exercise tests and reference patches in the isolated runner; expose only the prompt and declared editable surface to the model.",
+      "assets_prepared": false,
+      "oracle_passed": false,
+      "noop_failed": false,
+      "limitations": [
+        "This balanced cohort is not difficulty-stratified and is not comparable to the official 225-task Aider leaderboard.",
+        "Converted assets are revision-pinned but have not yet been imported, license-audited, or validated in this application.",
+        "Every converted task must pass an oracle run and fail a no-op run before this pack can become launchable."
+      ]
+    },
+    {
+      "id": "aider-polyglot-python-canary-3",
+      "name": "Aider Polyglot · Python canary 3",
+      "family": "aider-polyglot",
+      "upstream_version": "1.0",
+      "source_url": "https://github.com/laude-institute/harbor-datasets",
+      "source_revision": "f30b14415dd733c83627204bad0af69a89ceb46f",
+      "license": "MIT task components from Exercism Python and problem-specifications; Apache-2.0 Harbor adapter",
+      "upstream_task_count": 225,
+      "adapter_path": "bundled isolated-RPC Python adapter revision 1",
+      "distribution": "bundled_revision_pinned_components",
+      "preparation_state": "validated",
+      "curated_selection": "Three real Python editing exercises selected from the pinned 225-task Harbor conversion: zipper and zebra-puzzle overlap the balanced-12 cohort, while wordy adds a deeper parser and error-semantics workload. The selected upstream Git-tree attestation is sha256:373c1a204c4ec13e778200683784faba7d49e7bb11895ba9294f2349b47f2502. This is a fast application canary, not an official Aider score.",
+      "curated_task_ids": [
+        "polyglot_python_zipper",
+        "polyglot_python_wordy",
+        "polyglot_python_zebra-puzzle"
+      ],
+      "public_problem_fields": [
+        "id",
+        "instruction",
+        "language",
+        "editable_files",
+        "timeout_seconds"
+      ],
+      "success_criteria": "Every task must pass all assertions adapted from its trusted pinned upstream test file after the edit; the exact pinned exemplar must pass and the untouched starter must fail.",
+      "verifier_asset_policy": "Only the instruction, starter, and generic candidate RPC runner enter the agent sandbox. Root-only verifier drivers run candidate modules as uid/gid 65534 in a fresh network-disabled clean room. Exact exemplar oracles are eligibility-only and never enter agent or verifier runtime.",
+      "assets_prepared": true,
+      "oracle_passed": true,
+      "noop_failed": true,
+      "limitations": [
+        "This 3-of-225 Python-only canary is not difficulty-stratified and cannot be compared with official Aider Polyglot leaderboard scores.",
+        "The application adapter uses an immutable Python 3.12 slim runtime instead of Harbor's moving buildpack-deps:jammy plus Python 3.11 PPA build.",
+        "The generic RPC runner is public but contains no test cases or expected values; verifier assertions remain protected."
+      ]
+    },
+    {
+      "id": "featurebench-fast-100-reference",
+      "name": "FeatureBench · fast 100 reference",
+      "family": "featurebench",
+      "upstream_version": "fast",
+      "source_url": "https://github.com/LiberCoders/FeatureBench",
+      "source_revision": "445dcbaec0b2e136061b0acb54e753c0a9f1888e",
+      "license": "MIT",
+      "upstream_task_count": 100,
+      "adapter_path": "adapters/featurebench",
+      "distribution": "official_cli_download_required",
+      "preparation_state": "reference_only",
+      "curated_selection": "The official CPU-only fast split is recorded as a future full cohort; no application-specific subset has been selected.",
+      "curated_task_ids": [],
+      "public_problem_fields": [
+        "id",
+        "instruction",
+        "repository",
+        "base_revision",
+        "resource_requirements",
+        "timeout_seconds"
+      ],
+      "success_criteria": "The official FeatureBench harness must accept the patch under its hidden test and feature-resolution metrics.",
+      "verifier_asset_policy": "Use FeatureBench's official isolated evaluation path and do not expose gold patches or hidden tests to the model or public API.",
+      "assets_prepared": false,
+      "oracle_passed": false,
+      "noop_failed": false,
+      "limitations": [
+        "Harbor's registry entry referenced HEAD rather than an immutable converted-task commit when this manifest was authored, so those converted assets are intentionally not accepted.",
+        "The official FeatureBench CLI, images, and result schema have not yet been adapted to this application's run controller.",
+        "This entry is reference-only and cannot be launched."
+      ]
+    }
+  ]
+}

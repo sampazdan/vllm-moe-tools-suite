@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
@@ -12,10 +14,14 @@ from fastapi import (
     Request,
     status,
 )
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import __version__
 from .agentic.atif import trajectory_to_json
+from .agentic.comparison import (
+    AgentRunComparison,
+    CreateAgentComparisonRequest,
+)
 from .agentic.domain import (
     AgentDefinition,
     AgentRunExport,
@@ -35,14 +41,19 @@ from .domain import (
     BenchmarkDatasetRecord,
     BenchmarkInfo,
     BenchmarkItemPage,
-    BenchmarkRun,
+    BenchmarkProblemDetail,
+    BenchmarkRunPage,
+    BenchmarkRunSummary,
     ComparisonRecord,
     CreateComparisonRequest,
     CreateCustomBenchmarkRequest,
     CreateExpertProfileRequest,
     CreateModelSessionRequest,
+    EvaluationCapabilities,
     ExpertProfile,
     JobRecord,
+    JudgeEvaluationRequest,
+    LLMJudgeResult,
     ModelRegistryEntry,
     ModelSession,
     ModelState,
@@ -51,11 +62,15 @@ from .domain import (
     ProfileValidation,
     RoutingSummary,
     RunDetail,
+    RunItemResult,
+    RunItemResultPage,
     RunRequest,
     RuntimeStatus,
     SavedExpertProfile,
     SystemStatus,
 )
+from .expert_explorer import RoutingExploreRequest, RoutingExploreResponse
+from .judges import JudgeProviderError
 from .lab import ActiveJobConflict, ResearchLab
 
 router = APIRouter(prefix="/api")
@@ -141,6 +156,9 @@ def list_agent_tasks(pack_id: str, request: Request) -> list[AgentTaskInfo]:
                 instruction=task.instruction,
                 language=task.language,
                 tags=task.tags,
+                success_criteria=task.success_criteria,
+                verifier_fingerprint=task.verifier_fingerprint(),
+                hidden_verifier_file_count=len(task.verifier_file_paths),
                 timeout_seconds=task.timeout_seconds,
             )
             for task in _lab(request).agentic.list_tasks(pack_id)
@@ -211,6 +229,21 @@ def export_agent_run(run_id: str, request: Request) -> JSONResponse:
             "Content-Disposition": (f'attachment; filename="agent-run-{run_id}.json"')
         },
     )
+
+
+@router.post("/agent-comparisons", response_model=AgentRunComparison)
+def create_agent_comparison(
+    payload: CreateAgentComparisonRequest,
+    request: Request,
+) -> AgentRunComparison:
+    try:
+        return _lab(request).compare_agent_runs(payload)
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404, detail="agent comparison run not found"
+        ) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.get("/trials/{trial_id}", response_model=AgentTrialSummary)
@@ -330,6 +363,43 @@ def list_benchmarks(request: Request) -> list[BenchmarkInfo]:
 
 
 @router.get(
+    "/benchmarks/{benchmark_id}/items/{item_id}",
+    response_model=BenchmarkProblemDetail,
+)
+def get_benchmark_problem(
+    benchmark_id: str,
+    item_id: str,
+    request: Request,
+) -> BenchmarkProblemDetail:
+    try:
+        return _lab(request).get_benchmark_problem(benchmark_id, item_id)
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404, detail="benchmark item not found"
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get("/evaluation/capabilities", response_model=EvaluationCapabilities)
+def evaluation_capabilities(request: Request) -> EvaluationCapabilities:
+    return _lab(request).evaluation_capabilities()
+
+
+@router.post("/evaluation/judge", response_model=LLMJudgeResult)
+async def judge_evaluation(
+    payload: JudgeEvaluationRequest,
+    request: Request,
+) -> LLMJudgeResult:
+    try:
+        return await _lab(request).judge(payload)
+    except JudgeProviderError as error:
+        message = str(error)
+        status_code = 409 if "not configured" in message else 502
+        raise HTTPException(status_code=status_code, detail=message) from error
+
+
+@router.get(
     "/benchmarks/{benchmark_id}/items",
     response_model=BenchmarkItemPage,
 )
@@ -418,17 +488,34 @@ async def create_run(
         raise HTTPException(status_code=422, detail=str(error)) from error
 
 
-@router.get("/runs", response_model=list[BenchmarkRun])
-def list_runs(request: Request) -> list[BenchmarkRun]:
-    return _lab(request).list_runs()
+@router.get("/runs", response_model=BenchmarkRunPage)
+def list_runs(
+    request: Request,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> BenchmarkRunPage:
+    return _lab(request).list_runs(offset=offset, limit=limit)
 
 
-@router.get("/runs/{run_id}", response_model=BenchmarkRun)
-def get_run(run_id: str, request: Request) -> BenchmarkRun:
-    artifacts = _lab(request).runs.get(run_id)
-    if artifacts is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    return artifacts.run
+@router.get("/runs/{run_id}", response_model=BenchmarkRunSummary)
+def get_run(run_id: str, request: Request) -> BenchmarkRunSummary:
+    try:
+        return _lab(request).get_run(run_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="run not found") from error
+
+
+@router.get("/runs/{run_id}/items", response_model=RunItemResultPage)
+def get_run_items(
+    run_id: str,
+    request: Request,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=250)] = 100,
+) -> RunItemResultPage:
+    try:
+        return _lab(request).get_run_items(run_id, offset=offset, limit=limit)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="run not found") from error
 
 
 @router.get("/runs/{run_id}/routing", response_model=RoutingSummary)
@@ -437,6 +524,23 @@ def get_run_routing(run_id: str, request: Request) -> RoutingSummary:
     if artifacts is None:
         raise HTTPException(status_code=404, detail="run not found")
     return artifacts.routing
+
+
+@router.post("/routing/explore", response_model=RoutingExploreResponse)
+def explore_routing(
+    payload: RoutingExploreRequest,
+    request: Request,
+) -> RoutingExploreResponse:
+    try:
+        return _lab(request).explore_routing(payload)
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404, detail="routing source not found"
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.get("/runs/{run_id}/detail", response_model=RunDetail)
@@ -454,7 +558,7 @@ def export_run(
     run_id: str,
     request: Request,
     export_format: Annotated[Literal["json", "csv"], Query(alias="format")] = "json",
-) -> JSONResponse | Response:
+) -> StreamingResponse:
     lab = _lab(request)
     try:
         detail = lab.get_run_detail(run_id)
@@ -469,55 +573,161 @@ def export_run(
             for comparison in lab.comparisons.values()
             if run_id in {comparison.baseline_run_id, comparison.candidate_run_id}
         ]
-        return JSONResponse(
-            content={
-                "schema_version": 1,
-                "exported_at": datetime.now(UTC).isoformat(),
-                "detail": detail.model_dump(mode="json"),
-                "routing": artifacts.routing.model_dump(mode="json"),
-                "comparisons": [
-                    comparison.model_dump(mode="json") for comparison in comparisons
-                ],
-            },
+        return StreamingResponse(
+            _run_json_export_chunks(
+                detail=detail,
+                items=artifacts.run.items,
+                routing=artifacts.routing,
+                comparisons=comparisons,
+                cohort_item_ids=(
+                    lab.cohorts[artifacts.run.cohort_id].item_ids
+                    if artifacts.run.cohort_id is not None
+                    and artifacts.run.cohort_id in lab.cohorts
+                    else None
+                ),
+            ),
+            media_type="application/json",
             headers=headers,
         )
-
-    output = io.StringIO(newline="")
-    writer = csv.writer(output)
-    writer.writerow(
-        [
-            "item_id",
-            "passed",
-            "scoring",
-            "latency_ms",
-            "prompt_tokens",
-            "completion_tokens",
-            "error",
-            "prompt",
-            "expected",
-            "output",
-        ]
+    return StreamingResponse(
+        _run_csv_export_chunks(artifacts.run.items),
+        media_type="text/csv; charset=utf-8",
+        headers=headers,
     )
-    for item in detail.run.items:
-        writer.writerow(
+
+
+def _run_json_export_chunks(
+    *,
+    detail: RunDetail,
+    items: list[RunItemResult],
+    routing: RoutingSummary,
+    comparisons: list[ComparisonRecord],
+    cohort_item_ids: list[str] | None,
+) -> Iterator[str]:
+    detail_data = detail.model_dump(mode="json")
+    run_data = detail_data.pop("run")
+    run_json = _compact_json(run_data)
+    yield (
+        '{"schema_version":1,"exported_at":'
+        f'{_compact_json(datetime.now(UTC).isoformat())},"detail":{{"run":'
+        f'{run_json[:-1]},"items":['
+    )
+    for index, item in enumerate(items):
+        if index:
+            yield ","
+        yield item.model_dump_json()
+    yield "]}"
+    for key, value in detail_data.items():
+        yield f",{_compact_json(key)}:"
+        if key == "cohort" and value is not None and cohort_item_ids is not None:
+            cohort_json = _compact_json(value)
+            yield f'{cohort_json[:-1]},"item_ids":['
+            for index, item_id in enumerate(cohort_item_ids):
+                if index:
+                    yield ","
+                yield _compact_json(item_id)
+            yield "]}"
+        else:
+            yield _compact_json(value)
+    yield f'}},"routing":{routing.model_dump_json()},"comparisons":['
+    for index, comparison in enumerate(comparisons):
+        if index:
+            yield ","
+        yield comparison.model_dump_json()
+    yield "]}"
+
+
+_RUN_CSV_HEADER = [
+    "item_id",
+    "passed",
+    "scoring",
+    "attempt",
+    "deterministic_score",
+    "judge_score",
+    "combined_score",
+    "latency_ms",
+    "prompt_tokens",
+    "reasoning_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "ttft_ms",
+    "decode_ms",
+    "tokens_per_second",
+    "inference_cost_usd",
+    "judge_cost_usd",
+    "judge_equivalent_cost_usd",
+    "judge_budget_debit_usd",
+    "judge_cost_uncertain",
+    "error",
+    "prompt",
+    "expected",
+    "output",
+]
+
+
+def _run_csv_export_chunks(items: list[RunItemResult]) -> Iterator[str]:
+    yield _csv_row(_RUN_CSV_HEADER)
+    for item in items:
+        evaluation = item.evaluation
+        performance = item.performance
+        judge = evaluation.judge if evaluation is not None else None
+        yield _csv_row(
             [
                 item.item_id,
                 item.passed,
                 item.scoring.value,
+                item.attempt,
+                evaluation.deterministic_score if evaluation is not None else "",
+                evaluation.judge_score if evaluation is not None else "",
+                evaluation.combined_score if evaluation is not None else "",
                 item.latency_ms,
                 item.prompt_tokens,
+                item.reasoning_tokens if item.reasoning_tokens is not None else "",
                 item.completion_tokens,
+                item.total_tokens,
+                performance.ttft_ms if performance is not None else "",
+                performance.decode_ms if performance is not None else "",
+                performance.tokens_per_second if performance is not None else "",
+                (
+                    performance.estimated_cost_usd
+                    if performance is not None
+                    and performance.estimated_cost_usd is not None
+                    else ""
+                ),
+                (
+                    judge.usage.incurred_cost_usd
+                    if judge is not None and judge.usage.incurred_cost_usd is not None
+                    else ""
+                ),
+                (
+                    judge.usage.estimated_cost_usd
+                    if judge is not None and judge.usage.estimated_cost_usd is not None
+                    else ""
+                ),
+                item.judge_budget_debit_usd,
+                item.judge_cost_uncertain,
                 item.error or "",
                 item.prompt,
                 item.expected,
                 item.output,
             ]
         )
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv; charset=utf-8",
-        headers=headers,
-    )
+
+
+def _compact_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _csv_row(values: list[object]) -> str:
+    output = io.StringIO(newline="")
+    csv.writer(output).writerow([_csv_safe_cell(value) for value in values])
+    return output.getvalue()
+
+
+def _csv_safe_cell(value: object) -> object:
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return f"'{value}"
+    return value
 
 
 @router.get("/jobs", response_model=list[JobRecord])

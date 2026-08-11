@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "source": {
+    "url": "https://github.com/laude-institute/harbor-datasets",
+    "revision": "f30b14415dd733c83627204bad0af69a89ceb46f",
+    "selected_git_tree_hash_algorithm": "SHA-256 of the newline-terminated, bytewise path-sorted `git ls-tree -r` records for the three selected task directories",
+    "selected_git_tree_sha256": "373c1a204c4ec13e778200683784faba7d49e7bb11895ba9294f2349b47f2502"
+  },
+  "harbor_adapter": {
+    "url": "https://github.com/harbor-framework/harbor/tree/488af1b12b3b728b9364ab5e1bb663bd3e0ae643/adapters/aider_polyglot",
+    "revision": "488af1b12b3b728b9364ab5e1bb663bd3e0ae643",
+    "license": "Apache-2.0"
+  },
+  "component_license": {
+    "copyright": "Copyright (c) 2021 Exercism",
+    "license": "MIT",
+    "notice_resource": "THIRD_PARTY_NOTICES.md"
+  },
+  "effective_image": {
+    "reference": "python:3.12-slim",
+    "digest": "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36"
+  },
+  "tasks": {
+    "polyglot_python_zipper": {
+      "instruction_sha256": "d2bafe5a1d72fa867e2b40b5f64d9216cf668796ef7796406f98fd05342246d6",
+      "starter_sha256": "66276107d448f53a12509da6f503280e0dca4a6bbd9d690a774fb0972a55f926",
+      "upstream_test_sha256": "a3cf6e5ebcf6b2171bcc80fa0ce81b425af23b522f222e841fa2abd3119e95b2",
+      "oracle_sha256": "c1eff987dcc104ad0721087a18b96735f5630d4eb3828532e09adf434f6a06df",
+      "assertion_count": 14,
+      "noop_failed": true,
+      "oracle_passed": true
+    },
+    "polyglot_python_wordy": {
+      "instruction_sha256": "3535fc3e9ca0a6b1be826a0372d831b1a802efdd36039d7b5449ff5884b3a92b",
+      "starter_sha256": "3a8e9cf28b599898ff62c4714ad747b95ec84e8e04034b3dbf14b9f40afe0ee1",
+      "upstream_test_sha256": "3c8bf5b17e14c8f8953107c0ae9600be0c0d96e578cf442526dbedf0c57889da",
+      "oracle_sha256": "ae46b493f1782fffa932a26b279041c5d2d8083b0858b2289107bacc6161c796",
+      "assertion_count": 25,
+      "noop_failed": true,
+      "oracle_passed": true
+    },
+    "polyglot_python_zebra-puzzle": {
+      "instruction_sha256": "248e6d970c76d27c5a36e5b377f45d7ce021a5ef6634b5cc40abd000d4dad7be",
+      "starter_sha256": "6916bddd73997faa6920d6ef41a6a9f593e65bac41252dedc19deb65df844c67",
+      "upstream_test_sha256": "079d65e614c911f7e21ef19a1aa5d0d4bb2c69fba1bd86cb84e0f1f4e39efb90",
+      "oracle_sha256": "74be8f26867df7ef1946dcfc1c07ce851758dbbf3d2ab795abba19c2213eba7a",
+      "assertion_count": 2,
+      "noop_failed": true,
+      "oracle_passed": true
+    }
+  }
+}

@@ -20,12 +20,14 @@ ITEM_IDS = ("arith-03", "arith-04")
 
 
 class FakeCanaryApi:
-    def __init__(self, *, daytona: bool = False) -> None:
+    def __init__(self, *, daytona: bool = False, anthropic_judge: bool = False) -> None:
         self.daytona = daytona
+        self.anthropic_judge = anthropic_judge
         self.paths: list[tuple[str, str]] = []
         self.login_token: str | None = None
         self.current_session_id = "baseline-session"
         self.run_count = 0
+        self.agent_run_count = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         method = request.method
@@ -54,6 +56,38 @@ class FakeCanaryApi:
             )
         if method == "GET" and path == "/api/jobs/active":
             return self._json(request, None)
+        if method == "GET" and path == "/api/evaluation/capabilities":
+            assert self.anthropic_judge
+            return self._json(
+                request,
+                {
+                    "judge_providers": [
+                        {
+                            "provider": "anthropic",
+                            "configured": True,
+                            "default_model": "claude-sonnet-5",
+                        }
+                    ]
+                },
+            )
+        if method == "POST" and path == "/api/evaluation/judge":
+            assert self.anthropic_judge
+            self._assert_csrf(request)
+            assert isinstance(payload, Mapping)
+            config = payload.get("config")
+            assert isinstance(config, Mapping)
+            assert config.get("provider") == "anthropic"
+            assert config.get("model") == "claude-sonnet-5"
+            return self._json(
+                request,
+                {
+                    "id": "judge-canary",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-5",
+                    "score": 1,
+                    "request_hash": "a" * 64,
+                },
+            )
 
         if method == "GET" and path == "/api/models":
             return self._json(
@@ -123,7 +157,20 @@ class FakeCanaryApi:
                     "status": "completed",
                     "model_session_id": session_id,
                     "score": 1.0,
+                },
+            )
+        if method == "GET" and path in {
+            "/api/runs/baseline-run/items",
+            "/api/runs/masked-run/items",
+        }:
+            return self._json(
+                request,
+                {
+                    "run_id": path.split("/")[-2],
                     "items": [{"item_id": item_id} for item_id in ITEM_IDS],
+                    "total": len(ITEM_IDS),
+                    "offset": 0,
+                    "limit": 250,
                 },
             )
         if method == "GET" and path == "/api/runs/baseline-run/routing":
@@ -131,24 +178,92 @@ class FakeCanaryApi:
                 request,
                 {"run_id": "baseline-run", "total_routed_slots": 128},
             )
-        if method == "POST" and path == "/api/profiles/propose":
+        if method == "POST" and path == "/api/routing/explore":
             self._assert_csrf(request)
+            assert isinstance(payload, Mapping)
+            sources = payload.get("sources")
+            assert isinstance(sources, list)
+            source = sources[0]
+            assert isinstance(source, Mapping)
+            if source.get("kind") == "benchmark_run":
+                assert payload == {
+                    "sources": [
+                        {
+                            "kind": "benchmark_run",
+                            "id": "baseline-run",
+                            "weight": 1,
+                        }
+                    ],
+                    "metric": "routing_mass",
+                }
+                comparison_mass = None
+            else:
+                assert self.daytona
+                assert payload == {
+                    "sources": [
+                        {
+                            "kind": "agent_trial",
+                            "id": "trial-baseline",
+                            "weight": 1,
+                        }
+                    ],
+                    "comparison_sources": [
+                        {
+                            "kind": "agent_trial",
+                            "id": "trial-candidate",
+                            "weight": 1,
+                        }
+                    ],
+                    "metric": "routing_mass",
+                }
+                comparison_mass = [
+                    [0.7, 0.8, 0.5, 0.6, 0.3, 0.4, 0.1, 0.2],
+                    [0.2, 0.1, 0.4, 0.3, 0.6, 0.5, 0.8, 0.7],
+                ]
             return self._json(
                 request,
                 {
-                    "profile": {
-                        "version": 1,
-                        "layers": {"0": {"keep": list(range(8))}},
-                    },
-                    "validation": {"valid": True},
-                    "observed_mass_retained": 0.9,
+                    "fingerprint": "e" * 64,
+                    "layer_ids": [0, 1],
+                    "num_experts": 8,
+                    "top_k": 2,
+                    "routing_mass": [
+                        [0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
+                        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+                    ],
+                    "comparison_routing_mass": comparison_mass,
+                    "total_routed_slots": 128,
                 },
             )
+        if method == "POST" and path == "/api/profiles/validate":
+            self._assert_csrf(request)
+            assert isinstance(payload, Mapping)
+            layers = payload.get("layers")
+            assert isinstance(layers, Mapping)
+            assert len(layers["0"]["keep"]) == 7
+            assert len(layers["1"]["keep"]) == 8
+            return self._json(request, {"valid": True})
         if method == "POST" and path == "/api/profiles":
             self._assert_csrf(request)
             assert isinstance(payload, Mapping)
-            assert payload.get("source_run_id") == "baseline-run"
-            return self._json(request, {"id": "profile-canary"})
+            assert payload.get("selection_strategy") == ("canary_non_uniform_top_mass")
+            is_agentic = payload.get("source") == "agentic"
+            if is_agentic:
+                assert self.daytona
+                assert payload.get("source_trial_id") == "trial-baseline"
+                profile_id = "profile-agent-canary"
+            else:
+                assert payload.get("source_run_id") == "baseline-run"
+                profile_id = "profile-canary"
+            return self._json(
+                request,
+                {
+                    "id": profile_id,
+                    "profile": payload["profile"],
+                    "source_trial_id": ("trial-baseline" if is_agentic else None),
+                    "validation": {"valid": True},
+                },
+            )
         if method == "POST" and path == "/api/comparisons":
             self._assert_csrf(request)
             return self._json(
@@ -211,33 +326,67 @@ class FakeCanaryApi:
             assert payload.get("sandbox_provider_id") == "daytona"
             assert payload.get("task_ids") == ["fix-subtract"]
             assert payload.get("budgets") == {
-                "max_turns": 4,
-                "max_commands": 6,
-                "max_tokens": 4096,
-                "timeout_seconds": 180,
+                "max_turns": 10,
+                "max_commands": 12,
+                "max_tokens": 16384,
+                "timeout_seconds": 300,
             }
+            self.agent_run_count += 1
+            suffix = "baseline" if self.agent_run_count == 1 else "candidate"
+            expected_session = (
+                "baseline-session" if suffix == "baseline" else "masked-session"
+            )
+            assert payload.get("model_session_id") == expected_session
             return self._json(
                 request,
-                _job("agent-job", "agent_run", result_id="agent-run"),
+                _job(
+                    f"agent-job-{suffix}",
+                    "agent_run",
+                    result_id=f"agent-run-{suffix}",
+                ),
             )
-        if method == "GET" and path == "/api/agent-runs/agent-run":
+        if method == "GET" and path in {
+            "/api/agent-runs/agent-run-baseline",
+            "/api/agent-runs/agent-run-candidate",
+        }:
+            suffix = path.rsplit("-", maxsplit=1)[-1]
+            session_id = (
+                "baseline-session" if suffix == "baseline" else "masked-session"
+            )
             return self._json(
                 request,
                 {
-                    "id": "agent-run",
+                    "id": f"agent-run-{suffix}",
                     "status": "completed",
-                    "model_session_id": "masked-session",
+                    "model_session_id": session_id,
                     "sandbox_provider_id": "daytona",
                     "task_ids": ["fix-subtract"],
                     "total_trials": 1,
                     "passed_trials": 1,
                     "trials": [
                         {
+                            "id": f"trial-{suffix}",
                             "status": "passed",
                             "sandbox_status": "deleted",
                             "routed_inference_calls": 2,
                         }
                     ],
+                },
+            )
+        if method == "POST" and path == "/api/agent-comparisons":
+            self._assert_csrf(request)
+            assert payload == {
+                "baseline_run_id": "agent-run-baseline",
+                "candidate_run_id": "agent-run-candidate",
+                "name": "Acceptance canary agent comparison",
+            }
+            return self._json(
+                request,
+                {
+                    "id": "c" * 64,
+                    "trial_count": 1,
+                    "baseline_profile_id": None,
+                    "candidate_profile_id": "profile-canary",
                 },
             )
         return None
@@ -253,18 +402,25 @@ class FakeCanaryApi:
         return httpx.Response(status_code, json=payload, request=request)
 
 
-@pytest.mark.parametrize("daytona", [False, True])
-def test_public_canary_flow_is_explicit_and_secret_safe(daytona: bool) -> None:
-    fake = FakeCanaryApi(daytona=daytona)
+@pytest.mark.parametrize(
+    ("daytona", "anthropic_judge"),
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_public_canary_flow_is_explicit_and_secret_safe(
+    daytona: bool,
+    anthropic_judge: bool,
+) -> None:
+    fake = FakeCanaryApi(daytona=daytona, anthropic_judge=anthropic_judge)
     output: list[str] = []
     config = CanaryConfig(
         base_url="https://canary.test",
         token="top-secret-token",
         poll_interval_seconds=0,
         daytona=daytona,
+        anthropic_judge=anthropic_judge,
     )
     reporter = Reporter(
-        total_steps=10 if daytona else 9,
+        total_steps=9 + (3 if daytona else 0) + (1 if anthropic_judge else 0),
         secrets=(config.token or "",),
         write=output.append,
     )
@@ -276,11 +432,15 @@ def test_public_canary_flow_is_explicit_and_secret_safe(daytona: bool) -> None:
         result = AcceptanceCanary(config, api, reporter).run()
 
     assert result["comparison_id"] == "comparison-canary"
-    assert ("agent_run_id" in result) is daytona
+    assert ("agent_comparison_id" in result) is daytona
+    assert ("agent_profile_id" in result) is daytona
+    assert ("judge_result_id" in result) is anthropic_judge
     assert fake.login_token == "top-secret-token"
     assert "top-secret-token" not in "\n".join(output)
     touched_daytona = any("sandbox-providers" in path for _, path in fake.paths)
     assert touched_daytona is daytona
+    touched_judge = any("evaluation/judge" in path for _, path in fake.paths)
+    assert touched_judge is anthropic_judge
 
 
 def test_job_conflict_is_adopted_until_terminal_then_submission_retries() -> None:
