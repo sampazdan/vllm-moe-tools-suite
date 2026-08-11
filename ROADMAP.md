@@ -1,11 +1,12 @@
 # MoE Tools Test Suite Roadmap
 
-Status: `0.3.0-rc.1` finish-line candidate, updated 2026-08-11
+Status: `0.3.0-rc.1` live-acceptance candidate, updated 2026-08-11
 
-The product is now a complete local research loop rather than a collection of MVP
-cards. The remaining release work is integration verification, immutable image
-publication, and real Runpod/Daytona acceptance. This roadmap distinguishes those
-states deliberately:
+The product is now a complete research loop rather than a collection of MVP cards.
+Its exact application and fork commits were published as an attested image and
+exercised on real Runpod, Daytona, and Anthropic services. All GPU compute and owned
+Daytona sandboxes were stopped or deleted at handoff. This roadmap distinguishes
+those states deliberately:
 
 - **Implemented locally** means the code, UI, persistence contract, and automated
   coverage are present on this branch.
@@ -14,8 +15,10 @@ states deliberately:
 - **Fail-closed** means metadata or a future integration may be visible, but the
   application refuses to launch it because admission evidence is incomplete.
 
-The exact `0.3.0-rc.1` build is not yet live-accepted. An older internal RC3 build
-has historical evidence, recorded below, but it does not certify the new candidate.
+The exact `0.3.0-rc.1` build has bounded live evidence and a completed compute
+teardown recorded below. The stopped acceptance Pod remains undeleted only because
+deletion would irreversibly erase its fresh 150 GB Pod volume and requires explicit
+user approval. An older internal RC3 build remains historical evidence only.
 
 ## North star
 
@@ -45,18 +48,18 @@ what must still happen before release acceptance.
 
 | Area | Implemented locally in `0.3.0-rc.1` | Remaining release gate |
 | --- | --- | --- |
-| Runpod appliance | Authenticated same-origin FastAPI/React appliance; persistent data root; immutable-image/template tooling; managed vLLM on loopback; phone/desktop responsive shell. | Publish the final image, pin its digest, and repeat proxy/login/storage checks. |
-| Model lifecycle | Registry-based Qwen A3B load/stop/reload; topology and runtime facts; startup log; chat; persisted model sessions; job adoption; process-group cleanup and startup reconciliation. | Real-load, hard-reload, stop, and restart acceptance on the final image. |
-| Benchmark command center | Full-screen catalog/problem/run views; editable criteria and budgets; item/attempt progress; performance; routing; paginated archive/items; streamed JSON/CSV export. | Run bounded samples from every bundled adapter on the real model. |
-| Benchmark breadth | Fixture, GSM8K, MMLU-Pro validation 70/test 12,032, IFEval strict 387/full reference 541, LiveBench Zebra 50, and custom JSONL. | Verify lazy downloads, pins, scorers, cancellation, and representative real outputs. |
-| Profile Studio | Regular and agentic sources; explicit source weights; aggregate/per-layer References/Selection/Delta; mass/count metrics; fixed/global/cumulative/manual selection; immutable revisions. | Create, reload, and ablate a non-uniform multi-source profile on the real fork. |
-| Comparisons | Strict paired benchmark and agent-run resources/views; outcome transitions; score/reward and performance deltas; profile/provenance compatibility. | Save and reopen one baseline/masked comparison of each kind on the final image. |
-| Agentic foundation | Native bounded controller; Daytona/fake providers; reasoning/tool/command/stdout/stderr/verifier timeline; ATIF; per-inference routing and performance; durable trials/artifacts. | Run complete baseline and masked cohorts on Daytona with zero retained sandboxes. |
-| Agent profiles | Profile Studio accepts any selected agentic trials, including all trials in a run; sources can mix agentic and regular workloads. | Derive a custom profile from a real agent run and use it in a paired rerun. |
-| Evaluation | Fingerprinted deterministic criteria, trusted and user-authored verifier provenance, weighted aggregation, Anthropic/OpenAI/fake judges, cache/cost accounting. | Make one tightly capped real judge call and exercise a controlled failure/cache path. |
-| Isolation | Digest-pinned task images; public/submission/verifier/oracle separation; fresh verifier sandboxes; root-only hidden assets; unprivileged candidate subprocesses; exact-label cleanup. | Run clean-room exploit regressions and observe ownership/deletion on Daytona. |
-| Recovery | Durable jobs, typed conflicts, reconnect adoption, cooperative cancellation, restart reconciliation, periodic Daytona cleanup, bounded external errors. | Live cancellation, proxy disconnect, app restart, and orphan-recovery injection. |
-| External coding suites | Launchable Aider Python canary 3/225; pinned Terminal-Bench engineering 15, Aider balanced 12, and FeatureBench Fast manifests. | The three larger manifests remain fail-closed pending full admission. |
+| Runpod appliance | Authenticated same-origin FastAPI/React appliance; persistent data root; attested image/template tooling; managed vLLM on loopback; responsive shell. Exact-build desktop/390 px QA passed locally; public-proxy auth passed by API. | All eight account Pods were `EXITED` and no endpoints remained. Optional permanent deletion of the stopped acceptance Pod requires user approval; a second public-proxy visual pass was not claimed. |
+| Model lifecycle | Registry-based Qwen A3B load/reload; topology/runtime facts; startup log; chat; persisted sessions; job adoption; process-group cleanup and startup reconciliation. The application has no public model-stop action. | Pod stop is the paid-compute control. A separately authenticated live client adopted the same load; public-browser hard reload remains unclaimed. |
+| Benchmark command center | Full-screen catalog/problem/run views; editable criteria and budgets; item/attempt progress; performance; routing; paginated archive/items; streamed JSON/CSV export. | Fixture and tuned visible-answer MMLU-Pro/IFEval/LiveBench pairs passed the application flow live. |
+| Benchmark breadth | Fixture, GSM8K, MMLU-Pro validation 70/test 12,032, IFEval strict 387/full reference 541, LiveBench Zebra 50, and custom JSONL. | MMLU-Pro/IFEval/LiveBench were prepared, problem-inspected, and paired in a non-thinking 4/3/1 cohort. This is acceptance evidence, not a leaderboard aggregate. |
+| Profile Studio | Regular and agentic sources; explicit source weights; aggregate/per-layer References/Selection/Delta; mass/count metrics; fixed/global/cumulative/manual selection; immutable revisions. | Three non-uniform profiles were created live. The fixture and Aider-derived profiles were loaded; the smoke-derived 60/62/64 profile was created and inspected but not used for a reload. |
+| Comparisons | Strict paired benchmark and agent-run views; outcome transitions; score/reward and performance deltas; profile/provenance compatibility. Benchmark comparisons persist; agent comparisons are deterministic on-demand views over durable runs. | Fixture comparison persisted; smoke and Aider agent comparisons recomputed with stable IDs and one regression each. |
+| Agentic foundation | Native bounded controller; Daytona/fake providers; distinct reasoning/tool/command/stdout/stderr/verifier timeline; ATIF; per-inference routing/performance; durable trials/artifacts. | Baseline/masked smoke and Aider zebra contracts ran on Daytona; all acceptance-owned sandboxes were deleted. |
+| Agent profiles | Profile Studio accepts selected agentic trials or whole runs and can mix agentic and regular sources. | Smoke- and Aider-derived custom profiles were created; the Aider profile was used in a paired rerun. |
+| Evaluation | Fingerprinted deterministic criteria, trusted/user-authored verifier provenance, weighted aggregation, Anthropic/OpenAI/fake judges, cache/cost accounting. | One real Sonnet 5 request and zero-cost cache replay passed. Live standalone judging used a client guard because that endpoint has no server-side spend-cap field. |
+| Isolation | Digest-pinned task images; public/submission/verifier/oracle separation; fresh verifier sandboxes; root-only hidden assets; unprivileged candidate subprocesses; exact-label cleanup. | Local exploit coverage passed; real trusted Aider clean-room verification passed and provider cleanup ended empty. |
+| Recovery | Durable jobs, typed conflicts, reconnect adoption, cooperative cancellation, restart reconciliation, periodic Daytona cleanup, bounded external errors. | Live adoption and cancellation after 1/20 passed. Public-browser reload and a destructive orphan injection were not claimed. |
+| External coding suites | Launchable Aider Python canary 3/225; pinned Terminal-Bench engineering 15, Aider balanced 12, and FeatureBench Fast manifests. | Aider zebra passed unmasked live and regressed under its custom profile. The three larger manifests remain fail-closed pending full admission. |
 
 ## Current application shape
 
@@ -141,7 +144,9 @@ same capture mode; throughput claims need a separate capture-disabled run.
 ### Persistent Runpod Pod
 
 A Pod fits an interactive, stateful, warm-model appliance better than Serverless.
-The target remains one RTX PRO 6000 Blackwell Server Edition with 96 GB-class VRAM.
+The target is one compatible 96 GB RTX PRO 6000 Blackwell. The Runpod template
+describes the container, ports, storage, and environment; GPU type is selected
+separately when the Pod is created. RC1 acceptance used the Workstation Edition.
 The application serves `8080/http`; managed vLLM stays on `127.0.0.1:8000`.
 Persistent state and model caches live below `/workspace`, ideally on a network
 volume when they must outlive the Pod.
@@ -176,11 +181,23 @@ builder and Runpod CUDA 13/PyTorch 2.9 base are pinned by OCI digest; Python 3.1
 dependencies are locked by `uv.lock`; the build verifies the CUDA PyTorch shared
 library. The publish workflow uses pinned GitHub Actions, creates an OCI provenance
 attestation, and emits version and full-application-commit tags. Deployment should
-use the published digest.
+use the published digest where Runpod accepts that coordinate; otherwise use the
+full-application-SHA tag and record the verified digest it resolved to.
 
 Task packs also require effective image digests. The current runnable Python packs
-pin the official `python:3.12-slim` digest. The final application SHA, fork SHA, and
-release image digest will be inserted only after they are real.
+pin the official `python:3.12-slim` digest. RC1's immutable coordinates are:
+
+- application `0c8c8ffcbcd72f1cf9b664a1d4cf7813f701c345`;
+- fork `28a44cf4291c05af070c7d8398c462459b9992d1`;
+- OCI index `sha256:b31b5b376c637fbd7c9c995deeae32e4773a8d005cc9f1c0d051c624c6c68694`;
+- `linux/amd64` child
+  `sha256:c1525fe1edfded45c8c5355e09a053a7c8efc77a98bc564a2039233e089fe9e8`; and
+- [provenance attestation](https://github.com/sampazdan/vllm-moe-tools-suite/attestations/40091479),
+  verified by `gh attestation verify` and recorded at Rekor index `2424156563`.
+
+The accepted Pod used the full-application-SHA tag and resolved to that verified
+child image. This was the proven Runpod launch coordinate; experiment records keep
+both the tag and its resolved digest.
 
 ## Benchmark and evaluation design
 
@@ -231,6 +248,12 @@ and deterministic fake providers share one schema for single, reference, and
 explicit pairwise judging. Rubric, presentation randomization, repetitions, prices,
 model, threshold, and protocol are fingerprinted. Cached results record equivalent
 historical cost but zero newly incurred spend.
+
+Benchmark and agent execution policies enforce `max_cost_usd` before paid judge
+work by reserving a conservative upper bound. The standalone
+`/api/evaluation/judge` diagnostic does not carry its own server-side spend cap; it
+reports priced bounds and usage, while the caller must apply a guard or use the
+run-integrated path when enforced admission is required.
 
 ### ExecutionPolicy
 
@@ -305,8 +328,10 @@ details, profile eligibility, routing views, and performance/cost deltas.
 A strict agent comparison additionally requires the same task-pack revision/content
 hash, task attempt order, agent/controller revision, provider/policy, generation,
 budgets, and seed. It reports mean reward and pass-rate delta, task transitions,
-turns, commands, tokens, terminations, timing, judge cost, and routing. A masked run
-is never called comparable merely because it used the same task names.
+turns, commands, tokens, terminations, timing, judge cost, and routing. Agent runs
+are durable, but their comparison is a deterministic on-demand view identified by
+the run pair; it is not persisted as a separate comparison record. A masked run is
+never called comparable merely because it used the same task names.
 
 ## Agentic coding foundation
 
@@ -393,6 +418,8 @@ reported as success.
   cancelled immediately. The active-work lock remains held until worker exit.
 - Managed vLLM has an owned process group, validated identity, bounded TERM/KILL
   shutdown, and startup reconciliation that does not trust a PID file alone.
+- Managed shutdown is currently an internal reload/application-lifecycle operation;
+  there is no public model-stop endpoint or Home-screen stop control.
 - Interrupted benchmark and agent records retain explicit provenance and terminal
   causes. Archived task titles/content hashes do not depend on the current catalog.
 - Daytona cleanup handles ordinary deletion, handle-less create failure, app
@@ -429,8 +456,10 @@ reported as success.
 - job cancellation/recovery and judge budget/cache/failure tests; and
 - repository secret scan and review of the complete diff.
 
-Status: implementation present; final integrated result pending while this candidate
-is assembled.
+Status: passed on application commit `0c8c8ffc…`: 189 backend tests passed with one
+expected macOS root/UID skip; 18/18 frontend tests and the production build passed;
+Ruff, lock, shell, JSON, Docker, secret, and final-diff checks passed. Exact-build
+desktop and 390 px responsive QA also passed locally.
 
 ### Gate B — immutable container
 
@@ -438,27 +467,39 @@ is assembled.
 - pass that full 40-character SHA to the publish workflow;
 - build the exact application commit for `linux/amd64`;
 - record OCI digest and provenance attestation;
-- update the private Runpod template to the digest; and
+- update the private Runpod template to the immutable launch coordinate; and
 - verify the image startup hook retains Runpod `/start.sh` services while the app
   reaches `/readyz` within its bounded startup timeout.
 
-Status: pending. No final fork SHA or application image digest is invented in this
-roadmap.
+Status: passed. Application `0c8c8ffc…` and fork `28a44cf…` produced attested OCI
+index `sha256:b31b5b…` and verified `linux/amd64` child `sha256:c1525f…`.
+The accepted Pod used the full-application-SHA tag, which resolved to that child;
+this was the proven Runpod coordinate rather than a floating tag.
 
 ### Gate C — model and benchmark loop
 
-1. Authenticate through the public Runpod proxy on desktop and phone.
-2. Load `Qwen/Qwen3.6-35B-A3B-FP8`; hard-reload mid-load and require adoption of the
-   same job/process.
+1. Authenticate through the public Runpod proxy; separately verify the exact-build
+   desktop and phone-width UI.
+2. Load `Qwen/Qwen3.6-35B-A3B-FP8`; reconnect during load and require adoption of
+   the same job/session.
 3. Inspect topology, chat, reasoning presentation, and request metrics.
 4. Run bounded GSM8K, MMLU-Pro, IFEval, and LiveBench samples.
 5. Open problem/success criteria, live progress, item attempts, routing, and
    performance from their command-center pages.
-6. Combine at least two sources into a non-uniform custom profile, reload it, rerun
-   the identical cohort, save the strict comparison, and reopen it after a hard
-   refresh.
+6. Create a non-uniform custom profile, reload it, rerun the identical cohort, and
+   persist the strict benchmark comparison.
 
-Status: pending for the final image.
+Status: bounded core accepted. Public-proxy auth/CSRF and independent-client job
+adoption passed; the 40 × 256, top-k 8 model loaded; and a 2/2 fixture baseline and
+masked rerun both scored 1.0 with a persisted zero-delta comparison. Local
+desktop/390 px visual QA passed, but a live-proxy visual browser pass is not claimed.
+The initial MMLU-Pro/IFEval/LiveBench 3/2/2 cohorts exercised preparation,
+inspection, execution, routing, and scoring but exhausted their small output
+budgets in hidden reasoning. The tuned non-thinking 4/3/1 rerun then produced
+visible answers and strict persisted pairs: MMLU-Pro 0.75 → 0.25 (two regressions),
+IFEval 1.0 → 0.0 (three regressions), and LiveBench 1.0 → 0.0 (one regression).
+All items reported zero reasoning tokens. This eight-item canary is not a
+leaderboard result.
 
 ### Gate D — agentic/profile loop
 
@@ -470,48 +511,153 @@ Status: pending for the final image.
 4. Create a custom profile from all or selected trial traces; inspect aggregate and
    individual layers, then make a deliberate manual edit.
 5. Reload the profile and rerun the identical agent contract.
-6. Save and inspect the strict agent comparison.
+6. Open and inspect the deterministic strict agent comparison derived from both
+   durable runs.
 7. Exercise cancellation and one interruption/orphan recovery path.
 
-Status: pending for the final image.
+Status: accepted for the bounded smoke and Aider zebra canaries. Baseline and
+masked runs, distinct full-reasoning trajectories, per-call routing/performance,
+trusted clean-room verification, two 60/62/64 agent-derived profiles, and two
+deterministic regression comparisons were observed. Every acceptance-owned Daytona
+session was deleted; provider listing ended empty. Live cancellation passed after
+1/20 items. A destructive orphan injection was not required or claimed.
 
 ### Gate E — frontier judge and cost
 
-- run one small Anthropic judge under an explicit low spend cap and configured token
-  prices;
+- run one small Anthropic judge with configured token prices and a bounded request;
 - verify structured result, fingerprint, rationale, usage, latency, incurred cost,
   and budget debit;
 - repeat to prove a cache hit incurs zero new cost; and
-- exercise a preflight rejection or controlled failure without exceeding the cap.
+- exercise cache and local preflight/failure coverage without exceeding the guard.
 
-Status: pending for the final image.
+Status: live request/cache path passed. Sonnet 5 returned score 1.0/pass for
+341 input and 68 output tokens at $0.001362 incurred; the identical replay used the
+same ID/hash and incurred $0. The standalone endpoint has no server-side
+`max_cost_usd`; acceptance used a $0.025 driver guard and observed a $0.01115
+server-computed request bound. Server-enforced run-level caps remain covered by
+local tests.
 
 ### Gate F — teardown
 
 - list and confirm zero application-owned Daytona task/verifier sandboxes;
 - stop every Pod created or resumed for acceptance;
 - confirm no paid Runpod compute remains active;
-- record actual scoped spend; and
+- record the current provider ledger and conservative budget ceiling, then recheck
+  after billing catches up; and
 - retain only network volumes/storage chosen intentionally.
 
-Status: pending after Gates C–E. Existing unrelated resources are not deletion
-targets.
+Status: complete for paid compute and owned sandboxes; spend accounting remains a
+provisional provider snapshot. Acceptance Pod
+`7te5po3smp0227` reached `EXITED` at approximately 2026-08-11 19:23 UTC; all eight
+account Pods were `EXITED`, no Runpod endpoint remained, all eight durable Daytona
+rows were `deleted`, and direct provider inventory was empty. Permanent deletion of
+the stopped acceptance Pod awaits explicit user approval because it would
+irreversibly erase its fresh 150 GB volume; storage may continue billing. Existing
+network volumes `w7jl3o07i1`, `hhsfk4sdrc`, and `gbichawf78` were retained
+untouched. Earlier stalled fresh attempt Pod `o204fumgnxb1dj` was permanently
+deleted, and its Pod-volume data is unrecoverable.
 
-## RC1 acceptance record — intentionally pending
+## RC1 acceptance record — observed 2026-08-11
 
-Fill this section only from observed final-image evidence:
-
-- application commit: pending;
-- vLLM fork commit: pending;
-- GHCR image digest/attestation: pending;
-- Runpod template and Pod/GPU: pending;
-- local gate results: pending;
-- model load/topology/runtime: pending;
-- benchmark/profile/comparison result: pending;
-- agent/profile/comparison result: pending;
-- judge model/request/cost result: pending;
-- cancellation/recovery result: pending; and
-- final Runpod and Daytona teardown: pending.
+- **Immutable build:** application
+  `0c8c8ffcbcd72f1cf9b664a1d4cf7813f701c345`, fork
+  `28a44cf4291c05af070c7d8398c462459b9992d1`, OCI index
+  `sha256:b31b5b376c637fbd7c9c995deeae32e4773a8d005cc9f1c0d051c624c6c68694`,
+  `linux/amd64` child
+  `sha256:c1525fe1edfded45c8c5355e09a053a7c8efc77a98bc564a2039233e089fe9e8`,
+  and [attestation 40091479](https://github.com/sampazdan/vllm-moe-tools-suite/attestations/40091479)
+  at Rekor index `2424156563`.
+- **Runpod:** template `w2wkhbveg2` (`moe-tools-agentic-a3b-rc1`) and Pod
+  `7te5po3smp0227` used one 96 GB RTX PRO 6000 Blackwell Workstation Edition.
+  The template itself did not choose the GPU. The full-SHA image tag resolved to
+  the verified child digest.
+- **Auth/reconnect/UI:** public-proxy API checks observed anonymous 401, login 200,
+  a `Secure`/`HttpOnly`/`SameSite=Strict` cookie, missing-CSRF 403, valid-CSRF 200,
+  and independent-client adoption of the same load job/session. Exact-build visual
+  QA passed locally at desktop and 390 px. The live in-app browser was unavailable,
+  so no public-proxy visual or browser-hard-reload claim is made.
+- **Model:** the first fresh load downloaded 34.89 GiB in 74.46 seconds, loaded
+  34.23 GiB of weights in 89.07 seconds, and compiled in 94.1 seconds. Runtime was
+  vLLM `0.1.dev2+moe-tools`, `Qwen3_5Moe`, FP8, 4,096 maximum length, 0.90 GPU
+  utilization target, 2,048 maximum batched tokens, 8 maximum sequences, routed
+  IDs/weights, per-request metrics, and the `qwen3` parser. Topology was 40 layers ×
+  256 experts, top-k 8; memory was 86.3/97.9 GiB. Model replacement exercised
+  internal stop/reload; there is no public stop-model endpoint.
+- **Fixture pair:** baseline `78aea4ce…` and masked `7f233d71…` each scored 1.0
+  with 2/2 passes. Profile `92d9f816…` kept 63 experts in layer 0 and 64 elsewhere
+  (2,559/10,240, 24.9902%) while retaining 96.1701% observed mass. Persisted
+  comparison `febeed7f…` had delta 0 and two retained passes.
+- **Smoke pair/profile:** baseline `4afc6304…`/`06dd84fe…` passed at reward 1.0
+  with 9 turns, 7 commands, 6,284 tokens, and 186.53 TPS. Masked
+  `f35a42fe…`/`b9aacaf9…` reached `turn_limit`, reward 0, with 10 turns, 0
+  commands, 12,930 tokens, and 216.70 TPS. Deterministic on-demand comparison
+  `c7bd0e…` reported one regression. Smoke-derived custom profile `73100ed9…`
+  cycled 60/62/64 eligible experts per layer, kept 24.1992% of coordinates, and
+  retained 77.8729% observed mass.
+- **Aider pair/profile:** baseline `4d2c8222…`/`55050d5c…` passed its trusted
+  clean-room verifier at reward 1.0 with full reasoning, 19 turns, 3 commands,
+  52,429 tokens, and 218.39 TPS. Aider-derived custom profile `5a509409…` cycled
+  60/62/64, kept 24.1992% of coordinates, and retained 74.0881% observed mass.
+  Masked `c2b5be96…`/`0391b5e5…` reached `token_limit`, reward 0, with 23
+  turns, 5 commands, 59,817 tokens, and 208.58 TPS; on-demand comparison
+  `758bb58…` reported one regression. Their task/verifier sandboxes were deleted.
+  These are negative-transfer results for the profiles, not provider failures.
+- **Higher-level cohorts:** MMLU-Pro validation, IFEval strict, and LiveBench Zebra
+  were prepared and problem-inspected. The initial bounded 3/2/2 thinking-enabled
+  run spent its response budgets in hidden reasoning and left empty answer text, so
+  it is not quality evidence. The tuned 4/3/1 pairs used `enable_thinking=false`,
+  reported zero reasoning tokens, and applied profile
+  `5a509409-7e93-40bf-8153-14a32b1ce604`:
+  - MMLU-Pro baseline `d3aa4a4f-f463-4390-8508-e1a69aa70f54` scored 0.75
+    (3/4, 214.30 TPS), masked `c584aa35-93af-480a-98e0-c29460150b52`
+    scored 0.25 (1/4, 205.80 TPS), and comparison
+    `e69c95c3-f88d-4dab-8c2a-f0366fad86d7` recorded delta -0.50 with two
+    regressions;
+  - IFEval baseline `f60fc5c4-f459-4f4e-97cd-9a85d886ff32` scored 1.0
+    (3/3, 211.53 TPS), masked `6ab614ef-0edf-4591-870d-0ce257d6602a`
+    scored 0.0 (0/3, 176.37 TPS), and comparison
+    `2cb149fd-dc0a-49fc-9377-1ead6f7df206` recorded delta -1.0 with three
+    regressions; and
+  - LiveBench baseline `2986ae98-a81f-43f5-9599-a1c04b636925` scored 1.0
+    (1/1, 221.20 TPS), masked `d2777294-1a6d-47d1-ab18-a2a97337e3ce`
+    scored 0.0 (0/1, 219.23 TPS), and comparison
+    `4d750ba7-b6c5-49e3-852e-35dba4ff1e8a` recorded delta -1.0 with one
+    regression.
+  Baseline completion-token/routed-slot counts were 3,257/1,307,200,
+  1,495/550,720, and 1,678/639,680 respectively. These eight items are paired
+  acceptance evidence, not benchmark aggregates.
+- **Judge:** standalone Sonnet 5 result `fc09361a…`, request `533adbbb…`, scored
+  1.0/pass with 341 input/68 output tokens and 3,219.16 ms latency. Equivalent and
+  incurred cost were $0.001362 at $2/M input and $10/M output; computed bound was
+  $0.01115. The identical cached replay retained ID/hash with $0 incurred and
+  $0 bound. This was client-guarded at $0.025 because standalone judging has no
+  server-enforced cap.
+- **Recovery/cleanup:** job `000bd930…` cancelled at 1/20 and released the active
+  slot. All eight Daytona rows are `deleted`, no cleanup error remains, and direct
+  provider inventory found zero controller-owned sandboxes.
+- **Final teardown/spend:** acceptance Pod `7te5po3smp0227` stopped/`EXITED` at
+  approximately 2026-08-11 19:23 UTC, ending GPU billing. All eight account Pods
+  were `EXITED`; no Runpod endpoint remained. The Pod was not permanently deleted
+  because that would irreversibly erase its fresh 150 GB volume and requires
+  explicit user approval. Existing network volumes `w7jl3o07i1`, `hhsfk4sdrc`,
+  and `gbichawf78` were untouched. Earlier stalled fresh attempt Pod
+  `o204fumgnxb1dj` was permanently deleted, and its Pod-volume data is
+  unrecoverable. As of the final audit, Runpod's lagging billing API reported for
+  `7te5po3smp0227` $0.0493180654 at 17:00–18:00 UTC plus $0.9599268073 at
+  18:00–19:00 UTC: $1.0092448727 posted so far. It had no 19:00–19:23 bucket yet,
+  so this is not a finalized total. A conservative advertised-rate ceiling for that
+  Pod is approximately 1 hour 23 minutes × $1.89/hour ≈ $2.62, plus minor disk
+  charges, well below the $50 budget. The ledger exposed no separate row for
+  deleted attempt `o204fumgnxb1dj`; neither figure is a finalized all-attempt
+  acceptance total. The ledger must be checked after billing catches up; no exact
+  tail estimate is claimed. Daytona's eight durable rows were deleted and direct
+  owned inventory was empty; the tuned benchmark rerun used no Daytona. Its
+  separate monetary total was not exposed by this audit and is not invented.
+- **Post-acceptance configuration:** template `w2wkhbveg2` was verified on immutable
+  tag `sha-0c8c8ffcbcd72f1cf9b664a1d4cf7813f701c345` instead of the slow OCI-index
+  coordinate. Stopped original Pod `kw3whlid6esyhs` had its temporary auth value
+  restored to the Runpod secret reference, with its other 23 environment entries
+  preserved.
 
 ## Historical RC3 evidence — not RC1 acceptance
 
@@ -590,13 +736,14 @@ memory result.
 authenticate from a phone or laptop, load the supported Qwen model, inspect topology
 and reasoning/performance telemetry, run a selected benchmark, create a custom
 profile from regular and/or agentic traces, reload the masked model, rerun identical
-contracts, and inspect/export strict paired benchmark and agent comparisons without
-opening a shell after launch.
+contracts, inspect strict paired benchmark and agent views, and export their durable
+source runs/profiles without opening a shell after launch.
 
 Completion also requires that trusted verifier assets never enter the model
 sandbox, user-authored verifiers are labelled accurately, paid judge work remains
-inside its cap, cancellation/recovery remain observable, and all acceptance-owned
-paid compute and sandboxes are stopped or deleted at handoff.
+inside its enforced run cap or explicit standalone caller guard,
+cancellation/recovery remain observable, and all acceptance-owned paid compute and
+sandboxes are stopped or deleted at handoff.
 
 ## Open product-policy questions
 
