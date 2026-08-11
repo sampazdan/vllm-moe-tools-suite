@@ -64,9 +64,7 @@ def test_login_cookie_and_csrf_protect_api_mutations(tmp_path: Path) -> None:
     )
     assert loaded.status_code == 202
 
-    logout = client.post(
-        "/api/session/logout", headers={"X-CSRF-Token": csrf_token}
-    )
+    logout = client.post("/api/session/logout", headers={"X-CSRF-Token": csrf_token})
     assert logout.status_code == 204
     assert client.get("/api/models").status_code == 401
 

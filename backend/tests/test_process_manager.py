@@ -107,6 +107,10 @@ async def test_managed_server_writes_profile_and_capture_environment(
     monkeypatch.setenv("DAYTONA_API_KEY", "must-not-reach-vllm")
     monkeypatch.setenv("DAYTONA_JWT_TOKEN", "must-not-reach-vllm")
     monkeypatch.setenv("DAYTONA_ORGANIZATION_ID", "must-not-reach-vllm")
+    monkeypatch.setenv("MOE_TOOLS_ANTHROPIC_API_KEY", "must-not-reach-vllm")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-vllm")
+    monkeypatch.setenv("MOE_TOOLS_OPENAI_API_KEY", "must-not-reach-vllm")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-vllm")
     transport = httpx.MockTransport(
         lambda request: httpx.Response(
             200, json={"data": [{"id": MODEL_ID}]}, request=request
@@ -135,6 +139,10 @@ async def test_managed_server_writes_profile_and_capture_environment(
         assert "DAYTONA_API_KEY" not in environment
         assert "DAYTONA_JWT_TOKEN" not in environment
         assert "DAYTONA_ORGANIZATION_ID" not in environment
+        assert "MOE_TOOLS_ANTHROPIC_API_KEY" not in environment
+        assert "ANTHROPIC_API_KEY" not in environment
+        assert "MOE_TOOLS_OPENAI_API_KEY" not in environment
+        assert "OPENAI_API_KEY" not in environment
         profile_path = Path(environment["MOE_PROFILE"])
         assert json.loads(profile_path.read_text()) == profile.model_dump(mode="json")
         process_record = json.loads((manager.runtime_dir / "vllm.pid").read_text())

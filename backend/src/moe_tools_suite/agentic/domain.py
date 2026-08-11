@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
@@ -7,7 +10,16 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ..domain import GenerationConfig
+from ..domain import (
+    DeterministicScorerKind,
+    EvaluationAggregation,
+    EvaluationContract,
+    EvaluationCriterion,
+    EvaluationResult,
+    ExecutionPolicy,
+    GenerationConfig,
+    LLMJudgeConfig,
+)
 
 AgenticId = Annotated[
     str,
@@ -90,6 +102,7 @@ class TerminationCause(StrEnum):
     AGENT_FINISHED = "agent_finished"
     TURN_LIMIT = "turn_limit"
     TOKEN_LIMIT = "token_limit"
+    COST_LIMIT = "cost_limit"
     TIME_LIMIT = "time_limit"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
@@ -106,6 +119,13 @@ class TrajectoryStepType(StrEnum):
     TOOL = "tool"
     OBSERVATION = "observation"
     VERIFIER = "verifier"
+    REASONING = "reasoning"
+
+
+class ReasoningMode(StrEnum):
+    OFF = "off"
+    COMPACT = "compact"
+    FULL = "full"
 
 
 class VerifierStatus(StrEnum):
@@ -261,8 +281,9 @@ class AgentTask(AgenticModel):
     category: Annotated[str, Field(min_length=1, max_length=120)] = "python"
     language: Annotated[str, Field(min_length=1, max_length=80)] | None = "python"
     tags: list[str] = Field(default_factory=list)
+    success_criteria: Annotated[list[str], Field(min_length=1, max_length=50)]
     image_ref: Annotated[str, Field(min_length=1, max_length=500)]
-    image_digest: str | None = None
+    image_digest: Annotated[str, Field(min_length=71, max_length=71)]
     working_directory: str = "/workspace/task"
     network_policy: NetworkPolicy = NetworkPolicy.NONE
     allowed_hosts: list[str] = Field(default_factory=list)
@@ -270,24 +291,61 @@ class AgentTask(AgenticModel):
     memory_mb: Annotated[int, Field(ge=256, le=131_072)] = 1024
     disk_mb: Annotated[int, Field(ge=256, le=1_048_576)] = 2048
     files: Annotated[list[SandboxFile], Field(min_length=1, max_length=100)]
+    submission_file_paths: Annotated[list[str], Field(min_length=1, max_length=100)]
     verifier_file_paths: Annotated[list[str], Field(min_length=1, max_length=100)]
+    oracle_file_paths: Annotated[list[str], Field(max_length=100)] = Field(
+        default_factory=list
+    )
     verifier_command: Annotated[str, Field(min_length=1, max_length=20_000)]
     oracle_commands: Annotated[list[str], Field(min_length=1, max_length=32)]
     timeout_seconds: Annotated[float, Field(ge=1, le=7200)] = 300
 
     @model_validator(mode="after")
     def validate_task(self) -> Self:
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.image_digest) is None:
+            raise ValueError("agent task image_digest must pin a sha256 digest")
         paths = [item.path for item in self.files]
         if len(paths) != len(set(paths)):
             raise ValueError("agent task file paths must be unique")
-        if len(self.verifier_file_paths) != len(set(self.verifier_file_paths)):
-            raise ValueError("verifier file paths must be unique")
-        unknown_verifier_paths = set(self.verifier_file_paths) - set(paths)
-        if unknown_verifier_paths:
+        path_groups = {
+            "submission": self.submission_file_paths,
+            "verifier": self.verifier_file_paths,
+            "oracle": self.oracle_file_paths,
+        }
+        for label, group in path_groups.items():
+            if len(group) != len(set(group)):
+                raise ValueError(f"{label} file paths must be unique")
+            for path in group:
+                SandboxFile(path=path, content="")
+        protected_paths = set(self.verifier_file_paths) | set(self.oracle_file_paths)
+        overlap = set(self.submission_file_paths) & protected_paths
+        if overlap:
             raise ValueError(
-                "verifier file paths must reference task files: "
-                f"{sorted(unknown_verifier_paths)}"
+                "submission paths cannot overlap verifier or oracle paths: "
+                f"{sorted(overlap)}"
             )
+        verifier_overlap = set(self.verifier_file_paths) & set(self.oracle_file_paths)
+        if verifier_overlap:
+            raise ValueError(
+                "verifier and oracle paths must be disjoint: "
+                f"{sorted(verifier_overlap)}"
+            )
+        unknown_protected_paths = protected_paths - set(paths)
+        if unknown_protected_paths:
+            raise ValueError(
+                "verifier and oracle paths must reference task files: "
+                f"{sorted(unknown_protected_paths)}"
+            )
+        canonical_clean_room_paths = (
+            set(paths) - protected_paths - set(self.submission_file_paths)
+        )
+        materialized_count = (
+            len(canonical_clean_room_paths)
+            + len(self.verifier_file_paths)
+            + len(self.submission_file_paths)
+        )
+        if materialized_count > 100:
+            raise ValueError("clean-room materialization supports at most 100 files")
         if any(not command.strip() for command in self.oracle_commands):
             raise ValueError("oracle commands cannot be blank")
         SandboxSpec(
@@ -314,6 +372,25 @@ class AgentTask(AgenticModel):
             disk_mb=self.disk_mb,
         )
 
+    def verifier_fingerprint(self) -> str:
+        protected = {
+            file.path: hashlib.sha256(file.content.encode()).hexdigest()
+            for file in self.files
+            if file.path in set(self.verifier_file_paths)
+        }
+        canonical = json.dumps(
+            {
+                "command_hash": hashlib.sha256(
+                    self.verifier_command.encode()
+                ).hexdigest(),
+                "protected_files": protected,
+                "submission_file_paths": self.submission_file_paths,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return hashlib.sha256(canonical).hexdigest()
+
 
 class AgentTaskInfo(AgenticModel):
     id: AgenticId
@@ -321,6 +398,9 @@ class AgentTaskInfo(AgenticModel):
     instruction: str
     language: str | None = None
     tags: list[str] = Field(default_factory=list)
+    success_criteria: list[str] = Field(default_factory=list)
+    verifier_fingerprint: Annotated[str, Field(min_length=64, max_length=64)]
+    hidden_verifier_file_count: Annotated[int, Field(ge=0)] = 0
     timeout_seconds: Annotated[float, Field(ge=1, le=7200)]
 
 
@@ -388,6 +468,37 @@ class AgentBudgets(AgenticModel):
     timeout_seconds: Annotated[float, Field(ge=1, le=7200)] = 300
 
 
+def default_agent_evaluation_contract() -> EvaluationContract:
+    return EvaluationContract(
+        name="Trusted task-pack verifier",
+        description=(
+            "Success is determined by the task pack's protected verifier running "
+            "inside the isolated sandbox."
+        ),
+        criteria=[
+            EvaluationCriterion(
+                id="trusted_verifier",
+                label="Trusted task-pack verifier",
+                description="The protected task verifier exits successfully.",
+                kind=DeterministicScorerKind.BENCHMARK_DEFAULT,
+            )
+        ],
+    )
+
+
+class AgentEvaluationContractView(AgenticModel):
+    version: Literal[1] = 1
+    name: str
+    description: str = ""
+    criteria: list[EvaluationCriterion] = Field(default_factory=list)
+    aggregation: EvaluationAggregation
+    pass_threshold: float
+    judge: LLMJudgeConfig | None = None
+    judge_weight: float = 0
+    judge_can_override_deterministic_failure: bool = False
+    fingerprint: Annotated[str, Field(min_length=64, max_length=64)]
+
+
 class AgentDefinition(AgenticModel):
     id: AgenticId
     label: Annotated[str, Field(min_length=1, max_length=120)]
@@ -426,6 +537,9 @@ class CreateAgentRunRequest(AgenticModel):
     seed: int = 0
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     budgets: AgentBudgets = Field(default_factory=AgentBudgets)
+    reasoning_mode: ReasoningMode = ReasoningMode.COMPACT
+    evaluation_contract: EvaluationContract | None = None
+    execution_policy: ExecutionPolicy | None = None
 
     @field_validator("task_ids")
     @classmethod
@@ -500,8 +614,19 @@ class InferenceCall(AgenticModel):
     model_session_id: str
     request_hash: Annotated[str, Field(min_length=64, max_length=64)]
     prompt_tokens: Annotated[int, Field(ge=0)] = 0
+    reasoning_tokens: Annotated[int, Field(ge=0)] | None = None
     completion_tokens: Annotated[int, Field(ge=0)] = 0
     latency_ms: Annotated[float, Field(ge=0)] = 0
+    time_to_first_token_ms: Annotated[float, Field(ge=0)] | None = None
+    generation_time_ms: Annotated[float, Field(ge=0)] | None = None
+    queue_time_ms: Annotated[float, Field(ge=0)] | None = None
+    mean_inter_token_latency_ms: Annotated[float, Field(ge=0)] | None = None
+    tokens_per_second: Annotated[float, Field(ge=0)] | None = None
+    estimated_cost_usd: Annotated[float, Field(ge=0)] | None = None
+    reasoning_content: Annotated[str, Field(max_length=200_000)] | None = None
+    finish_reason: Annotated[str, Field(max_length=120)] | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
     routing_artifact: RoutingArtifactInfo | None = None
     error: Annotated[str, Field(max_length=1000)] | None = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -522,10 +647,34 @@ class SandboxSession(AgenticModel):
     deleted_at: datetime | None = None
 
 
+class TrialPerformance(AgenticModel):
+    wall_time_ms: Annotated[float, Field(ge=0)] = 0
+    queue_time_ms: Annotated[float, Field(ge=0)] = 0
+    provisioning_time_ms: Annotated[float, Field(ge=0)] = 0
+    model_time_ms: Annotated[float, Field(ge=0)] = 0
+    sandbox_time_ms: Annotated[float, Field(ge=0)] = 0
+    verifier_time_ms: Annotated[float, Field(ge=0)] = 0
+    prompt_tokens: Annotated[int, Field(ge=0)] = 0
+    reasoning_tokens: Annotated[int, Field(ge=0)] | None = None
+    completion_tokens: Annotated[int, Field(ge=0)] = 0
+    total_tokens: Annotated[int, Field(ge=0)] = 0
+    mean_tps: Annotated[float, Field(ge=0)] | None = None
+    p50_tps: Annotated[float, Field(ge=0)] | None = None
+    p95_tps: Annotated[float, Field(ge=0)] | None = None
+    inference_cost_usd: Annotated[float, Field(ge=0)] | None = None
+    judge_cost_usd: Annotated[float, Field(ge=0)] | None = None
+    judge_cost_debit_usd: Annotated[float, Field(ge=0)] = 0
+    judge_cost_uncertain: bool = False
+    estimated_cost_usd: Annotated[float, Field(ge=0)] | None = None
+
+
 class AgentTrial(AgenticModel):
     id: str
     run_id: str
     task_id: AgenticId
+    task_title_snapshot: Annotated[str, Field(min_length=1, max_length=120)] | None = (
+        None
+    )
     attempt: Annotated[int, Field(ge=1)] = 1
     seed: int = 0
     model_session_id: str
@@ -539,6 +688,10 @@ class AgentTrial(AgenticModel):
     completion_tokens: Annotated[int, Field(ge=0)] = 0
     verifier: VerifierResult | None = None
     patch_stats: PatchStats | None = None
+    evaluation: EvaluationResult | None = None
+    judge_cost_debit_usd: Annotated[float, Field(ge=0)] = 0
+    judge_cost_uncertain: bool = False
+    performance: TrialPerformance | None = None
     artifact_manifest: TrialArtifactManifest | None = None
     created_at: datetime = Field(default_factory=utc_now)
     started_at: datetime | None = None
@@ -551,6 +704,9 @@ class AgentTrialSummary(AgenticModel):
     agent_run_id: str
     task_id: AgenticId
     title: str
+    task_provenance_status: Literal["known", "legacy_unknown"]
+    attempt: Annotated[int, Field(ge=1)] = 1
+    seed: int = 0
     status: AgentTrialStatus
     reward: float | None = None
     turns: Annotated[int, Field(ge=0)] = 0
@@ -561,6 +717,8 @@ class AgentTrialSummary(AgenticModel):
     routed_inference_calls: Annotated[int, Field(ge=0)] = 0
     termination_reason: str | None = None
     sandbox_status: str
+    evaluation: EvaluationResult | None = None
+    performance: TrialPerformance | None = None
     updated_at: datetime
 
 
@@ -582,6 +740,12 @@ class AgentRun(AgenticModel):
     attempts: Annotated[int, Field(ge=1, le=5)] = 1
     generation: GenerationConfig
     budgets: AgentBudgets
+    reasoning_mode: ReasoningMode = ReasoningMode.COMPACT
+    evaluation_contract: EvaluationContract = Field(
+        default_factory=default_agent_evaluation_contract
+    )
+    execution_policy: ExecutionPolicy = Field(default_factory=ExecutionPolicy)
+    contract_provenance_status: Literal["known", "legacy_unknown"] = "legacy_unknown"
     contract_fingerprint: Annotated[str, Field(min_length=64, max_length=64)]
     completed_trials: Annotated[int, Field(ge=0)] = 0
     total_trials: Annotated[int, Field(ge=1)]
@@ -611,11 +775,24 @@ class AgentRunView(AgenticModel):
     job_id: str
     task_pack_id: AgenticId
     task_pack_name: str
+    task_pack_revision: str
+    task_pack_content_hash: Annotated[str, Field(min_length=64, max_length=64)]
     model_session_id: str
     profile_id: str | None = None
     profile_fingerprint: str | None = None
     agent_id: AgenticId
+    agent_revision: str
     sandbox_provider_id: AgenticId
+    generation: GenerationConfig
+    budgets: AgentBudgets
+    contract_provenance_status: Literal["known", "legacy_unknown"]
+    reasoning_mode: ReasoningMode | None = None
+    evaluation_contract: AgentEvaluationContractView | None = None
+    evaluation_contract_fingerprint: (
+        Annotated[str, Field(min_length=64, max_length=64)] | None
+    ) = None
+    hidden_evaluation_criteria_count: Annotated[int, Field(ge=0)] | None = None
+    execution_policy: ExecutionPolicy | None = None
     compatibility_fingerprint: Annotated[str, Field(min_length=64, max_length=64)]
     status: AgentRunStatus
     task_ids: list[AgenticId]
@@ -634,8 +811,19 @@ class AgentRunView(AgenticModel):
 class InferenceCallSummary(AgenticModel):
     id: str
     prompt_tokens: Annotated[int, Field(ge=0)] = 0
+    reasoning_tokens: Annotated[int, Field(ge=0)] | None = None
     completion_tokens: Annotated[int, Field(ge=0)] = 0
+    total_tokens: Annotated[int, Field(ge=0)] = 0
     latency_ms: Annotated[float, Field(ge=0)] = 0
+    ttft_ms: Annotated[float, Field(ge=0)] | None = None
+    prefill_ms: Annotated[float, Field(ge=0)] | None = None
+    decode_ms: Annotated[float, Field(ge=0)] | None = None
+    tokens_per_second: Annotated[float, Field(ge=0)] | None = None
+    estimated_cost_usd: Annotated[float, Field(ge=0)] | None = None
+    model_id: str | None = None
+    finish_reason: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
     routing_artifact_id: str | None = None
     routed_layers: Annotated[int, Field(ge=0)] = 0
     total_routed_slots: Annotated[int, Field(ge=0)] = 0
@@ -653,6 +841,11 @@ class TrajectoryStepView(AgenticModel):
     exit_code: int | None = None
     duration_ms: Annotated[float, Field(ge=0)] | None = None
     truncated: bool = False
+    phase: str | None = None
+    turn: Annotated[int, Field(ge=1)] | None = None
+    stream: Literal["stdout", "stderr"] | None = None
+    reasoning_visibility: Literal["explicit", "none"] | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
     inference: InferenceCallSummary | None = None
 
 
@@ -660,6 +853,7 @@ class AgentTrajectoryView(AgenticModel):
     trial_id: str
     format: Literal["ATIF"] = "ATIF"
     schema_version: str
+    reasoning_mode: ReasoningMode | None = None
     steps: list[TrajectoryStepView]
     updated_at: datetime
 
@@ -687,13 +881,19 @@ class AgentTrialArtifactsView(AgenticModel):
     additions: Annotated[int, Field(ge=0)] = 0
     deletions: Annotated[int, Field(ge=0)] = 0
     verifier: VerifierView | None = None
+    evaluation: EvaluationResult | None = None
     exports: list[ArtifactExport] = Field(default_factory=list)
+
+
+class AgentRunPublicDetail(AgenticModel):
+    run: AgentRunView
+    trials: list[AgentTrialSummary]
 
 
 class AgentRunExport(AgenticModel):
     schema_version: int = 1
     exported_at: datetime = Field(default_factory=utc_now)
-    detail: AgentRunDetail
+    detail: AgentRunPublicDetail
     trajectories: dict[str, dict[str, Any]] = Field(default_factory=dict)
     routing: dict[str, TrialRoutingSummary] = Field(default_factory=dict)
     manifests: dict[str, TrialArtifactManifest] = Field(default_factory=dict)

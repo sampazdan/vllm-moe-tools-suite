@@ -1,13 +1,14 @@
 """Run the public-API release canary against a deployed MoE Tools appliance.
 
-The default path performs deterministic model, benchmark, routing, profile, and
-comparison checks. The optional Daytona coding check is opt-in because it can
-create a paid remote sandbox.
+The default path performs deterministic model, benchmark, expert-explorer,
+non-uniform profile, and comparison checks. Daytona and Anthropic checks are
+explicit opt-ins because they can create paid external work.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -57,10 +58,18 @@ class CanaryConfig:
     job_timeout_seconds: float = 2400
     poll_interval_seconds: float = 2
     request_timeout_seconds: float = 30
+    anthropic_judge: bool = False
+    anthropic_judge_model: str = "claude-sonnet-5"
     daytona: bool = False
     daytona_provider_id: str = "daytona"
     daytona_pack_id: str = "smoke-python-v1"
     daytona_task_id: str = "fix-subtract"
+
+
+@dataclass(frozen=True)
+class AgentCanaryRun:
+    run_id: str
+    trial_id: str
 
 
 class Reporter:
@@ -220,6 +229,8 @@ class AcceptanceCanary:
         self.reporter = reporter
 
     def run(self) -> dict[str, str]:
+        baseline_agent_run: AgentCanaryRun | None = None
+        judge_result_id: str | None = None
         with self.reporter.step("Authenticate public API session"):
             session = self.api.login()
             auth_mode = "required" if session.get("auth_required") else "disabled"
@@ -234,6 +245,10 @@ class AcceptanceCanary:
                     f"Adopting active {_job_kind(active)} job {_short_id(active)}"
                 )
                 self.wait_for_job(active)
+
+        if self.config.anthropic_judge:
+            with self.reporter.step("Exercise the opt-in Anthropic judge protocol"):
+                judge_result_id = self._run_anthropic_judge()
 
         with self.reporter.step("Load an unprofiled baseline model"):
             model_id = self._select_model()
@@ -261,52 +276,93 @@ class AcceptanceCanary:
                 f"Baseline run {baseline_run_id[:8]} scored {baseline_run.get('score')}"
             )
 
-        with self.reporter.step("Capture routing and propose an expert profile"):
+        with self.reporter.step("Explore routing and build a non-uniform profile"):
             routing = _mapping(
                 self.api.get(f"/api/runs/{baseline_run_id}/routing"),
                 "routing summary",
             )
             if _integer(routing, "total_routed_slots") <= 0:
                 raise CanaryFailure("baseline run captured no routed expert slots")
-            proposal = _mapping(
+            explorer = _mapping(
                 self.api.post(
-                    "/api/profiles/propose",
+                    "/api/routing/explore",
                     {
-                        "run_id": baseline_run_id,
-                        "keep_per_layer": self.config.keep_per_layer,
+                        "sources": [
+                            {
+                                "kind": "benchmark_run",
+                                "id": baseline_run_id,
+                                "weight": 1,
+                            }
+                        ],
                         "metric": "routing_mass",
                     },
                 ),
-                "profile proposal",
+                "routing explorer",
             )
-            validation = _mapping(proposal.get("validation"), "profile validation")
+            if _integer(explorer, "total_routed_slots") <= 0:
+                raise CanaryFailure("routing explorer captured no routed expert slots")
+            custom_profile, selection_config = _custom_profile_from_explorer(
+                explorer,
+                keep_per_layer=self.config.keep_per_layer,
+            )
+            validation = _mapping(
+                self.api.post("/api/profiles/validate", custom_profile),
+                "profile validation",
+            )
             if not _boolean(validation, "valid"):
-                raise CanaryFailure("profile proposal failed topology validation")
+                raise CanaryFailure("custom profile failed topology validation")
 
-        with self.reporter.step("Save the immutable proposed profile"):
+        with self.reporter.step("Save the immutable custom profile"):
             saved_profile = _mapping(
                 self.api.post(
                     "/api/profiles",
                     {
                         "name": _profile_name(),
                         "description": (
-                            "Automated acceptance canary from the explicitly selected "
-                            "fixture cohort."
+                            "Automated non-uniform acceptance profile from the "
+                            "explicitly selected fixture cohort."
                         ),
                         "model_id": model_id,
-                        "profile": proposal.get("profile"),
-                        "source": "proposal",
+                        "profile": custom_profile,
+                        "source": "manual",
                         "source_run_id": baseline_run_id,
+                        "source_refs": [
+                            {
+                                "kind": "benchmark_run",
+                                "id": baseline_run_id,
+                                "weight": 1,
+                            }
+                        ],
                         "metric": "routing_mass",
-                        "observed_mass_retained": proposal.get(
-                            "observed_mass_retained"
-                        ),
+                        "selection_strategy": "canary_non_uniform_top_mass",
+                        "selection_config": selection_config,
                     },
                 ),
                 "saved profile",
             )
             profile_id = _string(saved_profile, "id")
+            saved_validation = _mapping(
+                saved_profile.get("validation"), "saved profile validation"
+            )
+            if not _boolean(saved_validation, "valid"):
+                raise CanaryFailure("saved custom profile is invalid")
+            saved_layer_sizes = {
+                len(_list(layer.get("keep"), "saved expert selection"))
+                for layer in _mapping(
+                    _mapping(saved_profile.get("profile"), "saved profile").get(
+                        "layers"
+                    ),
+                    "saved profile layers",
+                ).values()
+                if isinstance(layer, Mapping)
+            }
+            if len(saved_layer_sizes) < 2:
+                raise CanaryFailure("saved profile is not non-uniform across layers")
             self.reporter.info(f"Saved profile {profile_id[:8]}")
+
+        if self.config.daytona:
+            with self.reporter.step("Run the baseline Daytona coding canary"):
+                baseline_agent_run = self._run_daytona(baseline_session_id)
 
         with self.reporter.step("Reload using profile_id only"):
             masked_load = self.submit_job(
@@ -358,10 +414,85 @@ class AcceptanceCanary:
             "masked_run_id": masked_run_id,
             "comparison_id": comparison_id,
         }
+        if judge_result_id is not None:
+            result["judge_result_id"] = judge_result_id
         if self.config.daytona:
-            with self.reporter.step("Run the opt-in Daytona coding canary"):
-                result["agent_run_id"] = self._run_daytona(masked_session_id)
+            if baseline_agent_run is None:
+                raise AssertionError("baseline Daytona run was not recorded")
+            with self.reporter.step("Run the masked Daytona coding canary"):
+                candidate_agent_run = self._run_daytona(masked_session_id)
+            result["baseline_agent_run_id"] = baseline_agent_run.run_id
+            result["candidate_agent_run_id"] = candidate_agent_run.run_id
+            with self.reporter.step(
+                "Compare agent runs and save an agent-derived custom profile"
+            ):
+                result.update(
+                    self._analyze_daytona_pair(
+                        baseline=baseline_agent_run,
+                        candidate=candidate_agent_run,
+                        model_id=model_id,
+                        candidate_profile_id=profile_id,
+                    )
+                )
         return result
+
+    def _run_anthropic_judge(self) -> str:
+        capabilities = _mapping(
+            self.api.get("/api/evaluation/capabilities"),
+            "evaluation capabilities",
+        )
+        providers = _list(
+            capabilities.get("judge_providers"), "judge provider capabilities"
+        )
+        anthropic = next(
+            (
+                provider
+                for provider in providers
+                if isinstance(provider, Mapping)
+                and provider.get("provider") == "anthropic"
+            ),
+            None,
+        )
+        if anthropic is None or anthropic.get("configured") is not True:
+            raise CanaryFailure("Anthropic judge is not configured")
+        response = _mapping(
+            self.api.post(
+                "/api/evaluation/judge",
+                {
+                    "config": {
+                        "provider": "anthropic",
+                        "model": self.config.anthropic_judge_model,
+                        "mode": "single",
+                        "rubric": (
+                            "Score 1 only when the candidate states that two plus two "
+                            "equals four; otherwise score 0. Return the required JSON."
+                        ),
+                        "pass_threshold": 0.9,
+                        "repetitions": 1,
+                        "max_output_tokens": 256,
+                    },
+                    "task": "State the result of adding two and two.",
+                    "candidate": "Two plus two equals four.",
+                    "criteria": ["The arithmetic statement is correct."],
+                },
+            ),
+            "Anthropic judge result",
+        )
+        if response.get("provider") != "anthropic":
+            raise CanaryFailure("judge response used an unexpected provider")
+        if response.get("model") != self.config.anthropic_judge_model:
+            raise CanaryFailure("judge response used an unexpected model")
+        score = response.get("score")
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            raise CanaryFailure("judge response omitted a numeric score")
+        if not math.isfinite(float(score)) or not 0 <= float(score) <= 1:
+            raise CanaryFailure("judge response score is outside [0, 1]")
+        request_hash = response.get("request_hash")
+        if not isinstance(request_hash, str) or len(request_hash) != 64:
+            raise CanaryFailure("judge response omitted a reproducible request hash")
+        result_id = _string(response, "id")
+        self.reporter.info(f"Anthropic judge result {result_id[:8]} is protocol-valid")
+        return result_id
 
     def submit_job(
         self,
@@ -526,9 +657,13 @@ class AcceptanceCanary:
             raise CanaryFailure("benchmark run did not complete")
         if run.get("model_session_id") != model_session_id:
             raise CanaryFailure("benchmark run used an unexpected model session")
+        result_page = _mapping(
+            self.api.get(f"/api/runs/{run_id}/items?limit=250"),
+            "benchmark result page",
+        )
         item_ids = [
             item.get("item_id")
-            for item in _list(run.get("items"), "benchmark results")
+            for item in _list(result_page.get("items"), "benchmark results")
             if isinstance(item, Mapping)
         ]
         if item_ids != list(self.config.item_ids):
@@ -539,7 +674,7 @@ class AcceptanceCanary:
             )
         return run
 
-    def _run_daytona(self, model_session_id: str) -> str:
+    def _run_daytona(self, model_session_id: str) -> AgentCanaryRun:
         providers = _list(self.api.get("/api/sandbox-providers"), "sandbox providers")
         provider = next(
             (
@@ -623,10 +758,10 @@ class AcceptanceCanary:
                     "enable_thinking": False,
                 },
                 "budgets": {
-                    "max_turns": 4,
-                    "max_commands": 6,
-                    "max_tokens": 4096,
-                    "timeout_seconds": 180,
+                    "max_turns": 10,
+                    "max_commands": 12,
+                    "max_tokens": 16384,
+                    "timeout_seconds": 300,
                 },
             },
             expected_kind="agent_run",
@@ -661,8 +796,123 @@ class AcceptanceCanary:
             raise CanaryFailure(
                 "Daytona trial captured no routed-expert inference telemetry"
             )
+        trial_id = trial.get("id")
+        if not isinstance(trial_id, str) or not trial_id:
+            raise CanaryFailure("Daytona trial summary omitted its trial ID")
         self.reporter.info(f"Daytona agent run {run_id[:8]} passed")
-        return run_id
+        return AgentCanaryRun(run_id=run_id, trial_id=trial_id)
+
+    def _analyze_daytona_pair(
+        self,
+        *,
+        baseline: AgentCanaryRun,
+        candidate: AgentCanaryRun,
+        model_id: str,
+        candidate_profile_id: str,
+    ) -> dict[str, str]:
+        comparison = _mapping(
+            self.api.post(
+                "/api/agent-comparisons",
+                {
+                    "baseline_run_id": baseline.run_id,
+                    "candidate_run_id": candidate.run_id,
+                    "name": "Acceptance canary agent comparison",
+                },
+            ),
+            "agent comparison",
+        )
+        if _integer(comparison, "trial_count") != 1:
+            raise CanaryFailure("agent comparison did not preserve the one-task cohort")
+        if comparison.get("baseline_profile_id") is not None:
+            raise CanaryFailure(
+                "baseline agent run unexpectedly used an expert profile"
+            )
+        if comparison.get("candidate_profile_id") != candidate_profile_id:
+            raise CanaryFailure("agent comparison lost candidate profile provenance")
+        comparison_id = _string(comparison, "id")
+
+        explorer = _mapping(
+            self.api.post(
+                "/api/routing/explore",
+                {
+                    "sources": [
+                        {
+                            "kind": "agent_trial",
+                            "id": baseline.trial_id,
+                            "weight": 1,
+                        }
+                    ],
+                    "comparison_sources": [
+                        {
+                            "kind": "agent_trial",
+                            "id": candidate.trial_id,
+                            "weight": 1,
+                        }
+                    ],
+                    "metric": "routing_mass",
+                },
+            ),
+            "agent routing explorer",
+        )
+        comparison_matrix = _list(
+            explorer.get("comparison_routing_mass"),
+            "agent comparison routing matrix",
+        )
+        if not comparison_matrix:
+            raise CanaryFailure("agent routing comparison returned an empty matrix")
+        profile, selection_config = _custom_profile_from_explorer(
+            explorer,
+            keep_per_layer=self.config.keep_per_layer,
+        )
+        validation = _mapping(
+            self.api.post("/api/profiles/validate", profile),
+            "agent-derived profile validation",
+        )
+        if not _boolean(validation, "valid"):
+            raise CanaryFailure("agent-derived custom profile is invalid")
+        saved = _mapping(
+            self.api.post(
+                "/api/profiles",
+                {
+                    "name": f"{_profile_name()} · agent-derived",
+                    "description": (
+                        "Automated non-uniform profile derived from baseline agent "
+                        "routing telemetry."
+                    ),
+                    "model_id": model_id,
+                    "profile": profile,
+                    "source": "agentic",
+                    "source_trial_id": baseline.trial_id,
+                    "source_refs": [
+                        {
+                            "kind": "agent_trial",
+                            "id": baseline.trial_id,
+                            "weight": 1,
+                        }
+                    ],
+                    "metric": "routing_mass",
+                    "selection_strategy": "canary_non_uniform_top_mass",
+                    "selection_config": selection_config,
+                },
+            ),
+            "agent-derived saved profile",
+        )
+        if saved.get("source_trial_id") != baseline.trial_id:
+            raise CanaryFailure("agent-derived profile lost trial provenance")
+        saved_validation = _mapping(
+            saved.get("validation"), "agent-derived saved profile validation"
+        )
+        if not _boolean(saved_validation, "valid"):
+            raise CanaryFailure("saved agent-derived profile is invalid")
+        profile_id = _string(saved, "id")
+        self.reporter.info(
+            f"Agent comparison {comparison_id[:8]} and profile "
+            f"{profile_id[:8]} are valid"
+        )
+        return {
+            "agent_comparison_id": comparison_id,
+            "agent_profile_id": profile_id,
+        }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -702,6 +952,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-interval", type=float, default=2)
     parser.add_argument("--request-timeout", type=float, default=30)
     parser.add_argument(
+        "--anthropic-judge",
+        action="store_true",
+        help="Opt in to one small paid Anthropic judge protocol canary.",
+    )
+    parser.add_argument("--anthropic-judge-model", default="claude-sonnet-5")
+    parser.add_argument(
         "--daytona",
         action="store_true",
         help="Opt in to one small paid remote coding-sandbox canary.",
@@ -727,6 +983,8 @@ def config_from_args(arguments: argparse.Namespace) -> CanaryConfig:
         raise CanaryFailure("--poll-interval cannot be negative")
     if arguments.request_timeout <= 0:
         raise CanaryFailure("--request-timeout must be positive")
+    if not arguments.anthropic_judge_model.strip():
+        raise CanaryFailure("--anthropic-judge-model cannot be blank")
     return CanaryConfig(
         base_url=base_url,
         token=arguments.token,
@@ -736,6 +994,8 @@ def config_from_args(arguments: argparse.Namespace) -> CanaryConfig:
         job_timeout_seconds=arguments.job_timeout,
         poll_interval_seconds=arguments.poll_interval,
         request_timeout_seconds=arguments.request_timeout,
+        anthropic_judge=arguments.anthropic_judge,
+        anthropic_judge_model=arguments.anthropic_judge_model,
         daytona=arguments.daytona,
         daytona_provider_id=arguments.daytona_provider_id,
         daytona_pack_id=arguments.daytona_pack_id,
@@ -751,7 +1011,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Acceptance canary configuration failed: {error}", file=sys.stderr)
         return 2
     reporter = Reporter(
-        total_steps=10 if config.daytona else 9,
+        total_steps=(
+            9 + (3 if config.daytona else 0) + (1 if config.anthropic_judge else 0)
+        ),
         secrets=(config.token or "",),
     )
     try:
@@ -780,6 +1042,73 @@ def _normalize_base_url(value: str) -> str:
 def _profile_name() -> str:
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     return f"Acceptance canary · {timestamp} · {uuid4().hex[:8]}"
+
+
+def _custom_profile_from_explorer(
+    explorer: Mapping[str, Any],
+    *,
+    keep_per_layer: int,
+) -> tuple[dict[str, object], dict[str, object]]:
+    layer_ids = _list(explorer.get("layer_ids"), "routing explorer layer IDs")
+    matrix = _list(explorer.get("routing_mass"), "routing explorer mass matrix")
+    num_experts = _integer(explorer, "num_experts")
+    top_k = _integer(explorer, "top_k")
+    if len(layer_ids) != len(matrix) or not layer_ids:
+        raise CanaryFailure("routing explorer returned an inconsistent layer matrix")
+    if num_experts <= 0 or top_k <= 0 or top_k > num_experts:
+        raise CanaryFailure("routing explorer returned invalid expert topology")
+    default_keep = min(keep_per_layer, num_experts)
+    if default_keep < top_k:
+        raise CanaryFailure(
+            f"--keep-per-layer must retain at least the model top-k ({top_k})"
+        )
+    if default_keep > top_k:
+        custom_keep = default_keep - 1
+    elif default_keep < num_experts:
+        custom_keep = default_keep + 1
+    else:
+        raise CanaryFailure(
+            "model topology cannot express a non-uniform canary profile"
+        )
+
+    profile_layers: dict[str, dict[str, list[int]]] = {}
+    layer_rows = zip(layer_ids, matrix, strict=True)
+    for index, (raw_layer_id, raw_values) in enumerate(layer_rows):
+        if type(raw_layer_id) is not int:
+            raise CanaryFailure("routing explorer layer IDs must be integers")
+        values = _list(raw_values, f"routing mass for layer {raw_layer_id}")
+        if len(values) != num_experts:
+            raise CanaryFailure(
+                f"routing explorer layer {raw_layer_id} has the wrong expert count"
+            )
+        numeric: list[float] = []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise CanaryFailure("routing mass values must be numeric")
+            normalized = float(value)
+            if not math.isfinite(normalized) or normalized < 0:
+                raise CanaryFailure(
+                    "routing mass values must be finite and non-negative"
+                )
+            numeric.append(normalized)
+        layer_keep = custom_keep if index == 0 else default_keep
+        ranked = sorted(
+            range(num_experts),
+            key=lambda expert: (-numeric[expert], expert),
+        )
+        profile_layers[str(raw_layer_id)] = {"keep": sorted(ranked[:layer_keep])}
+
+    fingerprint = explorer.get("fingerprint")
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+        raise CanaryFailure("routing explorer omitted its source fingerprint")
+    selection_config: dict[str, object] = {
+        "explorer_fingerprint": fingerprint,
+        "metric": "routing_mass",
+        "default_keep_per_layer": default_keep,
+        "custom_layer_id": layer_ids[0],
+        "custom_layer_keep": custom_keep,
+    }
+    return {"version": 1, "layers": profile_layers}, selection_config
 
 
 def _response_body(response: httpx.Response) -> Any:

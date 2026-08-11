@@ -1,0 +1,166 @@
+{
+  "id": "repo-engineering-v1",
+  "name": "Repository engineering pack",
+  "revision": "2",
+  "description": "Three moderate, dependency-free repository tasks covering data-pipeline repair, dependency-graph planning, and asynchronous concurrency control. Designed for meaningful Daytona agent runs beyond the tiny smoke acceptance pack.",
+  "source": "bundled first-party",
+  "ready": true,
+  "oracle_passed": true,
+  "noop_failed": true,
+  "tags": ["agentic", "coding", "python", "repository", "daytona", "stdlib"],
+  "tasks": [
+    {
+      "id": "repair-event-ledger",
+      "pack_id": "repo-engineering-v1",
+      "name": "Repair event ledger compaction",
+      "title": "Repair event ledger compaction",
+      "instruction": "A small JSONL event-ledger utility in ledger.py regressed during an optimization. Repair it so input validation reports useful 1-based line errors, the latest event for each id wins, delete tombstones remove records, and surviving records are emitted in the order of their final occurrence. Preserve the CLI and compact deterministic JSONL output. Inspect the repository, make a focused change, and run the visible tests before finishing.",
+      "category": "data-pipeline-debugging",
+      "language": "python",
+      "tags": ["python", "jsonl", "cli", "debugging", "data-pipeline"],
+      "success_criteria": [
+        "The latest upsert or delete event for each non-empty string id determines the compacted state.",
+        "Surviving records retain final-occurrence order and the CLI writes compact deterministic JSONL.",
+        "Malformed JSON, invalid operations, and invalid upsert payloads fail with a useful 1-based line reference.",
+        "Visible and protected tests pass under the trusted verifier."
+      ],
+      "image_ref": "python:3.12-slim",
+      "image_digest": "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
+      "working_directory": "/workspace/task",
+      "network_policy": "none",
+      "cpu": 1,
+      "memory_mb": 1024,
+      "disk_mb": 2048,
+      "timeout_seconds": 300,
+      "files": [
+        {
+          "path": "ledger.py",
+          "content": "from __future__ import annotations\n\nimport argparse\nimport json\nfrom collections.abc import Iterable\nfrom pathlib import Path\nfrom typing import Any\n\n\ndef read_events(path: Path) -> list[dict[str, Any]]:\n    events: list[dict[str, Any]] = []\n    with path.open(encoding=\"utf-8\") as source:\n        for line in source:\n            if line.strip():\n                events.append(json.loads(line))\n    return events\n\n\ndef compact_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:\n    by_id: dict[str, dict[str, Any]] = {}\n    order: list[str] = []\n    for event in events:\n        event_id = str(event[\"id\"])\n        if event_id not in by_id:\n            order.append(event_id)\n        by_id.setdefault(event_id, event)\n    return [\n        by_id[event_id]\n        for event_id in sorted(order)\n        if by_id[event_id].get(\"op\") != \"delete\"\n    ]\n\n\ndef write_events(path: Path, events: Iterable[dict[str, Any]]) -> None:\n    with path.open(\"w\", encoding=\"utf-8\") as destination:\n        for event in events:\n            destination.write(\n                json.dumps(event, sort_keys=True, separators=(\",\", \":\")) + \"\\n\"\n            )\n\n\ndef main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"input\", type=Path)\n    parser.add_argument(\"output\", type=Path)\n    args = parser.parse_args()\n    write_events(args.output, compact_events(read_events(args.input)))\n\n\nif __name__ == \"__main__\":\n    main()\n"
+        },
+        {
+          "path": "tests/__init__.py",
+          "content": ""
+        },
+        {
+          "path": "tests/test_ledger.py",
+          "content": "from __future__ import annotations\n\nimport unittest\n\nfrom ledger import compact_events\n\n\nclass CompactEventsTests(unittest.TestCase):\n    def test_latest_event_wins_and_final_order_is_stable(self) -> None:\n        events = [\n            {\"id\": \"b\", \"op\": \"upsert\", \"payload\": {\"value\": 1}},\n            {\"id\": \"a\", \"op\": \"upsert\", \"payload\": {\"value\": 2}},\n            {\"id\": \"b\", \"op\": \"upsert\", \"payload\": {\"value\": 3}},\n        ]\n        self.assertEqual(\n            compact_events(events),\n            [\n                {\"id\": \"a\", \"op\": \"upsert\", \"payload\": {\"value\": 2}},\n                {\"id\": \"b\", \"op\": \"upsert\", \"payload\": {\"value\": 3}},\n            ],\n        )\n\n    def test_delete_tombstone_removes_latest_record(self) -> None:\n        events = [\n            {\"id\": \"gone\", \"op\": \"upsert\", \"payload\": {}},\n            {\"id\": \"keep\", \"op\": \"upsert\", \"payload\": {\"ok\": True}},\n            {\"id\": \"gone\", \"op\": \"delete\"},\n        ]\n        self.assertEqual(\n            compact_events(events),\n            [{\"id\": \"keep\", \"op\": \"upsert\", \"payload\": {\"ok\": True}}],\n        )\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+        },
+        {
+          "path": "tests/test_ledger_hidden.py",
+          "content": "from __future__ import annotations\n\nimport json\nimport os\nimport secrets\nimport subprocess\nimport sys\nimport tempfile\nfrom pathlib import Path\n\nallow_unprivileged = os.environ.get(\"MOE_TOOLS_VERIFIER_DEV_MODE\") == \"1\"\ndef demote() -> None:\n    if os.geteuid() == 0:\n        os.setgroups([])\n        os.setgid(65534)\n        os.setuid(65534)\n    elif not allow_unprivileged:\n        os._exit(126)\n\nchild_env = {\"PATH\": os.environ.get(\"PATH\", \"/usr/local/bin:/usr/bin:/bin\"), \"PYTHONDONTWRITEBYTECODE\": \"1\", \"PYTHONHASHSEED\": \"0\"}\ndef invoke(lines: list[str]):\n    with tempfile.TemporaryDirectory() as directory:\n        root = Path(directory)\n        source = root / \"input.jsonl\"\n        output = root / \"output.jsonl\"\n        source.write_text(\"\\n\".join(lines) + \"\\n\")\n        if os.geteuid() == 0:\n            os.chown(root, 65534, 65534)\n        completed = subprocess.run(\n            [sys.executable, \"ledger.py\", str(source), str(output)],\n            capture_output=True,\n            text=True,\n            timeout=15,\n            check=False,\n            cwd=\".\",\n            env=child_env,\n            preexec_fn=demote,\n        )\n        rendered = output.read_text() if output.exists() else None\n        return completed, rendered\n\ninvalid_json, _ = invoke(['{\"id\":\"ok\",\"op\":\"delete\"}', \"not-json\"])\nif invalid_json.returncode == 0 or \"line 2\" not in invalid_json.stderr:\n    raise AssertionError(\"invalid JSON must report line 2\")\ninvalid_payload, _ = invoke(['{\"id\":\"\",\"op\":\"upsert\",\"payload\":[]}'])\nif invalid_payload.returncode == 0 or \"line 1\" not in invalid_payload.stderr:\n    raise AssertionError(\"invalid payload must report line 1\")\ntoken = secrets.token_hex(6)\nevents = [\n    {\"id\": token, \"op\": \"upsert\", \"payload\": {\"z\": 1}},\n    {\"id\": \"keep\", \"op\": \"upsert\", \"payload\": {\"a\": 2}},\n    {\"id\": token, \"op\": \"delete\"},\n]\nvalid, output = invoke([json.dumps(event) for event in events])\nexpected = json.dumps(events[1], sort_keys=True, separators=(\",\", \":\")) + \"\\n\"\nif valid.returncode != 0 or valid.stderr or output != expected:\n    raise AssertionError(f\"ledger CLI mismatch: {valid.stderr!r}, {output!r}\")\nprint(\"verified isolated ledger validation and compaction probes\")\n"
+        },
+        {
+          "path": "oracle/ledger.py",
+          "content": "from __future__ import annotations\n\nimport argparse\nimport json\nfrom collections.abc import Iterable\nfrom pathlib import Path\nfrom typing import Any\n\n\ndef read_events(path: Path) -> list[dict[str, Any]]:\n    events: list[dict[str, Any]] = []\n    with path.open(encoding=\"utf-8\") as source:\n        for line_number, line in enumerate(source, start=1):\n            if not line.strip():\n                continue\n            try:\n                event = json.loads(line)\n            except json.JSONDecodeError as error:\n                raise ValueError(f\"line {line_number}: invalid JSON\") from error\n            if not isinstance(event, dict):\n                raise ValueError(f\"line {line_number}: event must be an object\")\n            event_id = event.get(\"id\")\n            operation = event.get(\"op\")\n            if not isinstance(event_id, str) or not event_id:\n                raise ValueError(f\"line {line_number}: id must be a non-empty string\")\n            if operation not in {\"upsert\", \"delete\"}:\n                raise ValueError(f\"line {line_number}: unsupported operation\")\n            if operation == \"upsert\" and not isinstance(event.get(\"payload\"), dict):\n                raise ValueError(f\"line {line_number}: upsert payload must be an object\")\n            events.append(event)\n    return events\n\n\ndef compact_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:\n    latest: dict[str, tuple[int, dict[str, Any]]] = {}\n    for index, event in enumerate(events):\n        latest[event[\"id\"]] = (index, event)\n    ordered = sorted(latest.values(), key=lambda entry: entry[0])\n    return [event for _, event in ordered if event[\"op\"] != \"delete\"]\n\n\ndef write_events(path: Path, events: Iterable[dict[str, Any]]) -> None:\n    with path.open(\"w\", encoding=\"utf-8\") as destination:\n        for event in events:\n            destination.write(\n                json.dumps(event, sort_keys=True, separators=(\",\", \":\")) + \"\\n\"\n            )\n\n\ndef main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"input\", type=Path)\n    parser.add_argument(\"output\", type=Path)\n    args = parser.parse_args()\n    write_events(args.output, compact_events(read_events(args.input)))\n\n\nif __name__ == \"__main__\":\n    main()\n"
+        }
+      ],
+      "submission_file_paths": ["ledger.py"],
+      "verifier_file_paths": ["tests/test_ledger_hidden.py"],
+      "oracle_file_paths": ["oracle/ledger.py"],
+      "verifier_command": "python -I tests/test_ledger_hidden.py",
+      "oracle_commands": ["cp oracle/ledger.py ledger.py"]
+    },
+    {
+      "id": "build-release-plan",
+      "pack_id": "repo-engineering-v1",
+      "name": "Build dependency-aware release plans",
+      "title": "Build dependency-aware release plans",
+      "instruction": "release_plan.py is supposed to compute deterministic deployment stages for changed services, including every transitive dependent that must be redeployed. The current shortcut ignores the graph. Implement complete graph validation, cycle detection, impacted-service expansion, and dependency-safe alphabetical stages. Keep the existing JSON CLI contract and useful ValueError failures for unknown services or dependencies. Run the visible tests before finishing.",
+      "category": "feature-development",
+      "language": "python",
+      "tags": ["python", "graphs", "cli", "deployment", "feature"],
+      "success_criteria": [
+        "Changed services and all transitive dependents are returned in deterministic dependency-safe stages.",
+        "Services within a stage are alphabetically ordered and unchanged prerequisites are not redeployed.",
+        "Unknown services, unknown dependencies, and dependency cycles fail clearly instead of producing a partial plan.",
+        "The compact JSON CLI contract and protected tests pass."
+      ],
+      "image_ref": "python:3.12-slim",
+      "image_digest": "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
+      "working_directory": "/workspace/task",
+      "network_policy": "none",
+      "cpu": 1,
+      "memory_mb": 1024,
+      "disk_mb": 2048,
+      "timeout_seconds": 300,
+      "files": [
+        {
+          "path": "release_plan.py",
+          "content": "from __future__ import annotations\n\nimport argparse\nimport json\nfrom collections.abc import Iterable, Mapping, Sequence\nfrom pathlib import Path\n\n\ndef deployment_stages(\n    graph: Mapping[str, Sequence[str]],\n    changed: Iterable[str],\n) -> list[list[str]]:\n    del graph\n    selected = sorted(set(changed))\n    return [selected] if selected else []\n\n\ndef main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"graph\", type=Path)\n    parser.add_argument(\"changed\", nargs=\"+\")\n    args = parser.parse_args()\n    graph = json.loads(args.graph.read_text(encoding=\"utf-8\"))\n    print(\n        json.dumps(\n            {\"stages\": deployment_stages(graph, args.changed)},\n            separators=(\",\", \":\"),\n        )\n    )\n\n\nif __name__ == \"__main__\":\n    main()\n"
+        },
+        {
+          "path": "tests/__init__.py",
+          "content": ""
+        },
+        {
+          "path": "tests/test_release_plan.py",
+          "content": "from __future__ import annotations\n\nimport unittest\n\nfrom release_plan import deployment_stages\n\n\nclass DeploymentStagesTests(unittest.TestCase):\n    def test_changed_dependency_redeploys_transitive_dependents(self) -> None:\n        graph = {\n            \"db\": [],\n            \"api\": [\"db\"],\n            \"worker\": [\"db\"],\n            \"web\": [\"api\"],\n        }\n        self.assertEqual(\n            deployment_stages(graph, [\"db\"]),\n            [[\"db\"], [\"api\", \"worker\"], [\"web\"]],\n        )\n\n    def test_unchanged_prerequisite_is_not_redeployed(self) -> None:\n        graph = {\"db\": [], \"api\": [\"db\"], \"web\": [\"api\"]}\n        self.assertEqual(deployment_stages(graph, [\"api\"]), [[\"api\"], [\"web\"]])\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+        },
+        {
+          "path": "tests/test_release_plan_hidden.py",
+          "content": "from __future__ import annotations\n\nimport json\nimport os\nimport secrets\nimport subprocess\nimport sys\nimport tempfile\nfrom pathlib import Path\n\nallow_unprivileged = os.environ.get(\"MOE_TOOLS_VERIFIER_DEV_MODE\") == \"1\"\ndef demote() -> None:\n    if os.geteuid() == 0:\n        os.setgroups([])\n        os.setgid(65534)\n        os.setuid(65534)\n    elif not allow_unprivileged:\n        os._exit(126)\n\nchild_env = {\"PATH\": os.environ.get(\"PATH\", \"/usr/local/bin:/usr/bin:/bin\"), \"PYTHONDONTWRITEBYTECODE\": \"1\", \"PYTHONHASHSEED\": \"0\"}\ndef invoke(graph, *changed: str):\n    with tempfile.TemporaryDirectory() as directory:\n        root = Path(directory)\n        path = root / \"graph.json\"\n        path.write_text(json.dumps(graph))\n        if os.geteuid() == 0:\n            os.chown(root, 65534, 65534)\n        return subprocess.run(\n            [sys.executable, \"release_plan.py\", str(path), *changed],\n            capture_output=True,\n            text=True,\n            timeout=15,\n            check=False,\n            cwd=\".\",\n            env=child_env,\n            preexec_fn=demote,\n        )\n\ntoken = secrets.token_hex(5)\ngraph = {token: [], \"left\": [token], \"right\": [token], \"edge\": [\"left\", \"right\"]}\nvalid = invoke(graph, token)\nexpected = json.dumps({\"stages\": [[token], [\"left\", \"right\"], [\"edge\"]]}, separators=(\",\", \":\")) + \"\\n\"\nif valid.returncode != 0 or valid.stderr or valid.stdout != expected:\n    raise AssertionError(f\"release plan mismatch: {valid.stderr!r}, {valid.stdout!r}\")\nfor candidate, changed, phrase in (\n    ({\"api\": [\"missing\"]}, (\"api\",), \"unknown dependency\"),\n    ({\"a\": [\"b\"], \"b\": [\"a\"]}, (\"a\",), \"cycle\"),\n    ({\"api\": []}, (\"missing\",), \"unknown changed service\"),\n):\n    failed = invoke(candidate, *changed)\n    if failed.returncode == 0 or phrase not in failed.stderr:\n        raise AssertionError(f\"expected {phrase!r} failure\")\nprint(\"verified isolated release-plan graph and failure probes\")\n"
+        },
+        {
+          "path": "oracle/release_plan.py",
+          "content": "from __future__ import annotations\n\nimport argparse\nimport json\nfrom collections.abc import Iterable, Mapping, Sequence\nfrom pathlib import Path\n\n\ndef _validated_graph(graph: Mapping[str, Sequence[str]]) -> dict[str, set[str]]:\n    if not isinstance(graph, Mapping) or not all(isinstance(name, str) for name in graph):\n        raise ValueError(\"graph must map service names to dependencies\")\n    normalized: dict[str, set[str]] = {}\n    for name, dependencies in graph.items():\n        if isinstance(dependencies, str) or not isinstance(dependencies, Sequence):\n            raise ValueError(f\"dependencies for {name} must be a sequence\")\n        if not all(isinstance(dependency, str) for dependency in dependencies):\n            raise ValueError(f\"dependencies for {name} must be service names\")\n        normalized[name] = set(dependencies)\n    unknown = {dependency for dependencies in normalized.values() for dependency in dependencies} - normalized.keys()\n    if unknown:\n        raise ValueError(f\"unknown dependency: {sorted(unknown)}\")\n    remaining = {name: set(dependencies) for name, dependencies in normalized.items()}\n    while remaining:\n        ready = {name for name, dependencies in remaining.items() if not (dependencies & remaining.keys())}\n        if not ready:\n            raise ValueError(\"dependency cycle detected\")\n        for name in ready:\n            remaining.pop(name)\n    return normalized\n\n\ndef deployment_stages(\n    graph: Mapping[str, Sequence[str]],\n    changed: Iterable[str],\n) -> list[list[str]]:\n    normalized = _validated_graph(graph)\n    selected = set(changed)\n    unknown_changed = selected - normalized.keys()\n    if unknown_changed:\n        raise ValueError(f\"unknown changed service: {sorted(unknown_changed)}\")\n    reverse: dict[str, set[str]] = {name: set() for name in normalized}\n    for name, dependencies in normalized.items():\n        for dependency in dependencies:\n            reverse[dependency].add(name)\n    impacted = set(selected)\n    frontier = list(selected)\n    while frontier:\n        dependency = frontier.pop()\n        for dependent in reverse[dependency]:\n            if dependent not in impacted:\n                impacted.add(dependent)\n                frontier.append(dependent)\n    stages: list[list[str]] = []\n    remaining = set(impacted)\n    while remaining:\n        ready = sorted(name for name in remaining if not (normalized[name] & remaining))\n        if not ready:\n            raise ValueError(\"dependency cycle detected\")\n        stages.append(ready)\n        remaining.difference_update(ready)\n    return stages\n\n\ndef main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"graph\", type=Path)\n    parser.add_argument(\"changed\", nargs=\"+\")\n    args = parser.parse_args()\n    graph = json.loads(args.graph.read_text(encoding=\"utf-8\"))\n    print(\n        json.dumps(\n            {\"stages\": deployment_stages(graph, args.changed)},\n            separators=(\",\", \":\"),\n        )\n    )\n\n\nif __name__ == \"__main__\":\n    main()\n"
+        }
+      ],
+      "submission_file_paths": ["release_plan.py"],
+      "verifier_file_paths": ["tests/test_release_plan_hidden.py"],
+      "oracle_file_paths": ["oracle/release_plan.py"],
+      "verifier_command": "python -I tests/test_release_plan_hidden.py",
+      "oracle_commands": ["cp oracle/release_plan.py release_plan.py"]
+    },
+    {
+      "id": "bound-async-worker-pool",
+      "pack_id": "repo-engineering-v1",
+      "name": "Bound an asynchronous worker pool",
+      "title": "Bound an asynchronous worker pool",
+      "instruction": "worker_pool.run_bounded currently schedules every job at once, ignores its concurrency limit, and leaves cleanup behavior undefined when one job fails. Implement a robust standard-library async worker pool that validates a positive integer limit, never exceeds it, preserves input result order, supports empty iterables, and cancels plus awaits unfinished jobs before re-raising the first failure. Keep the public async signature and run the visible tests.",
+      "category": "async-refactor",
+      "language": "python",
+      "tags": ["python", "asyncio", "concurrency", "refactor", "reliability"],
+      "success_criteria": [
+        "At most limit worker calls are active concurrently and results retain input order.",
+        "Empty inputs return immediately and non-positive, boolean, or non-integer limits raise ValueError.",
+        "On the first worker failure, unfinished tasks are cancelled and awaited before the exception is re-raised.",
+        "The implementation uses only the standard library and passes visible plus protected tests."
+      ],
+      "image_ref": "python:3.12-slim",
+      "image_digest": "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36",
+      "working_directory": "/workspace/task",
+      "network_policy": "none",
+      "cpu": 1,
+      "memory_mb": 1024,
+      "disk_mb": 2048,
+      "timeout_seconds": 300,
+      "files": [
+        {
+          "path": "worker_pool.py",
+          "content": "from __future__ import annotations\n\nimport asyncio\nfrom collections.abc import Awaitable, Callable, Iterable\nfrom typing import TypeVar\n\nInput = TypeVar(\"Input\")\nOutput = TypeVar(\"Output\")\n\n\nasync def run_bounded(\n    items: Iterable[Input],\n    worker: Callable[[Input], Awaitable[Output]],\n    limit: int,\n) -> list[Output]:\n    del limit\n    return list(await asyncio.gather(*(worker(item) for item in items)))\n"
+        },
+        {
+          "path": "tests/__init__.py",
+          "content": ""
+        },
+        {
+          "path": "tests/test_worker_pool.py",
+          "content": "from __future__ import annotations\n\nimport asyncio\nimport unittest\n\nfrom worker_pool import run_bounded\n\n\nclass WorkerPoolTests(unittest.IsolatedAsyncioTestCase):\n    async def test_limit_is_enforced_and_results_keep_input_order(self) -> None:\n        active = 0\n        peak = 0\n\n        async def worker(value: int) -> int:\n            nonlocal active, peak\n            active += 1\n            peak = max(peak, active)\n            await asyncio.sleep(0.005 * (4 - value))\n            active -= 1\n            return value * 10\n\n        results = await run_bounded([1, 2, 3], worker, limit=2)\n        self.assertEqual(results, [10, 20, 30])\n        self.assertLessEqual(peak, 2)\n\n    async def test_empty_input_returns_empty_list(self) -> None:\n        async def worker(value: int) -> int:\n            return value\n\n        self.assertEqual(await run_bounded([], worker, limit=1), [])\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+        },
+        {
+          "path": "tests/test_worker_pool_hidden.py",
+          "content": "from __future__ import annotations\n\nimport json\nimport os\nimport subprocess\nimport sys\n\nallow_unprivileged = os.environ.get(\"MOE_TOOLS_VERIFIER_DEV_MODE\") == \"1\"\ndef demote() -> None:\n    if os.geteuid() == 0:\n        os.setgroups([])\n        os.setgid(65534)\n        os.setuid(65534)\n    elif not allow_unprivileged:\n        os._exit(126)\n\nchild_env = {\"PATH\": os.environ.get(\"PATH\", \"/usr/local/bin:/usr/bin:/bin\"), \"PYTHONDONTWRITEBYTECODE\": \"1\", \"PYTHONHASHSEED\": \"0\"}\nprobe = '''import asyncio\nimport json\nimport sys\nsys.path.insert(0, \".\")\n_encode = json.JSONEncoder(sort_keys=True, separators=(\",\", \":\")).encode\n_run = asyncio.run\n_sleep = asyncio.sleep\n_write = sys.stdout.write\nfrom worker_pool import run_bounded\nasync def inspect():\n    report = {}\n    active = 0\n    peak = 0\n    async def ordered(value):\n        nonlocal active, peak\n        active += 1\n        peak = max(peak, active)\n        await _sleep(0.01 * (4 - value))\n        active -= 1\n        return value * 10\n    report[\"ordered\"] = await run_bounded([1, 2, 3], ordered, 2)\n    report[\"peak\"] = peak\n    report[\"empty\"] = await run_bounded([], ordered, 1)\n    invalid = []\n    for limit in (0, -1, True, 1.5):\n        try:\n            await run_bounded([1], ordered, limit)\n        except ValueError:\n            invalid.append(True)\n        else:\n            invalid.append(False)\n    report[\"invalid\"] = invalid\n    consumed = []\n    def items():\n        for value in range(4):\n            consumed.append(value)\n            yield value\n    async def increment(value):\n        await _sleep(0)\n        return value + 1\n    report[\"generated\"] = await run_bounded(items(), increment, 3)\n    report[\"consumed\"] = consumed\n    cancelled = asyncio.Event()\n    async def failing(value):\n        if value == 1:\n            await _sleep(0)\n            raise RuntimeError(\"boom\")\n        try:\n            await _sleep(10)\n        except asyncio.CancelledError:\n            cancelled.set()\n            raise\n    try:\n        await run_bounded([2, 1, 3], failing, 2)\n    except RuntimeError as error:\n        report[\"failure\"] = str(error)\n    report[\"cancelled\"] = cancelled.is_set()\n    return report\n_write(_encode(_run(inspect())))\n'''\ncompleted = subprocess.run(\n    [sys.executable, \"-I\", \"-c\", probe],\n    capture_output=True,\n    text=True,\n    timeout=30,\n    check=False,\n    cwd=\".\",\n    env=child_env,\n    preexec_fn=demote,\n)\nif completed.returncode != 0 or completed.stderr:\n    raise AssertionError(completed.stderr or \"worker-pool probe failed\")\ntry:\n    actual = json.loads(completed.stdout)\nexcept json.JSONDecodeError as error:\n    raise AssertionError(\"worker-pool probe returned invalid output\") from error\nexpected = {\n    \"ordered\": [10, 20, 30],\n    \"peak\": 2,\n    \"empty\": [],\n    \"invalid\": [True, True, True, True],\n    \"generated\": [1, 2, 3, 4],\n    \"consumed\": [0, 1, 2, 3],\n    \"failure\": \"boom\",\n    \"cancelled\": True,\n}\nif actual != expected:\n    raise AssertionError(f\"worker-pool behavior mismatch: {actual!r}\")\nprint(\"verified isolated worker-pool concurrency and cleanup probes\")\n"
+        },
+        {
+          "path": "oracle/worker_pool.py",
+          "content": "from __future__ import annotations\n\nimport asyncio\nfrom collections.abc import Awaitable, Callable, Iterable\nfrom typing import TypeVar\n\nInput = TypeVar(\"Input\")\nOutput = TypeVar(\"Output\")\n\n\nasync def run_bounded(\n    items: Iterable[Input],\n    worker: Callable[[Input], Awaitable[Output]],\n    limit: int,\n) -> list[Output]:\n    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:\n        raise ValueError(\"limit must be a positive integer\")\n    materialized = list(items)\n    if not materialized:\n        return []\n    semaphore = asyncio.Semaphore(limit)\n\n    async def run_one(item: Input) -> Output:\n        async with semaphore:\n            return await worker(item)\n\n    tasks = [asyncio.create_task(run_one(item)) for item in materialized]\n    try:\n        return list(await asyncio.gather(*tasks))\n    except BaseException:\n        for task in tasks:\n            if not task.done():\n                task.cancel()\n        await asyncio.gather(*tasks, return_exceptions=True)\n        raise\n"
+        }
+      ],
+      "submission_file_paths": ["worker_pool.py"],
+      "verifier_file_paths": ["tests/test_worker_pool_hidden.py"],
+      "oracle_file_paths": ["oracle/worker_pool.py"],
+      "verifier_command": "python -I tests/test_worker_pool_hidden.py",
+      "oracle_commands": ["cp oracle/worker_pool.py worker_pool.py"]
+    }
+  ]
+}

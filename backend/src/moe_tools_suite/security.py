@@ -135,9 +135,7 @@ class SessionMiddleware(BaseHTTPMiddleware):
         request.state.session_claims = claims
         if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
             csrf_token = request.headers.get(CSRF_HEADER)
-            if not csrf_token or not hmac.compare_digest(
-                csrf_token, claims.csrf_token
-            ):
+            if not csrf_token or not hmac.compare_digest(csrf_token, claims.csrf_token):
                 return JSONResponse(
                     {"detail": "invalid CSRF token"},
                     status_code=status.HTTP_403_FORBIDDEN,

@@ -143,6 +143,7 @@ class AgentArtifactStore:
             "trajectory.json",
             "patch.diff",
             "verifier.json",
+            "evaluation.json",
             "manifest.json",
         }:
             raise ValueError("unsupported agent artifact name")

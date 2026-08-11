@@ -14,7 +14,10 @@ from ..domain import (
 from .base import BenchmarkAdapter
 from .custom import CustomBenchmarkAdapter
 from .fixture import FixtureArithmeticAdapter
-from .gsm8k import GSM8K_ID, Gsm8kAdapter
+from .gsm8k import Gsm8kAdapter
+from .ifeval import ifeval_adapters
+from .livebench import LivebenchZebra202406Adapter
+from .mmlu_pro import mmlu_pro_adapters
 
 
 class BenchmarkCatalog:
@@ -31,9 +34,15 @@ class BenchmarkCatalog:
         self.max_custom_dataset_bytes = max_custom_dataset_bytes
         fixture = FixtureArithmeticAdapter()
         gsm8k = Gsm8kAdapter(self.data_dir)
+        standard_adapters: list[BenchmarkAdapter] = [
+            gsm8k,
+            *ifeval_adapters(self.data_dir),
+            LivebenchZebra202406Adapter(self.data_dir),
+            *mmlu_pro_adapters(self.data_dir),
+        ]
         self._adapters: dict[str, BenchmarkAdapter] = {
             fixture.info.id: fixture,
-            gsm8k.info.id: gsm8k,
+            **{adapter.info.id: adapter for adapter in standard_adapters},
         }
         self._unavailable: dict[str, BenchmarkInfo] = {}
         for record in custom_records.values():
@@ -118,14 +127,13 @@ class BenchmarkCatalog:
         on_progress: Callable[[int, int], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> BenchmarkInfo:
-        if benchmark_id != GSM8K_ID:
-            if benchmark_id in self._adapters:
-                return self._adapters[benchmark_id].info
+        adapter = self._adapters.get(benchmark_id)
+        if adapter is None:
             raise KeyError(benchmark_id)
-        adapter = self._adapters[GSM8K_ID]
-        if not isinstance(adapter, Gsm8kAdapter):
-            raise RuntimeError("GSM8K adapter registration is invalid")
-        await adapter.prepare(
+        prepare = getattr(adapter, "prepare", None)
+        if prepare is None:
+            return adapter.info
+        await prepare(
             on_progress=on_progress,
             should_cancel=should_cancel,
         )

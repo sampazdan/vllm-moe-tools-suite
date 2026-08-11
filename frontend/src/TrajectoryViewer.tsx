@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
+import { AgentPerformancePanel } from "./PerformancePanel";
 import type {
   AgentTrajectory,
   AgentTrialArtifacts,
@@ -18,10 +19,18 @@ interface TrajectoryViewerProps {
 const eventLabels: Record<TrajectoryStepType, string> = {
   system: "System",
   user: "Task",
-  assistant: "Model",
-  tool: "Command",
+  assistant: "Model response",
+  tool: "Tool call",
   observation: "Observation",
   verifier: "Verifier",
+  task: "Task",
+  reasoning: "Explicit reasoning",
+  model: "Model response",
+  tool_call: "Tool call",
+  command: "Command",
+  stdout: "Standard output",
+  stderr: "Standard error",
+  routing: "Expert routing",
 };
 
 export function TrajectoryViewer({
@@ -31,6 +40,9 @@ export function TrajectoryViewer({
   live,
 }: TrajectoryViewerProps) {
   const [expandedSteps, setExpandedSteps] = useState<Set<string>>(new Set());
+  const [reasoningView, setReasoningView] = useState<"off" | "compact" | "full">(
+    "compact",
+  );
   const feedRef = useRef<HTMLDivElement>(null);
   const steps = trajectory?.steps ?? [];
 
@@ -64,6 +76,19 @@ export function TrajectoryViewer({
           </p>
         </div>
         <div className="trajectory-heading-actions">
+          <label className="reasoning-view-control">
+            Reasoning
+            <select
+              value={reasoningView}
+              onChange={(event) =>
+                setReasoningView(event.target.value as typeof reasoningView)
+              }
+            >
+              <option value="off">Off</option>
+              <option value="compact">Compact</option>
+              <option value="full">Full</option>
+            </select>
+          </label>
           <span className={`trial-state ${trial.status}`}>
             {formatTrialStatus(trial.status)}
           </span>
@@ -92,14 +117,18 @@ export function TrajectoryViewer({
         />
       </div>
 
+      <AgentPerformancePanel trial={trial} trajectory={trajectory} compact />
+
       <div
         className="trajectory-feed"
         aria-live={live ? "polite" : "off"}
         ref={feedRef}
       >
-        {steps.map((step) => (
+        {steps
+          .filter((step) => step.type !== "reasoning" || reasoningView !== "off")
+          .map((step) => (
           <div
-            className={`trajectory-step ${step.type}`}
+            className={`trajectory-step ${step.type} ${step.phase ? `phase-${step.phase}` : ""}`}
             key={step.id}
           >
             <span className="trajectory-marker" aria-hidden="true">
@@ -111,13 +140,22 @@ export function TrajectoryViewer({
                   <span className="event-kind">{eventLabels[step.type]}</span>
                   <strong>{step.title}</strong>
                 </div>
-                <time dateTime={step.timestamp}>{formatStepTime(step.timestamp)}</time>
+                <div className="event-time">
+                  {step.turn != null && <span>Turn {step.turn}</span>}
+                  <time dateTime={step.timestamp}>{formatStepTime(step.timestamp)}</time>
+                </div>
               </header>
               {step.command && <pre className="command-line">$ {step.command}</pre>}
               {step.content && (
                 <StepContent
                   step={step}
-                  expanded={expandedSteps.has(step.id)}
+                  expanded={
+                    expandedSteps.has(step.id) ||
+                    (step.type === "reasoning" && reasoningView === "full")
+                  }
+                  compactReasoning={
+                    step.type === "reasoning" && reasoningView === "compact"
+                  }
                   onToggle={() => toggleStep(step.id)}
                 />
               )}
@@ -133,9 +171,19 @@ export function TrajectoryViewer({
                 {step.inference && (
                   <>
                     <span>
-                      {step.inference.prompt_tokens +
-                        step.inference.completion_tokens} tokens
+                      {step.inference.total_tokens ??
+                        step.inference.prompt_tokens +
+                          step.inference.completion_tokens} tokens
                     </span>
+                    {step.inference.reasoning_tokens != null && (
+                      <span>{step.inference.reasoning_tokens} reasoning</span>
+                    )}
+                    {step.inference.ttft_ms != null && (
+                      <span>{formatDuration(step.inference.ttft_ms)} TTFT</span>
+                    )}
+                    {step.inference.tokens_per_second != null && (
+                      <span>{step.inference.tokens_per_second.toFixed(1)} t/s</span>
+                    )}
                     <span>
                       {step.inference.routing_artifact_id
                         ? "Routing captured"
@@ -213,15 +261,19 @@ export function TrajectoryViewer({
 function StepContent({
   step,
   expanded,
+  compactReasoning,
   onToggle,
 }: {
   step: TrajectoryStep;
   expanded: boolean;
+  compactReasoning: boolean;
   onToggle: () => void;
 }) {
   const expandable = step.truncated || step.content.length > 900;
   return (
-    <div className={`step-content ${expanded ? "expanded" : ""}`}>
+    <div
+      className={`step-content ${expanded ? "expanded" : ""} ${compactReasoning ? "compact-reasoning" : ""}`}
+    >
       <pre>{step.content}</pre>
       {expandable && (
         <button className="text-button" onClick={onToggle}>
@@ -242,11 +294,15 @@ function Usage({ value, label }: { value: string | number; label: string }) {
 }
 
 function stepMarker(type: TrajectoryStepType) {
-  if (type === "assistant") return "M";
-  if (type === "user") return "→";
-  if (type === "tool") return "$";
-  if (type === "observation") return "↳";
+  if (type === "assistant" || type === "model") return "M";
+  if (type === "user" || type === "task") return "→";
+  if (type === "reasoning") return "R";
+  if (type === "tool" || type === "tool_call") return "◆";
+  if (type === "command") return "$";
+  if (type === "observation" || type === "stdout") return "↳";
+  if (type === "stderr") return "!";
   if (type === "verifier") return "✓";
+  if (type === "routing") return "⌁";
   return "·";
 }
 

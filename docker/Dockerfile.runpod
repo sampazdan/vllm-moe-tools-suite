@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=linux/amd64 node:24.6.0-bookworm-slim AS frontend-build
+FROM --platform=linux/amd64 node:24.6.0-bookworm-slim@sha256:527e3f1e925c5727a98b17575e68d0bb0b577965bf3b60330790bfcf8a0b3035 AS frontend-build
 WORKDIR /build/frontend
 COPY frontend/package*.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci
@@ -12,8 +12,11 @@ FROM --platform=linux/amd64 runpod/pytorch:1.0.3-cu1300-torch290-ubuntu2404@sha2
 ARG VLLM_PRECOMPILED_WHEEL_COMMIT=b1e12d142d8c9533f857f8da13d8fc368e95a8cd
 ARG VLLM_PRECOMPILED_WHEEL_VARIANT=cu130
 ARG VLLM_IMAGE_VERSION=0.1.dev1+moe-tools
-ARG VLLM_SOURCE_REF=stage-2-worktree
+ARG VLLM_SOURCE_REF
 ARG IMAGE_SOURCE=https://github.com/sampazdan/vllm-moe-tools-suite
+
+RUN printf '%s\n' "${VLLM_SOURCE_REF}" \
+    | grep -Eq '^[0-9a-f]{40}$'
 
 LABEL org.opencontainers.image.title="MoE Tools Test Suite" \
       org.opencontainers.image.description="Interactive expert-routing and pruning research appliance" \
@@ -41,10 +44,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUNPOD_VLLM_GPU_MEMORY_UTILIZATION=0.90 \
     RUNPOD_VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
     RUNPOD_VLLM_MAX_NUM_SEQS=8 \
+    RUNPOD_ENABLE_REQUEST_METRICS=1 \
+    RUNPOD_REASONING_PARSER=qwen3 \
     VLLM_USE_DEEP_GEMM=0 \
     MOE_TOOLS_MODE=mock \
     MOE_TOOLS_REQUIRE_AUTH=1 \
     MOE_TOOLS_COOKIE_SECURE=1 \
+    MOE_TOOLS_APP_STARTUP_TIMEOUT_SECONDS=300 \
     MOE_TOOLS_APP_ROOT=/opt/moe-tools-test-suite \
     MOE_TOOLS_DATA_DIR=/workspace/moe-tools \
     MOE_TOOLS_FRONTEND_DIST=/opt/moe-tools-test-suite/frontend/dist \
@@ -120,7 +126,7 @@ RUN chmod 0755 \
 WORKDIR /workspace
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null || exit 1
 
 # Inherit the Runpod base CMD. /start.sh invokes /pre_start.sh, preserving SSH,

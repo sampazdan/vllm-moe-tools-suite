@@ -26,17 +26,33 @@ async def test_vllm_runtime_reads_custom_choice_telemetry() -> None:
         assert payload["max_tokens"] == 321
         assert payload["seed"] == 7
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        assert payload["include_reasoning"] is False
         return httpx.Response(
             200,
             json={
                 "choices": [
                     {
-                        "message": {"content": "19"},
+                        "message": {
+                            "content": "19",
+                            "reasoning": "Twelve plus seven is nineteen.",
+                        },
+                        "finish_reason": "stop",
                         "routed_experts": encode_npy(ids),
                         "routed_expert_weights": encode_npy(weights),
                     }
                 ],
-                "usage": {"prompt_tokens": 8, "completion_tokens": 1},
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 1,
+                    "completion_tokens_details": {"reasoning_tokens": 7},
+                },
+                "metrics": {
+                    "time_to_first_token_ms": 14.5,
+                    "generation_time_ms": 8.0,
+                    "queue_time_ms": 1.25,
+                    "mean_itl_ms": 4.0,
+                    "tokens_per_second": 125.0,
+                },
             },
         )
 
@@ -57,7 +73,15 @@ async def test_vllm_runtime_reads_custom_choice_telemetry() -> None:
     )
 
     assert result.content == "19"
+    assert result.reasoning == "Twelve plus seven is nineteen."
+    assert result.finish_reason == "stop"
     assert result.prompt_tokens == 8
+    assert result.reasoning_tokens == 7
+    assert result.performance.time_to_first_token_ms == 14.5
+    assert result.performance.generation_time_ms == 8.0
+    assert result.performance.queue_time_ms == 1.25
+    assert result.performance.mean_inter_token_latency_ms == 4.0
+    assert result.performance.tokens_per_second == 125.0
     np.testing.assert_array_equal(result.routing.expert_ids, ids)
     await client.aclose()
 

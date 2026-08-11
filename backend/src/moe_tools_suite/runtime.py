@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import httpx
@@ -14,11 +15,26 @@ from .telemetry import DecodedRouting, decode_routing_payloads
 
 
 @dataclass(frozen=True)
+class CompletionPerformance:
+    """Timing metrics reported by the serving runtime for one completion."""
+
+    time_to_first_token_ms: float | None = None
+    generation_time_ms: float | None = None
+    queue_time_ms: float | None = None
+    mean_inter_token_latency_ms: float | None = None
+    tokens_per_second: float | None = None
+
+
+@dataclass(frozen=True)
 class CompletionResult:
     content: str
     prompt_tokens: int
     completion_tokens: int
     routing: DecodedRouting
+    reasoning_tokens: int | None = None
+    reasoning: str | None = None
+    finish_reason: str | None = None
+    performance: CompletionPerformance = field(default_factory=CompletionPerformance)
 
 
 class ModelRuntime(Protocol):
@@ -104,6 +120,7 @@ class MockModelRuntime:
             prompt_tokens=len(prompt.split()),
             completion_tokens=1,
             routing=DecodedRouting(expert_ids=ids, expert_weights=weights),
+            finish_reason="stop",
         )
 
     async def aclose(self) -> None:
@@ -165,6 +182,7 @@ class VllmRuntime:
             "temperature": config.temperature,
             "max_tokens": config.max_tokens,
             "chat_template_kwargs": chat_template_kwargs,
+            "include_reasoning": config.enable_thinking,
             "return_token_ids": True,
         }
         if config.seed is not None:
@@ -184,7 +202,17 @@ class VllmRuntime:
                 "both routing capture flags"
             )
         usage = payload.get("usage") or {}
-        content = choice["message"]["content"] or ""
+        completion_details = usage.get("completion_tokens_details")
+        reasoning_tokens = (
+            _optional_nonnegative_int(completion_details.get("reasoning_tokens"))
+            if isinstance(completion_details, dict)
+            else None
+        )
+        message = choice["message"]
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning") or message.get("reasoning_content")
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise ValueError("vLLM response returned invalid reasoning content")
         routing = decode_routing_payloads(
             choice["routed_experts"],
             choice["routed_expert_weights"],
@@ -204,6 +232,10 @@ class VllmRuntime:
             prompt_tokens=int(usage.get("prompt_tokens", 0)),
             completion_tokens=int(usage.get("completion_tokens", 0)),
             routing=routing,
+            reasoning_tokens=reasoning_tokens,
+            reasoning=reasoning,
+            finish_reason=_optional_string(choice.get("finish_reason")),
+            performance=_completion_performance(payload.get("metrics")),
         )
 
     async def _routed_prompt_start(
@@ -312,6 +344,41 @@ def _common_prefix_length(left: tuple[int, ...], right: tuple[int, ...]) -> int:
             break
         matched += 1
     return matched
+
+
+def _completion_performance(value: object) -> CompletionPerformance:
+    if not isinstance(value, dict):
+        return CompletionPerformance()
+    return CompletionPerformance(
+        time_to_first_token_ms=_optional_nonnegative_float(
+            value.get("time_to_first_token_ms")
+        ),
+        generation_time_ms=_optional_nonnegative_float(value.get("generation_time_ms")),
+        queue_time_ms=_optional_nonnegative_float(value.get("queue_time_ms")),
+        mean_inter_token_latency_ms=_optional_nonnegative_float(
+            value.get("mean_itl_ms")
+        ),
+        tokens_per_second=_optional_nonnegative_float(value.get("tokens_per_second")),
+    )
+
+
+def _optional_nonnegative_float(value: object) -> float | None:
+    if type(value) not in {int, float}:
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _solve_fixture_prompt(prompt: str) -> str:

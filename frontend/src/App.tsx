@@ -3,8 +3,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AgenticWorkbench } from "./AgenticWorkbench";
 import { activeJobFromConflict, api, setCsrfToken } from "./api";
+import { CommandCenter } from "./CommandCenter";
+import { runItemKey } from "./contracts";
 import { ExpertHeatmap } from "./ExpertHeatmap";
 import { ResearchArchive } from "./ResearchArchive";
+import { navigate, useAppRoute } from "./router";
 import { useDurableJob } from "./useDurableJob";
 import type {
   AgentRun,
@@ -12,6 +15,8 @@ import type {
   BenchmarkInfo,
   BenchmarkItemPage,
   BenchmarkRun,
+  BenchmarkRunPage,
+  BenchmarkRunSummary,
   ComparisonRecord,
   CreateExpertProfileRequest,
   JobRecord,
@@ -19,6 +24,7 @@ import type {
   ModelSession,
   ProfileProposal,
   RoutingSummary,
+  RunItemResultPage,
   RuntimeStatus,
   SavedExpertProfile,
   SessionStatus,
@@ -29,6 +35,7 @@ const modelId = "Qwen/Qwen3.6-35B-A3B-FP8";
 
 export default function App() {
   const queryClient = useQueryClient();
+  const route = useAppRoute();
   const customBenchmarkInput = useRef<HTMLInputElement>(null);
   const initializedSelection = useRef<string | null>(null);
   const [selectedBenchmarkId, setSelectedBenchmarkId] = useState(
@@ -118,8 +125,8 @@ export default function App() {
     enabled: accessReady && selectedBenchmark?.ready === true,
   });
   const runsQuery = useQuery({
-    queryKey: ["runs"],
-    queryFn: () => api<BenchmarkRun[]>("/api/runs"),
+    queryKey: ["runs", "dashboard"],
+    queryFn: () => api<BenchmarkRunPage>("/api/runs?limit=100"),
     enabled: accessReady,
   });
   const modelSessionsQuery = useQuery({
@@ -260,7 +267,7 @@ export default function App() {
       if (!submitted) return null;
       const job = await durableJob.watchJob(submitted);
       if (!job.result_id) throw new Error("Benchmark job has no result");
-      return api<BenchmarkRun>(`/api/runs/${job.result_id}`);
+      return fetchBenchmarkRun(job.result_id);
     },
     onSuccess: (nextRun) => {
       if (!nextRun) return;
@@ -366,7 +373,7 @@ export default function App() {
       if (!submitted) return null;
       const job = await durableJob.watchJob(submitted);
       if (!job.result_id) throw new Error("Benchmark job has no result");
-      return api<BenchmarkRun>(`/api/runs/${job.result_id}`);
+      return fetchBenchmarkRun(job.result_id);
     },
     onSuccess: (nextRun) => {
       if (!nextRun) return;
@@ -447,11 +454,11 @@ export default function App() {
   const comparisonRows = useMemo(() => {
     if (!baselineRun || !maskedRun) return [];
     const maskedItems = new Map(
-      maskedRun.items.map((item) => [item.item_id, item]),
+      maskedRun.items.map((item) => [runItemKey(item), item]),
     );
     return baselineRun.items.map((baseline) => ({
       baseline,
-      masked: maskedItems.get(baseline.item_id),
+      masked: maskedItems.get(runItemKey(baseline)),
     }));
   }, [baselineRun, maskedRun]);
   const pairedScoreDelta =
@@ -479,6 +486,23 @@ export default function App() {
         pending={login.isPending}
         error={login.error instanceof Error ? login.error.message : null}
         onLogin={(token) => login.mutate(token)}
+      />
+    );
+  }
+
+  if (route.name !== "dashboard") {
+    return (
+      <CommandCenter
+        route={route}
+        status={statusQuery.data ?? null}
+        currentModelSession={currentModelQuery.data ?? null}
+        activeJob={activeJob}
+        onJobConflict={(job) => {
+          durableJob.adoptJob(job);
+          setJobAdoptionNotice(
+            `Another ${jobKindLabel(job.kind)} was already running. Rejoined it instead.`,
+          );
+        }}
       />
     );
   }
@@ -575,20 +599,32 @@ export default function App() {
       queryClient.invalidateQueries({ queryKey: ["model-sessions"] }),
     ]);
     if (!job.result_id) return;
-    const [recoveredRun, nextRuns, nextSessions] = await Promise.all([
-      api<BenchmarkRun>(`/api/runs/${job.result_id}`),
-      api<BenchmarkRun[]>("/api/runs"),
+    const [recoveredSummary, nextRuns, nextSessions] = await Promise.all([
+      api<BenchmarkRunSummary>(`/api/runs/${job.result_id}`),
+      api<BenchmarkRunPage>("/api/runs?limit=100"),
       api<ModelSession[]>("/api/model-sessions"),
     ]);
-    queryClient.setQueryData(["runs"], nextRuns);
+    queryClient.setQueryData(["runs", "dashboard"], nextRuns);
     queryClient.setQueryData(["model-sessions"], nextSessions);
+    if (recoveredSummary.completed_items > 1_000) {
+      navigate(`/runs/${encodeURIComponent(recoveredSummary.id)}`);
+      return;
+    }
+    const recoveredRun = await fetchBenchmarkRun(recoveredSummary.id);
     const recoveredSession = nextSessions.find(
       (session) => session.id === recoveredRun.model_session_id,
     );
     if (recoveredSession?.profile) {
+      const compatible = findCompatibleBaseline(
+        recoveredSummary,
+        nextRuns.items,
+        nextSessions,
+      );
       setMaskedRun(recoveredRun);
       setBaselineRun(
-        findCompatibleBaseline(recoveredRun, nextRuns, nextSessions) ?? null,
+        compatible && compatible.completed_items <= 1_000
+          ? await fetchBenchmarkRun(compatible.id)
+          : null,
       );
       setRoutingVariant("masked");
     } else {
@@ -604,22 +640,22 @@ export default function App() {
       <aside className="rail">
         <div className="brand-mark">M</div>
         <nav aria-label="Primary navigation">
-          <a className="nav-item active" href="#model" aria-label="Model">
+          <a className="nav-item active" href="/" aria-label="Model">
             ◇<span>Model</span>
           </a>
-          <a className="nav-item" href="#benchmark" aria-label="Benchmarks">
+          <a className="nav-item" href="/benchmarks" aria-label="Benchmarks" onClick={followAppLink}>
             ◫<span>Bench</span>
           </a>
-          <a className="nav-item" href="#agentic" aria-label="Agentic coding">
+          <a className="nav-item" href="/agent-runs" aria-label="Agentic coding" onClick={followAppLink}>
             ⌘<span>Code</span>
           </a>
-          <a className="nav-item" href="#engagement" aria-label="Profiles">
+          <a className="nav-item" href="/profiles" aria-label="Profiles" onClick={followAppLink}>
             ⌁<span>Experts</span>
           </a>
-          <a className="nav-item" href="#compare" aria-label="Compare runs">
+          <a className="nav-item" href="/comparisons" aria-label="Compare runs" onClick={followAppLink}>
             ⇄<span>Compare</span>
           </a>
-          <a className="nav-item" href="#archive" aria-label="Research archive">
+          <a className="nav-item" href="/runs" aria-label="Research archive" onClick={followAppLink}>
             ◷<span>Archive</span>
           </a>
         </nav>
@@ -963,8 +999,8 @@ export default function App() {
               {routingRun.items
                 .filter((item) => item.passed === false)
                 .map((item) => (
-                  <div key={item.item_id}>
-                    <span>{item.item_id}</span>
+                  <div key={runItemKey(item)}>
+                    <span>{item.item_id} · attempt {item.attempt}</span>
                     <strong>{item.error ?? item.output}</strong>
                     <small>expected {item.expected}</small>
                   </div>
@@ -1307,9 +1343,9 @@ export default function App() {
                           ? "regression"
                           : "recovery";
                     return (
-                      <tr key={baseline.item_id}>
+                      <tr key={runItemKey(baseline)}>
                         <td>
-                          <strong>{baseline.item_id}</strong>
+                          <strong>{baseline.item_id} · attempt {baseline.attempt}</strong>
                           <small>{baseline.prompt}</small>
                         </td>
                         <td
@@ -1340,7 +1376,7 @@ export default function App() {
 
         {model && (
           <ResearchArchive
-            runs={runsQuery.data ?? []}
+            runs={runsQuery.data?.items ?? []}
             profiles={profiles}
             comparisons={comparisonsQuery.data ?? []}
             agentRuns={agentRunsQuery.data ?? []}
@@ -1353,33 +1389,8 @@ export default function App() {
               loadProfile.isPending ||
               createProfile.isPending
             }
-            onOpenRun={(run, pairedBaseline) => {
-              setProposal(null);
-              if (pairedBaseline) {
-                setBaselineRun(pairedBaseline);
-                setMaskedRun(run);
-                setRoutingVariant("masked");
-                return;
-              }
-              const session = modelSessionsQuery.data?.find(
-                (candidate) => candidate.id === run.model_session_id,
-              );
-              if (session?.profile) {
-                setBaselineRun(null);
-                setMaskedRun(run);
-                setRoutingVariant("masked");
-              } else {
-                setBaselineRun(run);
-                setMaskedRun(null);
-                setRoutingVariant("baseline");
-              }
-            }}
-            onOpenComparison={(baseline, candidate) => {
-              setBaselineRun(baseline);
-              setMaskedRun(candidate);
-              setRoutingVariant("masked");
-              setProposal(null);
-            }}
+            onOpenRun={(run) => navigate(`/runs/${encodeURIComponent(run.id)}`)}
+            onOpenComparison={(_baseline, _candidate) => navigate("/comparisons")}
             onOpenAgentRun={(run) => setRequestedAgentRunId(run.id)}
             onLoadProfile={(profile) => {
               setProposal(null);
@@ -1469,6 +1480,20 @@ function resultClass(value: boolean | null | undefined) {
   return value == null ? "unscored" : value ? "pass" : "fail";
 }
 
+function followAppLink(event: React.MouseEvent<HTMLAnchorElement>) {
+  if (
+    event.button !== 0 ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.shiftKey ||
+    event.altKey
+  ) {
+    return;
+  }
+  event.preventDefault();
+  navigate(event.currentTarget.getAttribute("href") ?? "/");
+}
+
 function formatProgress(job: JobRecord) {
   if (job.kind !== "dataset_prepare") {
     return `${job.progress_current}/${job.progress_total}`;
@@ -1489,13 +1514,12 @@ function jobKindLabel(kind: JobRecord["kind"]) {
 }
 
 function findCompatibleBaseline(
-  candidate: BenchmarkRun,
-  runs: BenchmarkRun[],
+  candidate: BenchmarkRunSummary,
+  runs: BenchmarkRunSummary[],
   sessions: ModelSession[],
 ) {
   if (candidate.status !== "completed") return undefined;
   const sessionById = new Map(sessions.map((session) => [session.id, session]));
-  const candidateIds = candidate.items.map((item) => item.item_id).join("\0");
   return runs.find((run) => {
     const session = sessionById.get(run.model_session_id);
     return (
@@ -1503,11 +1527,25 @@ function findCompatibleBaseline(
       session?.profile === null &&
       run.status === "completed" &&
       run.benchmark_id === candidate.benchmark_id &&
-      (run.cohort_id && candidate.cohort_id
-        ? run.cohort_id === candidate.cohort_id
-        : run.items.map((item) => item.item_id).join("\0") === candidateIds)
+      run.cohort_id !== null &&
+      run.cohort_id === candidate.cohort_id
     );
   });
+}
+
+async function fetchBenchmarkRun(runId: string): Promise<BenchmarkRun> {
+  const summary = await api<BenchmarkRunSummary>(
+    `/api/runs/${encodeURIComponent(runId)}`,
+  );
+  const items: BenchmarkRun["items"] = [];
+  for (let offset = 0; offset < summary.completed_items; offset += 250) {
+    const page = await api<RunItemResultPage>(
+      `/api/runs/${encodeURIComponent(runId)}/items?offset=${offset}&limit=250`,
+    );
+    items.push(...page.items);
+    if (page.items.length === 0) break;
+  }
+  return { ...summary, items };
 }
 
 function CompareMetric({

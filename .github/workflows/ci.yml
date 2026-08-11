@@ -38,6 +38,18 @@ jobs:
           bash -n docker/runpod/pre_start.sh scripts/create_runpod_template.sh
           uv run python -m json.tool deploy/runpod-template.example.json >/dev/null
           uv run python -m json.tool deploy/runpod-agentic-template.example.json >/dev/null
+          MOE_TOOLS_IMAGE=ghcr.io/example/moe-tools:canary \
+            MOE_TOOLS_TEMPLATE_DRY_RUN=1 \
+            MOE_TOOLS_TEMPLATE_MODE=mock \
+            ./scripts/create_runpod_template.sh \
+            | jq -e '.env.MOE_TOOLS_MODE == "mock" and .imageName == "ghcr.io/example/moe-tools:canary"' \
+            >/dev/null
+          MOE_TOOLS_IMAGE=ghcr.io/example/moe-tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            MOE_TOOLS_TEMPLATE_DRY_RUN=1 \
+            MOE_TOOLS_TEMPLATE_MODE=agentic \
+            ./scripts/create_runpod_template.sh \
+            | jq -e '.env.MOE_TOOLS_MODE == "vllm" and (.env.MOE_TOOLS_ANTHROPIC_API_KEY | contains("RUNPOD_SECRET"))' \
+            >/dev/null
 
       - name: Run backend tests
         run: uv run pytest -q
