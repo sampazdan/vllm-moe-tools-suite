@@ -45,6 +45,13 @@ class JobRecord(BaseModel):
     completed_at: datetime | None = None
 
 
+class ActiveJobConflictDetail(BaseModel):
+    code: Literal["active_job_conflict"] = "active_job_conflict"
+    message: str
+    active_job: JobRecord
+    recovery_url: str
+
+
 class ModelTopology(BaseModel):
     num_layers: Annotated[int, Field(gt=0)]
     num_experts: Annotated[int, Field(gt=0)]
@@ -392,12 +399,6 @@ class CreateModelSessionRequest(BaseModel):
     model_id: str
     profile: ExpertProfile | None = None
     profile_id: str | None = None
-
-    @model_validator(mode="after")
-    def validate_profile_reference(self) -> CreateModelSessionRequest:
-        if self.profile_id is not None and self.profile is None:
-            raise ValueError("profile_id requires profile")
-        return self
 
 
 class SystemStatus(BaseModel):

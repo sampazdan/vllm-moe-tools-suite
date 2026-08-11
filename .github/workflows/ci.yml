@@ -1,0 +1,70 @@
+name: Validate application
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "codex/**"
+
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend · Python 3.12
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/0.11.32/install.sh | sh
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      - name: Lint backend
+        run: uv run ruff check backend
+
+      - name: Validate deployment assets
+        run: |
+          bash -n docker/runpod/pre_start.sh scripts/create_runpod_template.sh
+          uv run python -m json.tool deploy/runpod-template.example.json >/dev/null
+          uv run python -m json.tool deploy/runpod-agentic-template.example.json >/dev/null
+
+      - name: Run backend tests
+        run: uv run pytest -q
+
+  frontend:
+    name: Frontend · Node 24
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.6.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Test durable browser-job recovery
+        run: npm test
+
+      - name: Type-check and build production assets
+        run: npm run build

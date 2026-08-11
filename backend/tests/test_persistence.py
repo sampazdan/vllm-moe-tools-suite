@@ -1,8 +1,15 @@
+import asyncio
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
-from moe_tools_suite.domain import JobKind, JobRecord, JobStatus
-from moe_tools_suite.lab import MODEL_ID
+from moe_tools_suite.domain import (
+    CreateModelSessionRequest,
+    JobKind,
+    JobRecord,
+    JobStatus,
+)
+from moe_tools_suite.lab import MODEL_ID, ResearchLab
 from moe_tools_suite.main import create_app
 from moe_tools_suite.persistence import ModelSessionRow, SqliteStore
 from moe_tools_suite.settings import Settings
@@ -22,9 +29,9 @@ def test_completed_run_and_routing_survive_application_restart(
     load_job = first_client.post(
         "/api/model-sessions", json={"model_id": MODEL_ID}
     ).json()
-    assert first_client.get(f"/api/jobs/{load_job['id']}").json()[
-        "status"
-    ] == "completed"
+    assert (
+        first_client.get(f"/api/jobs/{load_job['id']}").json()["status"] == "completed"
+    )
     run_job = first_client.post(
         "/api/runs",
         json={"benchmark_id": "fixture-arithmetic", "item_ids": ["arith-03"]},
@@ -62,17 +69,15 @@ def test_completed_run_and_routing_survive_application_restart(
             "profile_id": saved_profile["id"],
         },
     ).json()
-    completed_masked_load = first_client.get(
-        f"/api/jobs/{masked_load['id']}"
-    ).json()
+    completed_masked_load = first_client.get(f"/api/jobs/{masked_load['id']}").json()
     assert completed_masked_load["status"] == "completed"
     masked_job = first_client.post(
         "/api/runs",
         json={"benchmark_id": "fixture-arithmetic", "item_ids": ["arith-03"]},
     ).json()
-    masked_run_id = first_client.get(
-        f"/api/jobs/{masked_job['id']}"
-    ).json()["result_id"]
+    masked_run_id = first_client.get(f"/api/jobs/{masked_job['id']}").json()[
+        "result_id"
+    ]
     comparison = first_client.post(
         "/api/comparisons",
         json={
@@ -97,16 +102,12 @@ def test_completed_run_and_routing_survive_application_restart(
     assert {job["status"] for job in restored_jobs} == {"completed"}
     assert second_client.get("/api/profiles").json()[0]["id"] == saved_profile["id"]
     assert second_client.get("/api/comparisons").json()[0]["id"] == comparison["id"]
-    masked_detail = second_client.get(
-        f"/api/runs/{masked_run_id}/detail"
-    ).json()
+    masked_detail = second_client.get(f"/api/runs/{masked_run_id}/detail").json()
     assert masked_detail["saved_profile"]["id"] == saved_profile["id"]
     with second_app.state.lab.store.sessions() as database:
         row = database.get(ModelSessionRow, created["model_session_id"])
         assert row.state == "stopped"
-        masked_row = database.get(
-            ModelSessionRow, completed_masked_load["result_id"]
-        )
+        masked_row = database.get(ModelSessionRow, completed_masked_load["result_id"])
         assert masked_row.state == "failed"
         journal_mode = database.execute(text("PRAGMA journal_mode")).scalar_one()
         assert journal_mode == "delete"
@@ -136,3 +137,116 @@ def test_interrupted_job_is_failed_closed_after_restart(tmp_path: Path) -> None:
     recovered = client.get("/api/jobs/interrupted-job").json()
     assert recovered["status"] == "failed"
     assert recovered["error"] == "application restarted before the job completed"
+
+
+def test_interrupted_model_load_keeps_job_and_session_linked_after_restart(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        mode="mock",
+        data_dir=tmp_path / "data",
+        frontend_dist=tmp_path / "frontend",
+    )
+    initial = ResearchLab(settings)
+    submitted = initial.submit_model_session(
+        CreateModelSessionRequest(model_id=MODEL_ID)
+    )
+    assert submitted.result_id is not None
+    assert initial.current_model_session().state == "starting"
+
+    restarted = ResearchLab(settings)
+
+    recovered_job = restarted.get_job(submitted.id)
+    recovered_session = restarted.model_sessions[submitted.result_id]
+    assert recovered_job.status == "failed"
+    assert recovered_job.result_id == recovered_session.id
+    assert recovered_session.state == "failed"
+    assert recovered_job.completed_at is not None
+    assert "linked model session was marked failed" in (recovered_job.error or "")
+    assert restarted.active_job() is None
+    assert restarted.current_model_session() is None
+
+
+@pytest.mark.asyncio
+async def test_lab_startup_recovers_an_interrupted_managed_process(
+    tmp_path: Path,
+) -> None:
+    lab = ResearchLab(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "frontend",
+        )
+    )
+
+    class RecoveryProbe:
+        recovered = False
+
+        async def recover_interrupted_process(self) -> None:
+            self.recovered = True
+
+    probe = RecoveryProbe()
+    lab.server = probe  # type: ignore[assignment]
+
+    await lab.startup()
+
+    assert probe.recovered
+
+
+@pytest.mark.asyncio
+async def test_running_model_load_remains_observable_and_retry_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    lab = ResearchLab(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "frontend",
+        )
+    )
+
+    class BlockingServer:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def start(self, **kwargs) -> None:
+            del kwargs
+            self.started.set()
+            await self.release.wait()
+
+        async def stop(self) -> None:
+            return None
+
+    server = BlockingServer()
+    lab.server = server  # type: ignore[assignment]
+    request = CreateModelSessionRequest(model_id=MODEL_ID)
+    submitted = lab.submit_model_session(request)
+    response_waiter = asyncio.create_task(lab.dispatch_job(submitted.id))
+    await asyncio.wait_for(server.started.wait(), timeout=1)
+
+    response_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await response_waiter
+
+    active = lab.active_job()
+    current = lab.current_model_session()
+    retried = lab.submit_model_session(request)
+    await lab.execute_job(retried.id)
+
+    assert active is not None
+    assert active.id == submitted.id
+    assert active.status == "running"
+    assert current is not None
+    assert current.id == submitted.result_id
+    assert current.state == "starting"
+    assert retried.id == submitted.id
+    assert len(lab.jobs) == 1
+    assert len(lab.model_sessions) == 1
+
+    server.release.set()
+    await asyncio.wait_for(lab.dispatch_job(retried.id), timeout=1)
+
+    assert lab.get_job(submitted.id).status == "completed"
+    assert lab.active_job() is None
+    assert lab.current_model_session().state == "ready"

@@ -1,9 +1,129 @@
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from moe_tools_suite.agentic.domain import CreateAgentRunRequest
+from moe_tools_suite.domain import CreateModelSessionRequest
+from moe_tools_suite.lab import MODEL_ID
 from moe_tools_suite.main import create_app
 from moe_tools_suite.settings import Settings
+
+
+def test_lost_model_load_response_can_be_discovered_and_retried(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
+    )
+    lab = app.state.lab
+    submitted = lab.submit_model_session(CreateModelSessionRequest(model_id=MODEL_ID))
+    client = TestClient(app)
+
+    active = client.get("/api/jobs/active")
+    assert active.status_code == 200
+    assert active.json() == submitted.model_dump(mode="json")
+    current = client.get("/api/model-sessions/current").json()
+    assert current["id"] == submitted.result_id
+    assert current["state"] == "starting"
+
+    retried = client.post("/api/model-sessions", json={"model_id": MODEL_ID})
+
+    assert retried.status_code == 202
+    assert retried.json()["id"] == submitted.id
+    assert len(client.get("/api/jobs").json()) == 1
+    assert len(client.get("/api/model-sessions").json()) == 1
+    assert client.get(f"/api/jobs/{submitted.id}").json()["status"] == "completed"
+    assert client.get("/api/jobs/active").json() is None
+    assert client.get("/api/model-sessions/current").json()["state"] == "ready"
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/model-sessions", {"model_id": MODEL_ID}),
+        ("/api/benchmarks/fixture-arithmetic/prepare", None),
+        (
+            "/api/runs",
+            {"benchmark_id": "fixture-arithmetic", "item_ids": ["arith-03"]},
+        ),
+        (
+            "/api/agent-runs",
+            {
+                "task_pack_id": "pack",
+                "task_ids": ["task"],
+                "model_session_id": "session",
+            },
+        ),
+    ],
+)
+def test_active_job_conflict_points_to_the_recoverable_job(
+    tmp_path: Path,
+    path: str,
+    payload: dict[str, object] | None,
+) -> None:
+    app = create_app(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
+    )
+    lab = app.state.lab
+    active = lab.submit_prepare_benchmark("fixture-arithmetic")
+    client = TestClient(app)
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "active_job_conflict",
+        "message": f"dataset_prepare job {active.id} is already queued",
+        "active_job": active.model_dump(mode="json"),
+        "recovery_url": f"/api/jobs/{active.id}",
+    }
+    assert client.get("/api/jobs/active").json()["id"] == active.id
+    assert client.post(f"/api/jobs/{active.id}/cancel").json()["status"] == (
+        "cancelled"
+    )
+    assert client.get("/api/jobs/active").json() is None
+
+
+def test_queued_agent_job_is_globally_visible_and_blocks_model_loading(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
+    )
+    client = TestClient(app)
+    load = client.post("/api/model-sessions", json={"model_id": MODEL_ID}).json()
+    assert client.get(f"/api/jobs/{load['id']}").json()["status"] == "completed"
+    session_id = client.get("/api/model-sessions/current").json()["id"]
+    queued_agent = app.state.lab.submit_agent_run(
+        CreateAgentRunRequest(
+            task_pack_id="smoke-python-v1",
+            task_ids=["fix-subtract"],
+            model_session_id=session_id,
+        )
+    )
+
+    active = client.get("/api/jobs/active")
+    conflict = client.post("/api/model-sessions", json={"model_id": MODEL_ID})
+
+    assert active.status_code == 200
+    assert active.json()["id"] == queued_agent.id
+    assert active.json()["kind"] == "agent_run"
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "active_job_conflict"
+    assert conflict.json()["detail"]["active_job"]["id"] == queued_agent.id
 
 
 def test_custom_benchmark_import_browse_and_ungraded_scoring(
@@ -201,7 +321,6 @@ def test_mock_vertical_slice_creates_profile_and_masked_run(tmp_path: Path) -> N
         "/api/model-sessions",
         json={
             "model_id": model["id"],
-            "profile": proposed["profile"],
             "profile_id": saved_profile["id"],
         },
     )

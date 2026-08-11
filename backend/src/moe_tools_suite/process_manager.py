@@ -100,6 +100,9 @@ class ManagedVllmServer:
         self._write_pid_file(self._process.pid, session_id)
         try:
             await self._wait_until_ready()
+        except asyncio.CancelledError:
+            await asyncio.shield(self.stop())
+            raise
         except Exception as error:
             failure = self._failure_context(error)
             await self.stop()
@@ -108,15 +111,11 @@ class ManagedVllmServer:
     async def stop(self) -> None:
         process = self._process
         if process is not None:
-            if process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(
-                        process.wait(), timeout=self.shutdown_timeout_seconds
-                    )
-                except TimeoutError:
-                    process.kill()
-                    await process.wait()
+            process_group_id = self._validated_process_group_id(process.pid)
+            await self._terminate_process_group(
+                process_group_id,
+                process=process,
+            )
             self._remove_pid_file()
         self._process = None
         self.started_at = None
@@ -127,6 +126,10 @@ class ManagedVllmServer:
         await self._stop_recorded_process()
         if self._owns_client:
             await self._client.aclose()
+
+    async def recover_interrupted_process(self) -> None:
+        """Stop a validated vLLM process left behind by an interrupted app."""
+        await self._stop_recorded_process()
 
     def read_log_tail(self, max_bytes: int = 12_000) -> str:
         if self.log_path is None or not self.log_path.is_file():
@@ -218,21 +221,74 @@ class ManagedVllmServer:
                 f"refusing to signal unexpected process recorded as vLLM PID {pid}"
             )
 
+        process_group_id = self._validated_process_group_id(pid)
+        await self._terminate_process_group(process_group_id)
+        self._remove_pid_file()
+
+    async def _terminate_process_group(
+        self,
+        process_group_id: int,
+        *,
+        process: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        leader_wait = (
+            asyncio.create_task(process.wait()) if process is not None else None
+        )
         try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            self._remove_pid_file()
-            return
+            try:
+                os.killpg(process_group_id, signal.SIGTERM)
+            except ProcessLookupError:
+                if leader_wait is not None:
+                    await leader_wait
+                return
+            if not await self._wait_for_process_group_exit(process_group_id):
+                with suppress(ProcessLookupError):
+                    os.killpg(process_group_id, signal.SIGKILL)
+                if not await self._wait_for_process_group_exit(process_group_id):
+                    raise RuntimeError(
+                        f"vLLM process group {process_group_id} did not exit"
+                    )
+            if leader_wait is not None:
+                await asyncio.wait_for(
+                    leader_wait,
+                    timeout=self.shutdown_timeout_seconds,
+                )
+        finally:
+            if leader_wait is not None and not leader_wait.done():
+                leader_wait.cancel()
+                with suppress(asyncio.CancelledError):
+                    await leader_wait
+
+    async def _wait_for_process_group_exit(self, process_group_id: int) -> bool:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.shutdown_timeout_seconds
         while loop.time() < deadline:
-            if self._read_process_identity(pid) != identity:
-                self._remove_pid_file()
-                return
+            if not self._process_group_exists(process_group_id):
+                return True
             await asyncio.sleep(0.1)
-        with suppress(ProcessLookupError):
-            os.killpg(pid, signal.SIGKILL)
-        self._remove_pid_file()
+        return not self._process_group_exists(process_group_id)
+
+    @staticmethod
+    def _process_group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    @staticmethod
+    def _validated_process_group_id(pid: int) -> int:
+        if pid <= 1 or pid in {os.getpid(), os.getpgrp()}:
+            raise RuntimeError(f"refusing unsafe vLLM process group {pid}")
+        try:
+            process_group_id = os.getpgid(pid)
+        except ProcessLookupError:
+            return pid
+        if process_group_id != pid:
+            raise RuntimeError(f"refusing vLLM PID {pid} outside its own process group")
+        return pid
 
     def _remove_pid_file(self) -> None:
         (self.runtime_dir / "vllm.pid").unlink(missing_ok=True)

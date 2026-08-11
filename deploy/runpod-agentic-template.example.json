@@ -12,7 +12,7 @@
     "MOE_TOOLS_MODE": "vllm",
     "MOE_TOOLS_REQUIRE_AUTH": "1"
   },
-  "imageName": "ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.1",
+  "imageName": "ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.3",
   "isPublic": false,
   "isServerless": false,
   "name": "moe-tools-agentic-a3b",

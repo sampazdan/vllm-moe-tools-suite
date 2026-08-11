@@ -661,7 +661,7 @@ wheels = [
 
 [[package]]
 name = "moe-tools-test-suite"
-version = "0.2.0rc1"
+version = "0.2.0rc3"
 source = { editable = "." }
 dependencies = [
     { name = "daytona" },

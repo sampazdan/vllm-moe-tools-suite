@@ -17,6 +17,7 @@ from .domain import (
     BenchmarkRun,
     ComparisonRecord,
     ExpertProfile,
+    JobKind,
     JobRecord,
     JobStatus,
     ModelSession,
@@ -301,6 +302,90 @@ class SqliteStore:
                     profile_link.profile_id = model_session.profile_id
             elif profile_link is not None:
                 database.delete(profile_link)
+
+    def save_model_load_submission(
+        self,
+        model_session: ModelSession,
+        job: JobRecord,
+        payload: dict[str, object],
+    ) -> None:
+        """Persist a planned model session and its job atomically."""
+        now = datetime.now(UTC)
+        with self.sessions.begin() as database:
+            database.add(
+                ModelSessionRow(
+                    id=model_session.id,
+                    model_id=model_session.model_id,
+                    state=model_session.state.value,
+                    mode=model_session.mode,
+                    profile_json=(
+                        model_session.profile.model_dump_json()
+                        if model_session.profile is not None
+                        else None
+                    ),
+                    created_at=model_session.created_at,
+                    updated_at=now,
+                )
+            )
+            if model_session.profile_id is not None:
+                database.add(
+                    ModelSessionProfileRow(
+                        model_session_id=model_session.id,
+                        profile_id=model_session.profile_id,
+                    )
+                )
+            database.add(
+                JobRow(
+                    id=job.id,
+                    kind=job.kind.value,
+                    status=job.status.value,
+                    progress_current=job.progress_current,
+                    progress_total=job.progress_total,
+                    payload_json=json.dumps(payload, separators=(",", ":")),
+                    result_id=job.result_id,
+                    error=job.error,
+                    created_at=job.created_at,
+                    started_at=job.started_at,
+                    completed_at=job.completed_at,
+                )
+            )
+
+    def reconcile_interrupted_state(self) -> tuple[int, int]:
+        """Fail active sessions and jobs in one restart transaction."""
+        session_states = {
+            ModelState.STARTING.value,
+            ModelState.READY.value,
+            ModelState.STOPPING.value,
+        }
+        job_states = {
+            JobStatus.QUEUED.value,
+            JobStatus.RUNNING.value,
+            JobStatus.CANCELLING.value,
+        }
+        now = datetime.now(UTC)
+        reconciled_sessions = 0
+        reconciled_jobs = 0
+        with self.sessions.begin() as database:
+            session_rows = database.query(ModelSessionRow).filter(
+                ModelSessionRow.state.in_(session_states)
+            )
+            for row in session_rows:
+                row.state = ModelState.FAILED.value
+                row.updated_at = now
+                reconciled_sessions += 1
+            job_rows = database.query(JobRow).filter(JobRow.status.in_(job_states))
+            for row in job_rows:
+                row.status = JobStatus.FAILED.value
+                if row.kind == JobKind.MODEL_LOAD.value and row.result_id is not None:
+                    row.error = (
+                        "application restarted during model loading; the linked "
+                        "model session was marked failed and the request can be retried"
+                    )
+                else:
+                    row.error = "application restarted before the job completed"
+                row.completed_at = now
+                reconciled_jobs += 1
+        return reconciled_sessions, reconciled_jobs
 
     def reconcile_interrupted_sessions(self) -> int:
         active_states = {

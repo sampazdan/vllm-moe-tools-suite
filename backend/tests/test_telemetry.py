@@ -27,9 +27,7 @@ def test_decodes_fork_wire_format_and_aggregates_pairs(
         dtype=np.float32,
     )
 
-    decoded = decode_routing_payloads(
-        encode_npy(ids), encode_npy(weights), topology
-    )
+    decoded = decode_routing_payloads(encode_npy(ids), encode_npy(weights), topology)
     aggregate = aggregate_routing(decoded, topology)
 
     assert aggregate.selection_counts.tolist() == [[1, 2, 1, 0], [1, 0, 2, 1]]
@@ -53,4 +51,22 @@ def test_rejects_expert_ids_outside_topology(topology: ModelTopology) -> None:
     weights = np.ones((1, 2, 2), dtype=np.float32)
 
     with pytest.raises(ValueError, match="outside"):
+        decode_routing_payloads(encode_npy(ids), encode_npy(weights), topology)
+
+
+def test_rejects_duplicate_experts_within_one_routing_decision(
+    topology: ModelTopology,
+) -> None:
+    ids = np.array([[[0, 0], [1, 2]]], dtype=np.uint8)
+    weights = np.full(ids.shape, 0.5, dtype=np.float32)
+
+    with pytest.raises(ValueError, match="unique"):
+        decode_routing_payloads(encode_npy(ids), encode_npy(weights), topology)
+
+
+def test_rejects_negative_routing_mass(topology: ModelTopology) -> None:
+    ids = np.array([[[0, 1], [2, 3]]], dtype=np.uint8)
+    weights = np.array([[[-0.1, 1.1], [0.5, 0.5]]], dtype=np.float32)
+
+    with pytest.raises(ValueError, match="non-negative"):
         decode_routing_payloads(encode_npy(ids), encode_npy(weights), topology)

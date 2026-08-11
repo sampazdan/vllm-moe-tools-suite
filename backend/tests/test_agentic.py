@@ -5,6 +5,7 @@ import hashlib
 import os
 import subprocess
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
@@ -22,6 +23,7 @@ from moe_tools_suite.agentic.domain import (
     SandboxSession,
     SandboxSessionState,
     SandboxSpec,
+    TerminationCause,
 )
 from moe_tools_suite.agentic.providers.base import ownership_labels
 from moe_tools_suite.agentic.providers.daytona import (
@@ -630,6 +632,69 @@ class _LifecycleDaytonaClient:
         self.closed = True
 
 
+class _FailedWorkspaceDaytonaProcess(_DaytonaProcess):
+    async def exec(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout: int,
+    ) -> SimpleNamespace:
+        assert timeout > 0
+        self.commands.append((command, cwd, env))
+        return SimpleNamespace(exit_code=1, result="workspace setup failed")
+
+
+class _CreateCleanupDaytonaClient:
+    def __init__(self, *, recovery_succeeds: bool) -> None:
+        self.recovery_succeeds = recovery_succeeds
+        self.sandbox: _LifecycleDaytonaSandbox | None = None
+        self.deleted = False
+        self.delete_calls = 0
+        self.list_queries: list[dict[str, object] | None] = []
+        self.closed = False
+
+    async def create(
+        self, params: dict[str, object], *, timeout: float
+    ) -> _LifecycleDaytonaSandbox:
+        assert timeout > 0
+        self.sandbox = _LifecycleDaytonaSandbox(
+            "daytona-create-failure", dict(params["labels"])
+        )
+        self.sandbox.process = _FailedWorkspaceDaytonaProcess()
+        return self.sandbox
+
+    def list(
+        self, query: dict[str, object] | None = None
+    ) -> AsyncIterator[_LifecycleDaytonaSandbox]:
+        self.list_queries.append(query)
+
+        async def iterate() -> AsyncIterator[_LifecycleDaytonaSandbox]:
+            if query is not None and self.sandbox is not None and not self.deleted:
+                yield self.sandbox
+
+        return iterate()
+
+    async def get(self, sandbox_id: str) -> _LifecycleDaytonaSandbox:
+        if self.deleted or self.sandbox is None or sandbox_id != self.sandbox.id:
+            raise _DaytonaNotFound
+        return self.sandbox
+
+    async def delete(
+        self, sandbox: _LifecycleDaytonaSandbox, *, timeout: float
+    ) -> None:
+        assert self.sandbox is sandbox
+        assert timeout > 0
+        self.delete_calls += 1
+        if self.delete_calls == 1 or not self.recovery_succeeds:
+            raise ConnectionError("simulated delete failure")
+        self.deleted = True
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 class _RecoveryDaytonaClient:
     def __init__(self, sandboxes: list[_LifecycleDaytonaSandbox]) -> None:
         self.sandboxes = {sandbox.id: sandbox for sandbox in sandboxes}
@@ -798,6 +863,78 @@ async def test_daytona_provider_remote_lifecycle_is_private_bounded_and_deleted(
         await provider.delete(handle)
     finally:
         await provider.aclose()
+
+    assert sdk_client.closed is True
+
+
+@pytest.mark.parametrize(
+    ("recovery_succeeds", "expected_state", "expected_termination"),
+    [
+        (True, SandboxSessionState.DELETED, TerminationCause.SANDBOX_ERROR),
+        (False, SandboxSessionState.CLEANUP_PENDING, TerminationCause.CLEANUP_ERROR),
+    ],
+)
+def test_failed_daytona_create_uses_label_scoped_cleanup(
+    tmp_path: Path,
+    recovery_succeeds: bool,
+    expected_state: SandboxSessionState,
+    expected_termination: TerminationCause,
+) -> None:
+    sdk_client = _CreateCleanupDaytonaClient(recovery_succeeds=recovery_succeeds)
+    provider = DaytonaSandboxProvider(
+        DaytonaProviderConfig(api_key="configured-test-key", target="us"),
+        client_factory=lambda config: sdk_client,
+    )
+    app = create_app(_settings(tmp_path, daytona_api_key="configured-test-key"))
+    app.state.lab.agentic.providers["daytona"] = provider
+
+    with TestClient(app) as client:
+        session = _load_model(client)
+        preflight = client.post("/api/sandbox-providers/daytona/preflight")
+        assert preflight.status_code == 200
+        assert preflight.json()["status"] == "ready"
+        response = client.post(
+            "/api/agent-runs",
+            json={
+                "task_pack_id": PACK_ID,
+                "task_ids": [TASK_IDS[0]],
+                "agent_id": "bash-json-v1",
+                "sandbox_provider_id": "daytona",
+                "model_session_id": session["id"],
+            },
+        )
+        assert response.status_code == 202
+        run_id = response.json()["result_id"]
+        trial = next(
+            item
+            for item in app.state.lab.agentic.trials.values()
+            if item.run_id == run_id
+        )
+        assert trial.sandbox_session_id is not None
+        sandbox = app.state.lab.agentic.sandboxes[trial.sandbox_session_id]
+
+        assert sandbox.external_id is None
+        assert sandbox.state is expected_state
+        assert trial.termination_cause is expected_termination
+        persisted = app.state.lab.store.load_sandbox_sessions()[sandbox.id]
+        assert persisted.state is expected_state
+        assert persisted.cleanup_error == sandbox.cleanup_error
+
+        recovery_query = next(
+            query for query in reversed(sdk_client.list_queries) if query is not None
+        )
+        assert recovery_query == {
+            "labels": ownership_labels(sandbox.ownership, "daytona"),
+            "limit": 10,
+        }
+        assert sdk_client.delete_calls == 2
+        assert sdk_client.deleted is recovery_succeeds
+        if recovery_succeeds:
+            assert sandbox.deleted_at is not None
+            assert sandbox.cleanup_error is None
+        else:
+            assert sandbox.deleted_at is None
+            assert sandbox.cleanup_error == "The Daytona API could not be reached."
 
     assert sdk_client.closed is True
 

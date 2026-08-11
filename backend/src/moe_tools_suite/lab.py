@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -77,6 +78,17 @@ class JobArtifacts:
     payload: dict[str, object]
 
 
+class ActiveJobConflict(RuntimeError):
+    """A submission conflicts with the process-wide active job."""
+
+    def __init__(self, active_job: JobRecord) -> None:
+        self.active_job = active_job.model_copy(deep=True)
+        super().__init__(
+            f"{active_job.kind.value} job {active_job.id} is already "
+            f"{active_job.status.value}"
+        )
+
+
 class ResearchLab:
     """Application service for the first model-to-profile vertical slice."""
 
@@ -102,8 +114,7 @@ class ResearchLab:
         ]
         self.session: ModelSession | None = None
         self.store = SqliteStore(settings.data_dir)
-        self.store.reconcile_interrupted_sessions()
-        self.store.reconcile_interrupted_jobs()
+        self.store.reconcile_interrupted_state()
         self.datasets = self.store.load_benchmark_datasets()
         self.benchmark_catalog = BenchmarkCatalog(
             settings.data_dir,
@@ -128,6 +139,7 @@ class ResearchLab:
         self.profiles = self.store.load_expert_profiles()
         self.comparisons = self.store.load_comparisons()
         self._job_guard = Lock()
+        self._job_tasks: dict[str, asyncio.Task[None]] = {}
         self.runtime: ModelRuntime = self._create_runtime()
         self.server = self._create_server()
         self.agentic = AgenticController(
@@ -164,6 +176,8 @@ class ResearchLab:
         return self.benchmark_catalog.list_benchmarks()
 
     async def startup(self) -> None:
+        if self.server is not None:
+            await self.server.recover_interrupted_process()
         await self.agentic.cleanup_interrupted_sandboxes()
 
     def list_benchmark_items(
@@ -192,9 +206,12 @@ class ResearchLab:
         return record
 
     async def create_model_session(
-        self, request: CreateModelSessionRequest
+        self,
+        request: CreateModelSessionRequest,
+        *,
+        session_id: str | None = None,
     ) -> ModelSession:
-        self._validate_model_session_request(request)
+        request = self._resolve_model_session_request(request)
         previous_session = self.session
         if previous_session is not None:
             previous_session.state = ModelState.STOPPING
@@ -214,15 +231,30 @@ class ResearchLab:
             if request.profile is not None
             else None
         )
-        self.session = ModelSession(
-            id=str(uuid4()),
-            model_id=request.model_id,
-            state=ModelState.STARTING,
-            mode=self.settings.mode,
-            profile=request.profile,
-            profile_id=request.profile_id
-            or (matched_profile.id if matched_profile is not None else None),
+        profile_id = request.profile_id or (
+            matched_profile.id if matched_profile is not None else None
         )
+        planned_session = (
+            self.model_sessions.get(session_id) if session_id is not None else None
+        )
+        if planned_session is not None:
+            if (
+                planned_session.model_id != request.model_id
+                or planned_session.profile != request.profile
+                or planned_session.profile_id != profile_id
+            ):
+                raise RuntimeError("model-load job does not match its planned session")
+            planned_session.state = ModelState.STARTING
+            self.session = planned_session
+        else:
+            self.session = ModelSession(
+                id=session_id or str(uuid4()),
+                model_id=request.model_id,
+                state=ModelState.STARTING,
+                mode=self.settings.mode,
+                profile=request.profile,
+                profile_id=profile_id,
+            )
         self.model_sessions[self.session.id] = self.session
         self.store.save_model_session(self.session)
         try:
@@ -241,23 +273,40 @@ class ResearchLab:
 
     def list_model_sessions(self) -> list[ModelSession]:
         return sorted(
-            self.model_sessions.values(),
+            (
+                model_session.model_copy(deep=True)
+                for model_session in self.model_sessions.values()
+            ),
             key=lambda model_session: model_session.created_at,
             reverse=True,
         )
 
+    def current_model_session(self) -> ModelSession | None:
+        with self._job_guard:
+            active = self._active_job_artifacts_unlocked()
+            if (
+                active is not None
+                and active.record.kind is JobKind.MODEL_LOAD
+                and active.record.result_id is not None
+            ):
+                planned = self.model_sessions.get(active.record.result_id)
+                if planned is not None:
+                    return planned.model_copy(deep=True)
+            return self.session.model_copy(deep=True) if self.session else None
+
     def runtime_status(self) -> RuntimeStatus:
+        current_session = self.current_model_session()
         if self.server is None:
             return RuntimeStatus(
                 managed=False,
                 model_id=MODEL_ID,
-                session_id=self.session.id if self.session else None,
+                session_id=current_session.id if current_session else None,
             )
         return RuntimeStatus(
             managed=True,
             model_id=MODEL_ID,
             pid=self.server.pid,
-            session_id=self.session.id if self.session else None,
+            session_id=current_session.id if current_session else None,
             started_at=self.server.started_at,
             log_path=str(self.server.log_path) if self.server.log_path else None,
             profile_path=(
@@ -267,14 +316,46 @@ class ResearchLab:
         )
 
     def submit_model_session(self, request: CreateModelSessionRequest) -> JobRecord:
-        self._validate_model_session_request(request)
-        return self._queue_job(
-            kind=JobKind.MODEL_LOAD,
-            payload=request.model_dump(mode="json"),
-            progress_total=1,
-        )
+        request = self._resolve_model_session_request(request)
+        payload = request.model_dump(mode="json")
+        with self._job_guard:
+            active = self._active_job_artifacts_unlocked()
+            if active is not None:
+                if (
+                    active.record.kind is JobKind.MODEL_LOAD
+                    and active.payload == payload
+                ):
+                    return active.record.model_copy(deep=True)
+                raise ActiveJobConflict(active.record)
+
+            matched_profile = (
+                self._find_saved_profile(request.model_id, request.profile)
+                if request.profile is not None
+                else None
+            )
+            model_session = ModelSession(
+                id=str(uuid4()),
+                model_id=request.model_id,
+                state=ModelState.STARTING,
+                mode=self.settings.mode,
+                profile=request.profile,
+                profile_id=request.profile_id
+                or (matched_profile.id if matched_profile is not None else None),
+            )
+            job = JobRecord(
+                id=str(uuid4()),
+                kind=JobKind.MODEL_LOAD,
+                status=JobStatus.QUEUED,
+                progress_total=1,
+                result_id=model_session.id,
+            )
+            self.store.save_model_load_submission(model_session, job, payload)
+            self.model_sessions[model_session.id] = model_session
+            self.jobs[job.id] = JobArtifacts(record=job, payload=payload)
+            return job.model_copy(deep=True)
 
     def submit_benchmark(self, request: RunRequest) -> JobRecord:
+        self._ensure_no_active_job()
         adapter, selected, generation = self._select_benchmark_items(request)
         cohort = self._create_cohort(adapter, selected, generation)
         normalized_request = request.model_copy(update={"generation": generation})
@@ -288,6 +369,7 @@ class ResearchLab:
         )
 
     def submit_prepare_benchmark(self, benchmark_id: str) -> JobRecord:
+        self._ensure_no_active_job()
         self.benchmark_catalog.get_info(benchmark_id)
         return self._queue_job(
             kind=JobKind.DATASET_PREPARE,
@@ -296,6 +378,7 @@ class ResearchLab:
         )
 
     def submit_agent_run(self, request: CreateAgentRunRequest) -> JobRecord:
+        self._ensure_no_active_job()
         model_session = self.model_sessions.get(request.model_session_id)
         self.agentic.validate_run_request(request, model_session)
         run_id = str(uuid4())
@@ -331,7 +414,10 @@ class ResearchLab:
                 model_request = CreateModelSessionRequest.model_validate(
                     artifacts.payload
                 )
-                result = await self.create_model_session(model_request)
+                result = await self.create_model_session(
+                    model_request,
+                    session_id=job.result_id,
+                )
                 self._update_job_progress(job_id, 1, 1)
             elif job.kind is JobKind.BENCHMARK_RUN:
                 run_request = RunRequest.model_validate(artifacts.payload["request"])
@@ -362,6 +448,19 @@ class ResearchLab:
                     ),
                     should_cancel=lambda: self._job_cancelled(job_id),
                 )
+        except asyncio.CancelledError:
+            with self._job_guard:
+                if job.status in {
+                    JobStatus.QUEUED,
+                    JobStatus.RUNNING,
+                    JobStatus.CANCELLING,
+                }:
+                    job.status = JobStatus.FAILED
+                    job.error = "job execution was interrupted during shutdown"
+                    job.completed_at = datetime.now(UTC)
+                    self._fail_planned_model_session_unlocked(job)
+                    self.store.save_job(job, artifacts.payload)
+            raise
         except Exception as error:
             with self._job_guard:
                 if job.status is JobStatus.CANCELLED:
@@ -370,6 +469,7 @@ class ResearchLab:
                 job.status = JobStatus.FAILED
                 job.error = str(error) or error.__class__.__name__
                 job.completed_at = datetime.now(UTC)
+                self._fail_planned_model_session_unlocked(job)
                 self.store.save_job(job, artifacts.payload)
             return
 
@@ -385,12 +485,51 @@ class ResearchLab:
             job.completed_at = datetime.now(UTC)
             self.store.save_job(job, artifacts.payload)
 
+    def start_job(self, job_id: str) -> asyncio.Task[None]:
+        """Start and track a persisted job before its API response is sent."""
+        loop = asyncio.get_running_loop()
+        with self._job_guard:
+            task = self._job_tasks.get(job_id)
+            if task is None or task.done():
+                task = loop.create_task(
+                    self.execute_job(job_id),
+                    name=f"moe-tools-job-{job_id}",
+                )
+                self._job_tasks[job_id] = task
+                task.add_done_callback(
+                    lambda completed, tracked_id=job_id: self._discard_job_task(
+                        tracked_id,
+                        completed,
+                    )
+                )
+            return task
+
+    async def dispatch_job(self, job_id: str) -> None:
+        """Wait for tracked execution without propagating waiter cancellation."""
+        task = self.start_job(job_id)
+        await asyncio.shield(task)
+
     def list_jobs(self) -> list[JobRecord]:
         return sorted(
-            (artifacts.record for artifacts in self.jobs.values()),
+            (
+                artifacts.record.model_copy(deep=True)
+                for artifacts in self.jobs.values()
+            ),
             key=lambda job: job.created_at,
             reverse=True,
         )
+
+    def active_job(self) -> JobRecord | None:
+        with self._job_guard:
+            active = self._active_job_artifacts_unlocked()
+            return active.record.model_copy(deep=True) if active else None
+
+    def get_job(self, job_id: str) -> JobRecord:
+        with self._job_guard:
+            artifacts = self.jobs.get(job_id)
+            if artifacts is None:
+                raise KeyError(job_id)
+            return artifacts.record.model_copy(deep=True)
 
     def cancel_job(self, job_id: str) -> JobRecord:
         with self._job_guard:
@@ -414,6 +553,12 @@ class ResearchLab:
             return job.model_copy(deep=True)
 
     async def shutdown(self) -> None:
+        with self._job_guard:
+            active_job_tasks = list(self._job_tasks.values())
+        for task in active_job_tasks:
+            task.cancel()
+        if active_job_tasks:
+            await asyncio.gather(*active_job_tasks, return_exceptions=True)
         if self.session is not None and self.session.state is ModelState.READY:
             self.session.state = ModelState.STOPPING
             self.store.save_model_session(self.session)
@@ -429,23 +574,26 @@ class ResearchLab:
             self.session.state = ModelState.STOPPED
             self.store.save_model_session(self.session)
 
-    def _validate_model_session_request(
+    def _resolve_model_session_request(
         self, request: CreateModelSessionRequest
-    ) -> None:
+    ) -> CreateModelSessionRequest:
         if request.model_id != MODEL_ID:
             raise ValueError(f"unsupported model {request.model_id!r}")
-        if request.profile is not None:
-            validation = validate_profile(request.profile, self.topology)
-            if not validation.valid:
-                raise ValueError("; ".join(validation.errors))
+        profile = request.profile
         if request.profile_id is not None:
             saved_profile = self.profiles.get(request.profile_id)
             if saved_profile is None:
                 raise ValueError("profile_id does not reference a saved profile")
             if saved_profile.model_id != request.model_id:
                 raise ValueError("saved profile belongs to a different model")
-            if saved_profile.profile != request.profile:
+            if profile is not None and saved_profile.profile != profile:
                 raise ValueError("profile does not match saved profile_id")
+            profile = saved_profile.profile.model_copy(deep=True)
+        if profile is not None:
+            validation = validate_profile(profile, self.topology)
+            if not validation.valid:
+                raise ValueError("; ".join(validation.errors))
+        return request.model_copy(update={"profile": profile})
 
     async def run_benchmark(
         self,
@@ -643,13 +791,9 @@ class ResearchLab:
         result_id: str | None = None,
     ) -> JobRecord:
         with self._job_guard:
-            active = any(
-                artifacts.record.status
-                in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CANCELLING}
-                for artifacts in self.jobs.values()
-            )
-            if active:
-                raise RuntimeError("another job is already active")
+            active = self._active_job_artifacts_unlocked()
+            if active is not None:
+                raise ActiveJobConflict(active.record)
             job = JobRecord(
                 id=job_id or str(uuid4()),
                 kind=kind,
@@ -660,6 +804,43 @@ class ResearchLab:
             self.jobs[job.id] = JobArtifacts(record=job, payload=payload)
             self.store.save_job(job, payload)
             return job.model_copy(deep=True)
+
+    def _ensure_no_active_job(self) -> None:
+        with self._job_guard:
+            active = self._active_job_artifacts_unlocked()
+            if active is not None:
+                raise ActiveJobConflict(active.record)
+
+    def _active_job_artifacts_unlocked(self) -> JobArtifacts | None:
+        active = [
+            artifacts
+            for artifacts in self.jobs.values()
+            if artifacts.record.status
+            in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CANCELLING}
+        ]
+        return max(
+            active,
+            key=lambda artifacts: artifacts.record.created_at,
+            default=None,
+        )
+
+    def _fail_planned_model_session_unlocked(self, job: JobRecord) -> None:
+        if job.kind is not JobKind.MODEL_LOAD or job.result_id is None:
+            return
+        model_session = self.model_sessions.get(job.result_id)
+        if model_session is None or model_session.state is not ModelState.STARTING:
+            return
+        model_session.state = ModelState.FAILED
+        self.store.save_model_session(model_session)
+
+    def _discard_job_task(
+        self,
+        job_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        with self._job_guard:
+            if self._job_tasks.get(job_id) is task:
+                self._job_tasks.pop(job_id, None)
 
     def _update_job_progress(self, job_id: str, current: int, total: int) -> None:
         with self._job_guard:

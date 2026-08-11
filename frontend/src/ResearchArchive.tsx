@@ -1,5 +1,11 @@
 import { useMemo, useRef, useState } from "react";
 
+import {
+  expertsForLayer,
+  fullExpertIds,
+  materializeProfileForEditor,
+  profileMeetsTopKFloor,
+} from "./profileEditor";
 import type {
   AgentRun,
   BenchmarkRun,
@@ -52,6 +58,7 @@ export function ResearchArchive({
   const [editingProfile, setEditingProfile] =
     useState<SavedExpertProfile | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [profileNotice, setProfileNotice] = useState<string | null>(null);
   const importInput = useRef<HTMLInputElement>(null);
   const sessionById = useMemo(
     () => new Map(sessions.map((session) => [session.id, session])),
@@ -67,7 +74,8 @@ export function ResearchArchive({
     return runs.find((run) => {
       const session = sessionById.get(run.model_session_id);
       return (
-        !session?.profile &&
+        run.id !== candidate.id &&
+        session?.profile === null &&
         run.status === "completed" &&
         candidate.status === "completed" &&
         run.benchmark_id === candidate.benchmark_id &&
@@ -92,6 +100,7 @@ export function ResearchArchive({
       });
       setEditingProfile(imported);
       setTab("profiles");
+      setProfileNotice(`Imported “${imported.name}”. Review it before loading.`);
     } catch (error) {
       setImportError(error instanceof Error ? error.message : "Import failed");
     } finally {
@@ -148,6 +157,11 @@ export function ResearchArchive({
       </div>
 
       {importError && <div className="archive-error">{importError}</div>}
+      {profileNotice && tab === "profiles" && (
+        <div className="archive-success" role="status">
+          {profileNotice}
+        </div>
+      )}
 
       {tab === "runs" && (
         <div className="archive-grid">
@@ -267,7 +281,13 @@ export function ResearchArchive({
                 >
                   {activeProfileId === profile.id ? "Loaded" : "Load profile"}
                 </button>
-                <button className="text-button" onClick={() => setEditingProfile(profile)}>
+                <button
+                  className="text-button"
+                  onClick={() => {
+                    setProfileNotice(null);
+                    setEditingProfile(profile);
+                  }}
+                >
                   Revise
                 </button>
                 <a href={`/api/profiles/${profile.id}/export`} download>
@@ -289,7 +309,10 @@ export function ResearchArchive({
           onCancel={() => setEditingProfile(null)}
           onSave={async (request) => {
             const saved = await onCreateProfile(request);
-            setEditingProfile(saved);
+            setEditingProfile(null);
+            setProfileNotice(
+              `Saved “${saved.name}” as a new immutable profile revision.`,
+            );
           }}
         />
       )}
@@ -359,17 +382,25 @@ function ProfileEditor({
   onSave: (request: CreateExpertProfileRequest) => Promise<void>;
 }) {
   const [draft, setDraft] = useState<ExpertProfile>(() =>
-    structuredClone(profile.profile),
+    materializeProfileForEditor(
+      profile.profile,
+      topology.routed_layer_ids,
+      topology.num_experts,
+    ),
   );
   const [selectedLayer, setSelectedLayer] = useState(topology.routed_layer_ids[0]);
   const [name, setName] = useState(`${profile.name} · revision`);
   const [description, setDescription] = useState(profile.description);
   const [error, setError] = useState<string | null>(null);
-  const keep = draft.layers[String(selectedLayer)]?.keep ?? [];
+  const [saving, setSaving] = useState(false);
+  const keep = expertsForLayer(draft, selectedLayer, topology.num_experts);
   const keepSet = new Set(keep);
   const layerValid = keep.length >= topology.top_k;
-  const allLayersValid = topology.routed_layer_ids.every(
-    (layerId) => (draft.layers[String(layerId)]?.keep.length ?? 0) >= topology.top_k,
+  const allLayersValid = profileMeetsTopKFloor(
+    draft,
+    topology.routed_layer_ids,
+    topology.num_experts,
+    topology.top_k,
   );
 
   function replaceLayer(nextKeep: number[]) {
@@ -392,6 +423,7 @@ function ProfileEditor({
 
   async function saveRevision() {
     setError(null);
+    setSaving(true);
     try {
       await onSave({
         name,
@@ -403,6 +435,7 @@ function ProfileEditor({
       });
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "Save failed");
+      setSaving(false);
     }
   }
 
@@ -446,12 +479,23 @@ function ProfileEditor({
         <span>
           <strong>{keep.length}</strong> / {topology.num_experts} eligible
         </span>
-        <button className="text-button" onClick={() => replaceLayer([...Array(topology.num_experts).keys()])}>
+        <button
+          className="text-button"
+          onClick={() => replaceLayer(fullExpertIds(topology.num_experts))}
+        >
           Select all
         </button>
         <button
           className="text-button"
-          onClick={() => replaceLayer(profile.profile.layers[String(selectedLayer)].keep)}
+          onClick={() =>
+            replaceLayer(
+              expertsForLayer(
+                profile.profile,
+                selectedLayer,
+                topology.num_experts,
+              ),
+            )
+          }
         >
           Revert layer
         </button>
@@ -461,7 +505,9 @@ function ProfileEditor({
           onClick={() => {
             const position = topology.routed_layer_ids.indexOf(selectedLayer);
             const previous = topology.routed_layer_ids[position - 1];
-            replaceLayer(draft.layers[String(previous)].keep);
+            replaceLayer(
+              expertsForLayer(draft, previous, topology.num_experts),
+            );
           }}
         >
           Copy previous layer
@@ -469,7 +515,7 @@ function ProfileEditor({
       </div>
 
       <div className="expert-picker" aria-label={`Experts for layer ${selectedLayer}`}>
-        {[...Array(topology.num_experts).keys()].map((expertId) => (
+        {fullExpertIds(topology.num_experts).map((expertId) => (
           <button
             key={expertId}
             aria-pressed={keepSet.has(expertId)}
@@ -490,10 +536,10 @@ function ProfileEditor({
         {error && <span className="archive-error">{error}</span>}
         <button
           className="primary-button"
-          disabled={busy || !name.trim() || !allLayersValid}
+          disabled={busy || saving || !name.trim() || !allLayersValid}
           onClick={() => void saveRevision()}
         >
-          Save new revision
+          {saving ? "Saving revision…" : "Save new revision"}
         </button>
       </footer>
     </div>

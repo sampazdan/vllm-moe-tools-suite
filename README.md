@@ -10,7 +10,10 @@ deterministic mock of `Qwen/Qwen3.6-35B-A3B-FP8`, including its 40 routed layers
 The second is a native, model-centered coding controller with remote-sandbox and
 trajectory boundaries. Both slices use persisted background jobs, immutable run
 contracts, per-inference routing artifacts, named profile revisions, and restart-safe
-research records. The target RTX PRO 6000 model lifecycle and the live Daytona
+research records. Browser polling survives transient proxy failures and reloads by
+rediscovering the one durable server job; model-load submissions are persisted with
+their planned session before execution, and identical retries rejoin the same work.
+The target RTX PRO 6000 model lifecycle and the live Daytona
 sandbox lifecycle are **not verified yet**; those are the paid acceptance gates
 below, not claims made by the local test suite.
 
@@ -42,6 +45,13 @@ expert IDs and weights to the corresponding trajectory step. The controller pers
 run, trial, sandbox, verifier, trajectory, inference, routing, and artifact records;
 the workbench shows trial progress, the complete trajectory, verifier output,
 artifacts, and a trial routing heatmap.
+
+For extending multi-turn chats, the gateway uses returned prompt/generated token IDs
+and the local tokenizer to calculate an exact common prefix. The fork omits only that
+already-recorded prompt routing on the next turn. Prefix state is isolated per trial
+and falls back to capturing the full prompt whenever token metadata or template
+alignment is ambiguous, so earlier turns are neither double-counted nor silently
+shared across trials.
 
 Trajectories are exported as `ATIF-v1.7`, following Harbor's
 [Agent Trajectory Interchange Format RFC](https://github.com/harbor-framework/harbor/blob/main/rfcs/0001-trajectory-format.md)
@@ -170,8 +180,23 @@ with the output of `openssl rand -base64 32`, and leave
 ```bash
 uv run pytest
 uv run ruff check backend
+npm --prefix frontend test
 npm --prefix frontend run build
 ```
+
+The public-API release canary exercises the complete baseline-to-mask loop against a
+running appliance. It uses two explicit fixture items by default and never touches
+Daytona unless `--daytona` is supplied:
+
+```bash
+MOE_TOOLS_CANARY_BASE_URL=http://127.0.0.1:8080 \
+uv run python scripts/acceptance_canary.py
+```
+
+For a protected deployment, set `MOE_TOOLS_CANARY_TOKEN` in the environment. The
+opt-in `--daytona` extension performs a read-only provider preflight followed by one
+bounded `fix-subtract` trial, and requires both routed inference telemetry and a
+confirmed `deleted` sandbox state before it passes.
 
 ## Runpod image
 
@@ -184,7 +209,7 @@ docker buildx build \
   --build-context vllm_source=../vllm-moe-tools \
   --file docker/Dockerfile.runpod \
   --build-arg VLLM_SOURCE_REF="$(git -C ../vllm-moe-tools rev-parse HEAD)" \
-  --tag YOUR_REGISTRY/moe-tools-test-suite:0.2.0-rc.1 \
+  --tag YOUR_REGISTRY/moe-tools-test-suite:0.2.0-rc.3 \
   .
 ```
 
@@ -197,17 +222,17 @@ pinned commit recorded in the workflow and uses GitHub's repository-scoped token
 no long-lived registry password is required.
 
 Publish either by running **Publish Runpod container** from the GitHub Actions tab
-with an explicit version such as `0.2.0-rc.1`, or by pushing a semantic tag:
+with an explicit version such as `0.2.0-rc.3`, or by pushing a semantic tag:
 
 ```bash
-git tag v0.2.0-rc.1
-git push origin v0.2.0-rc.1
+git tag v0.2.0-rc.3
+git push origin v0.2.0-rc.3
 ```
 
 The versioned image and a commit-addressed image are both produced:
 
 ```text
-ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.1
+ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.3
 ghcr.io/sampazdan/vllm-moe-tools-suite:sha-<full-application-commit>
 ```
 
@@ -240,7 +265,7 @@ PRO 6000 for the managed-vLLM checkpoint.
 
    ```bash
    export RUNPOD_API_KEY="..."
-   export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.1"
+   export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.3"
    ./scripts/create_runpod_template.sh
    ```
 
@@ -269,7 +294,7 @@ versioned image with the managed runtime enabled:
 
 ```bash
 export RUNPOD_API_KEY="..."
-export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.1"
+export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.3"
 export MOE_TOOLS_TEMPLATE_MODE="vllm"
 export MOE_TOOLS_TEMPLATE_NAME="moe-tools-test-suite-a3b"
 ./scripts/create_runpod_template.sh
@@ -308,7 +333,7 @@ SHA tag/digest):
 
 ```bash
 export RUNPOD_API_KEY="..."
-export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.1"
+export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite:0.2.0-rc.3"
 export MOE_TOOLS_TEMPLATE_MODE="agentic"
 export MOE_TOOLS_TEMPLATE_NAME="moe-tools-agentic-a3b"
 ./scripts/create_runpod_template.sh

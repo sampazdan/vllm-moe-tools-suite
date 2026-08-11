@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 
-import { api } from "./api";
+import { activeJobFromConflict, api } from "./api";
 import { ExpertHeatmap } from "./ExpertHeatmap";
 import { TrajectoryViewer } from "./TrajectoryViewer";
 import type {
@@ -36,6 +36,7 @@ interface AgenticWorkbenchProps {
   requestedRunId: string | null;
   onRequestedRunOpened: () => void;
   onActivityChange: (active: boolean) => void;
+  onJobConflict: (job: JobRecord) => void;
 }
 
 export function AgenticWorkbench({
@@ -46,6 +47,7 @@ export function AgenticWorkbench({
   requestedRunId,
   onRequestedRunOpened,
   onActivityChange,
+  onJobConflict,
 }: AgenticWorkbenchProps) {
   const queryClient = useQueryClient();
   const [selectedPackId, setSelectedPackId] = useState("");
@@ -57,6 +59,7 @@ export function AgenticWorkbench({
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [selectedTrialId, setSelectedTrialId] = useState<string | null>(null);
   const [preflight, setPreflight] = useState<ProviderPreflight | null>(null);
+  const [runNotice, setRunNotice] = useState<string | null>(null);
 
   const agentsQuery = useQuery({
     queryKey: ["agents"],
@@ -254,19 +257,44 @@ export function AgenticWorkbench({
 
   const startRun = useMutation({
     mutationFn: async (request: CreateAgentRunRequest) => {
-      const job = await api<JobRecord>("/api/agent-runs", {
-        method: "POST",
-        body: JSON.stringify(request),
-      });
+      let job: JobRecord;
+      try {
+        job = await api<JobRecord>("/api/agent-runs", {
+          method: "POST",
+          body: JSON.stringify(request),
+        });
+      } catch (error) {
+        const serverJob = activeJobFromConflict(error);
+        if (!serverJob) throw error;
+        if (serverJob.kind === "agent_run" && serverJob.result_id) {
+          setActiveRunId(serverJob.result_id);
+          setSelectedTrialId(null);
+          setRunNotice("Rejoined the coding run already active on the server.");
+          void queryClient.invalidateQueries({ queryKey: ["agent-runs"] });
+        } else {
+          onJobConflict(serverJob);
+        }
+        return null;
+      }
       if (!job.result_id) throw new Error("Agent job has no run ID");
       return job;
     },
+    onMutate: () => setRunNotice(null),
     onSuccess: (job) => {
+      if (!job) return;
       setActiveRunId(job.result_id);
       setSelectedTrialId(null);
       void queryClient.invalidateQueries({ queryKey: ["agent-runs"] });
     },
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: ["active-job"] });
+      void queryClient.invalidateQueries({ queryKey: ["agent-runs"] });
+    },
   });
+
+  useEffect(() => {
+    if (activeRunId && startRun.isError) startRun.reset();
+  }, [activeRunId, startRun.isError]);
 
   const cancelRun = useMutation({
     mutationFn: (runId: string) =>
@@ -330,6 +358,11 @@ export function AgenticWorkbench({
       {setupError && (
         <div className="agentic-error" role="alert">
           {(setupError as Error).message}
+        </div>
+      )}
+      {runNotice && (
+        <div className="job-recovery-note" role="status">
+          <span>{runNotice}</span>
         </div>
       )}
 
@@ -441,7 +474,7 @@ export function AgenticWorkbench({
           {preflight?.error && (
             <p className="provider-guidance error">{preflight.error.message}</p>
           )}
-          {selectedProvider && (
+          {selectedProvider && selectedProvider.id !== "fake" && (
             <button
               className="text-button provider-test-button"
               disabled={

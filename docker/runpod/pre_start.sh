@@ -28,9 +28,39 @@ mkdir -p \
 ln -sfn /opt/vllm-src /workspace/vllm-src
 ln -sfn "${app_root}" /workspace/moe-tools-test-suite
 
-if [[ -f "${pid_file}" ]] && kill -0 "$(<"${pid_file}")" 2>/dev/null; then
-    echo "MoE Tools Test Suite is already running."
-    exit 0
+if [[ -f "${pid_file}" ]]; then
+    existing_pid="$(<"${pid_file}")"
+    if [[ "${existing_pid}" =~ ^[0-9]+$ ]] && kill -0 "${existing_pid}" 2>/dev/null; then
+        if curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null; then
+            echo "MoE Tools Test Suite is already running."
+            exit 0
+        fi
+
+        existing_command=""
+        if [[ -r "/proc/${existing_pid}/cmdline" ]]; then
+            existing_command="$(tr '\0' ' ' <"/proc/${existing_pid}/cmdline")"
+        fi
+        if [[ "${existing_command}" == *"moe_tools_suite.main:app"* ]]; then
+            echo "Stopping an unhealthy prior application process (PID ${existing_pid})."
+            kill -TERM -- "-${existing_pid}" 2>/dev/null \
+                || kill -TERM "${existing_pid}" 2>/dev/null \
+                || true
+            for _ in {1..50}; do
+                if ! kill -0 "${existing_pid}" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.1
+            done
+            if kill -0 "${existing_pid}" 2>/dev/null; then
+                kill -KILL -- "-${existing_pid}" 2>/dev/null \
+                    || kill -KILL "${existing_pid}" 2>/dev/null \
+                    || true
+            fi
+        else
+            echo "Ignoring a stale application PID file reused by another process."
+        fi
+    fi
+    rm -f "${pid_file}"
 fi
 
 export MOE_TOOLS_DATA_DIR="${data_root}"

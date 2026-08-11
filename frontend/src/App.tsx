@@ -2,9 +2,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AgenticWorkbench } from "./AgenticWorkbench";
-import { api, setCsrfToken, waitForJob } from "./api";
+import { activeJobFromConflict, api, setCsrfToken } from "./api";
 import { ExpertHeatmap } from "./ExpertHeatmap";
 import { ResearchArchive } from "./ResearchArchive";
+import { useDurableJob } from "./useDurableJob";
 import type {
   AgentRun,
   BenchmarkDatasetRecord,
@@ -44,8 +45,8 @@ export default function App() {
   const [proposal, setProposal] = useState<ProfileProposal | null>(null);
   const [keepPerLayer, setKeepPerLayer] = useState(64);
   const [profileName, setProfileName] = useState("Workload profile · 64/layer");
-  const [activeJob, setActiveJob] = useState<JobRecord | null>(null);
   const [agentRunActive, setAgentRunActive] = useState(false);
+  const [jobAdoptionNotice, setJobAdoptionNotice] = useState<string | null>(null);
   const [requestedAgentRunId, setRequestedAgentRunId] = useState<string | null>(
     null,
   );
@@ -58,6 +59,11 @@ export default function App() {
     staleTime: 30_000,
   });
   const accessReady = sessionQuery.data?.authenticated === true;
+  const durableJob = useDurableJob({
+    enabled: accessReady,
+    onRecovered: refreshRecoveredJob,
+  });
+  const activeJob = durableJob.activeJob;
 
   const statusQuery = useQuery({
     queryKey: ["status"],
@@ -162,20 +168,21 @@ export default function App() {
 
   const loadModel = useMutation({
     mutationFn: async () => {
-      const job = await api<JobRecord>("/api/model-sessions", {
+      const job = await submitServerJob("/api/model-sessions", {
         method: "POST",
         body: JSON.stringify({ model_id: modelId }),
       });
-      await waitForJob(job, setActiveJob);
+      if (!job) return null;
+      await durableJob.watchJob(job);
       return api<ModelSession>("/api/model-sessions/current");
     },
     onSuccess: (modelSession) => {
+      if (!modelSession) return;
       queryClient.setQueryData(["model-session-current"], modelSession);
-      queryClient.invalidateQueries({ queryKey: ["status"] });
-      queryClient.invalidateQueries({ queryKey: ["runtime-status"] });
-      queryClient.invalidateQueries({ queryKey: ["model-sessions"] });
+      setMaskedRun(null);
+      if (baselineRun) setRoutingVariant("baseline");
+      void refreshModelQueries();
     },
-    onSettled: () => setActiveJob(null),
   });
 
   const login = useMutation({
@@ -192,17 +199,17 @@ export default function App() {
 
   const prepareBenchmark = useMutation({
     mutationFn: async () => {
-      const submitted = await api<JobRecord>(
+      const submitted = await submitServerJob(
         `/api/benchmarks/${encodeURIComponent(selectedBenchmarkId)}/prepare`,
         { method: "POST" },
       );
-      return waitForJob(submitted, setActiveJob);
+      if (!submitted) return null;
+      return durableJob.watchJob(submitted);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["benchmarks"] });
       queryClient.invalidateQueries({ queryKey: ["benchmark-items"] });
     },
-    onSettled: () => setActiveJob(null),
   });
 
   const importCustomBenchmark = useMutation({
@@ -239,30 +246,30 @@ export default function App() {
   const cancelActiveJob = useMutation({
     mutationFn: (jobId: string) =>
       api<JobRecord>(`/api/jobs/${jobId}/cancel`, { method: "POST" }),
-    onSuccess: (job) => setActiveJob(job),
   });
 
   const runBaseline = useMutation({
     mutationFn: async () => {
-      const submitted = await api<JobRecord>("/api/runs", {
+      const submitted = await submitServerJob("/api/runs", {
         method: "POST",
         body: JSON.stringify({
           benchmark_id: selectedBenchmarkId,
           item_ids: [...selectedItems],
         }),
       });
-      const job = await waitForJob(submitted, setActiveJob);
+      if (!submitted) return null;
+      const job = await durableJob.watchJob(submitted);
       if (!job.result_id) throw new Error("Benchmark job has no result");
       return api<BenchmarkRun>(`/api/runs/${job.result_id}`);
     },
     onSuccess: (nextRun) => {
+      if (!nextRun) return;
       setBaselineRun(nextRun);
       setMaskedRun(null);
       setRoutingVariant("baseline");
       setProposal(null);
       queryClient.invalidateQueries({ queryKey: ["runs"] });
     },
-    onSettled: () => setActiveJob(null),
   });
 
   const proposeProfile = useMutation({
@@ -287,14 +294,18 @@ export default function App() {
         method: "POST",
         body: JSON.stringify(request),
       }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["profiles"] });
+    onSuccess: (savedProfile) => {
+      queryClient.setQueryData<SavedExpertProfile[]>(["profiles"], (current) => [
+        savedProfile,
+        ...(current ?? []).filter((profile) => profile.id !== savedProfile.id),
+      ]);
+      void queryClient.invalidateQueries({ queryKey: ["profiles"] });
     },
   });
 
   const loadProfile = useMutation({
     mutationFn: async (savedProfile: SavedExpertProfile) => {
-      const job = await api<JobRecord>("/api/model-sessions", {
+      const job = await submitServerJob("/api/model-sessions", {
         method: "POST",
         body: JSON.stringify({
           model_id: savedProfile.model_id,
@@ -302,16 +313,17 @@ export default function App() {
           profile_id: savedProfile.id,
         }),
       });
-      await waitForJob(job, setActiveJob);
+      if (!job) return null;
+      await durableJob.watchJob(job);
       return api<ModelSession>("/api/model-sessions/current");
     },
     onSuccess: (modelSession) => {
+      if (!modelSession) return;
       queryClient.setQueryData(["model-session-current"], modelSession);
-      queryClient.invalidateQueries({ queryKey: ["status"] });
-      queryClient.invalidateQueries({ queryKey: ["runtime-status"] });
-      queryClient.invalidateQueries({ queryKey: ["model-sessions"] });
+      setMaskedRun(null);
+      if (baselineRun) setRoutingVariant("baseline");
+      void refreshModelQueries();
     },
-    onSettled: () => setActiveJob(null),
   });
 
   const createComparison = useMutation({
@@ -326,37 +338,53 @@ export default function App() {
           candidate_run_id: candidate.id,
         }),
       }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["comparisons"] });
+    onSuccess: (comparison) => {
+      queryClient.setQueryData<ComparisonRecord[]>(["comparisons"], (current) => [
+        comparison,
+        ...(current ?? []).filter((saved) => saved.id !== comparison.id),
+      ]);
+      void queryClient.invalidateQueries({ queryKey: ["comparisons"] });
+    },
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: ["comparisons"] });
     },
   });
 
   const runMasked = useMutation({
     mutationFn: async () => {
       if (!baselineRun) throw new Error("Run a baseline cohort first");
-      const submitted = await api<JobRecord>("/api/runs", {
+      if (!currentModelQuery.data?.profile) {
+        throw new Error("Load an expert profile first");
+      }
+      const submitted = await submitServerJob("/api/runs", {
         method: "POST",
         body: JSON.stringify({
           benchmark_id: baselineRun.benchmark_id,
           item_ids: baselineRun.items.map((item) => item.item_id),
         }),
       });
-      const job = await waitForJob(submitted, setActiveJob);
+      if (!submitted) return null;
+      const job = await durableJob.watchJob(submitted);
       if (!job.result_id) throw new Error("Benchmark job has no result");
       return api<BenchmarkRun>(`/api/runs/${job.result_id}`);
     },
     onSuccess: (nextRun) => {
+      if (!nextRun) return;
       setMaskedRun(nextRun);
       setRoutingVariant("masked");
       queryClient.invalidateQueries({ queryKey: ["runs"] });
       if (
         baselineRun?.status === "completed" &&
-        nextRun.status === "completed"
+        nextRun.status === "completed" &&
+        !comparisonsQuery.data?.some(
+          (comparison) =>
+            comparison.baseline_run_id === baselineRun.id &&
+            comparison.candidate_run_id === nextRun.id,
+        )
       ) {
         createComparison.mutate({ baseline: baselineRun, candidate: nextRun });
       }
     },
-    onSettled: () => setActiveJob(null),
   });
 
   const model = modelsQuery.data?.[0];
@@ -383,6 +411,9 @@ export default function App() {
         )?.id ?? null
       : null
   );
+  const activeSavedProfile = activeProfileId
+    ? profiles.find((profile) => profile.id === activeProfileId) ?? null
+    : null;
   const profileMatchesProposal = Boolean(
     proposal &&
       currentProfile &&
@@ -427,6 +458,13 @@ export default function App() {
     baselineRun?.score != null && maskedRun?.score != null
       ? maskedRun.score - baselineRun.score
       : null;
+  const savedComparison = baselineRun && maskedRun
+    ? comparisonsQuery.data?.find(
+        (comparison) =>
+          comparison.baseline_run_id === baselineRun.id &&
+          comparison.candidate_run_id === maskedRun.id,
+      ) ?? null
+    : null;
   const workBusy = Boolean(activeJob) || agentRunActive;
 
   if (sessionQuery.isPending) {
@@ -477,6 +515,90 @@ export default function App() {
     });
   }
 
+  function changeProfileMetric(nextMetric: typeof metric) {
+    setMetric(nextMetric);
+    setProposal(null);
+    createProfile.reset();
+  }
+
+  function changeKeepPerLayer(nextValue: number) {
+    setKeepPerLayer(nextValue);
+    setProposal(null);
+    createProfile.reset();
+  }
+
+  async function submitServerJob(path: string, init: RequestInit) {
+    setJobAdoptionNotice(null);
+    try {
+      return await api<JobRecord>(path, init);
+    } catch (error) {
+      const serverJob = activeJobFromConflict(error);
+      if (!serverJob) throw error;
+      durableJob.adoptJob(serverJob);
+      setJobAdoptionNotice(
+        `Another ${jobKindLabel(serverJob.kind)} was already running. Rejoined it instead.`,
+      );
+      return null;
+    }
+  }
+
+  async function refreshModelQueries() {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["status"] }),
+      queryClient.invalidateQueries({ queryKey: ["runtime-status"] }),
+      queryClient.invalidateQueries({ queryKey: ["model-session-current"] }),
+      queryClient.invalidateQueries({ queryKey: ["model-sessions"] }),
+    ]);
+  }
+
+  async function refreshRecoveredJob(job: JobRecord) {
+    setJobAdoptionNotice(null);
+    if (job.kind === "model_load") {
+      await refreshModelQueries();
+      return;
+    }
+    if (job.kind === "dataset_prepare") {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["benchmarks"] }),
+        queryClient.invalidateQueries({ queryKey: ["benchmark-items"] }),
+      ]);
+      return;
+    }
+    if (job.kind === "agent_run") {
+      await queryClient.invalidateQueries({ queryKey: ["agent-runs"] });
+      return;
+    }
+
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["runs"] }),
+      queryClient.invalidateQueries({ queryKey: ["comparisons"] }),
+      queryClient.invalidateQueries({ queryKey: ["model-sessions"] }),
+    ]);
+    if (!job.result_id) return;
+    const [recoveredRun, nextRuns, nextSessions] = await Promise.all([
+      api<BenchmarkRun>(`/api/runs/${job.result_id}`),
+      api<BenchmarkRun[]>("/api/runs"),
+      api<ModelSession[]>("/api/model-sessions"),
+    ]);
+    queryClient.setQueryData(["runs"], nextRuns);
+    queryClient.setQueryData(["model-sessions"], nextSessions);
+    const recoveredSession = nextSessions.find(
+      (session) => session.id === recoveredRun.model_session_id,
+    );
+    if (recoveredSession?.profile) {
+      setMaskedRun(recoveredRun);
+      setBaselineRun(
+        findCompatibleBaseline(recoveredRun, nextRuns, nextSessions) ?? null,
+      );
+      setRoutingVariant("masked");
+    } else {
+      setBaselineRun(recoveredRun);
+      setMaskedRun(null);
+      setRoutingVariant("baseline");
+    }
+    setProposal(null);
+  }
+
   return (
     <div className="shell">
       <aside className="rail">
@@ -501,7 +623,12 @@ export default function App() {
             ◷<span>Archive</span>
           </a>
         </nav>
-        <span className="version">v{statusQuery.data?.version ?? "0.1"}</span>
+        <span
+          className="version"
+          title={`Backend ${statusQuery.data?.version ?? "version unavailable"}`}
+        >
+          v{__APP_VERSION__}
+        </span>
       </aside>
 
       <main>
@@ -527,6 +654,27 @@ export default function App() {
 
         {error && <div className="error-banner">{(error as Error).message}</div>}
 
+        {jobAdoptionNotice && (
+          <div className="job-recovery-note" role="status">
+            <span>{jobAdoptionNotice}</span>
+          </div>
+        )}
+
+        {(durableJob.discoveryError || durableJob.recoveryError) && (
+          <div className="job-recovery-error" role="alert">
+            <span>
+              {durableJob.recoveryError
+                ? `Background work needs attention: ${durableJob.recoveryError}`
+                : `Could not check for background work: ${durableJob.discoveryError}`}
+            </span>
+            {(activeJob || durableJob.discoveryError) && (
+              <button className="text-button" onClick={durableJob.retryRecovery}>
+                Check again
+              </button>
+            )}
+          </div>
+        )}
+
         {activeJob && (
           <div className="job-banner" role="status" aria-live="polite">
             <div>
@@ -535,7 +683,9 @@ export default function App() {
                   ? "Model job"
                   : activeJob.kind === "dataset_prepare"
                     ? "Dataset job"
-                    : "Benchmark job"}
+                    : activeJob.kind === "agent_run"
+                      ? "Coding job"
+                      : "Benchmark job"}
               </span>
               <strong>
                 {activeJob.status === "queued"
@@ -551,10 +701,11 @@ export default function App() {
               max={Math.max(activeJob.progress_total, 1)}
               value={activeJob.progress_current}
             />
-            <span>
-              {formatProgress(activeJob)}
+            <span className={durableJob.connectionIssue ? "job-connection-issue" : ""}>
+              {durableJob.connectionIssue ?? formatProgress(activeJob)}
             </span>
             {activeJob.kind !== "model_load" &&
+              activeJob.kind !== "agent_run" &&
               (activeJob.status === "queued" || activeJob.status === "running") && (
                 <button
                   className="text-button"
@@ -770,6 +921,12 @@ export default function App() {
           requestedRunId={requestedAgentRunId}
           onRequestedRunOpened={() => setRequestedAgentRunId(null)}
           onActivityChange={setAgentRunActive}
+          onJobConflict={(job) => {
+            durableJob.adoptJob(job);
+            setJobAdoptionNotice(
+              `Another ${jobKindLabel(job.kind)} was already running. Rejoined it instead.`,
+            );
+          }}
         />
 
         {routingRun && (
@@ -837,134 +994,204 @@ export default function App() {
                   </div>
                 )}
                 <div className="segmented-control" aria-label="Heatmap metric">
-                  <button
-                    className={metric === "routing_mass" ? "selected" : ""}
-                    onClick={() => setMetric("routing_mass")}
-                  >Mass</button>
-                  <button
-                    className={metric === "selection_counts" ? "selected" : ""}
-                    onClick={() => setMetric("selection_counts")}
-                  >Count</button>
+                    <button
+                      className={metric === "routing_mass" ? "selected" : ""}
+                      aria-pressed={metric === "routing_mass"}
+                      disabled={proposeProfile.isPending}
+                      onClick={() => changeProfileMetric("routing_mass")}
+                    >Mass</button>
+                    <button
+                      className={metric === "selection_counts" ? "selected" : ""}
+                      aria-pressed={metric === "selection_counts"}
+                      disabled={proposeProfile.isPending}
+                      onClick={() => changeProfileMetric("selection_counts")}
+                    >Count</button>
                 </div>
               </div>
             </div>
             <div className="heatmap-frame">
               <ExpertHeatmap summary={routingQuery.data} metric={metric} />
             </div>
-            <div className="profile-workbench">
-              <div>
-                <span className="section-label">Profile proposal</span>
-                <h3>Keep {keepPerLayer} experts per layer</h3>
-                <p>
-                  Rank experts from the baseline capture by observed {metric === "routing_mass" ? "routing mass" : "selection count"},
-                  while preserving the router’s top-k floor.
-                </p>
-              </div>
-              <div className="range-field">
-                <input
-                  type="range"
-                  min={model?.topology.top_k ?? 8}
-                  max={model?.topology.num_experts ?? 256}
-                  step="8"
-                  value={keepPerLayer}
-                  onChange={(event) => setKeepPerLayer(Number(event.target.value))}
-                />
-                <div><span>More selective</span><span>More coverage</span></div>
-              </div>
-              <button
-                className="primary-button"
-                disabled={proposeProfile.isPending}
-                onClick={() => proposeProfile.mutate()}
-              >
-                {proposeProfile.isPending ? "Calculating…" : "Create proposal"}
-              </button>
-            </div>
-            {proposal && (
-              <div className="proposal-result">
+            {baselineRun && currentProfile && (
+              <div className="active-profile-workflow">
                 <div>
-                  <span className="proposal-value">
-                    {Math.round(proposal.observed_mass_retained * 1000) / 10}%
-                  </span>
-                  <span>observed routing mass retained</span>
+                  <span className="section-label">Loaded profile</span>
+                  <h3>{activeSavedProfile?.name ?? "Expert eligibility mask"}</h3>
+                  <p>
+                    Run the exact {baselineRun.total_items}-item baseline cohort
+                    through the profile currently loaded in the runtime.
+                  </p>
                 </div>
-                <div>
-                  <span className="proposal-value">
-                    {Math.round(proposal.validation.retained_fraction * 100)}%
+                <div className="active-profile-facts">
+                  <span>
+                    <strong>{baselineRun.completed_items}</strong>
+                    baseline items
                   </span>
-                  <span>experts eligible</span>
+                  <span>
+                    <strong>
+                      {activeSavedProfile?.profile_fingerprint.slice(0, 10) ??
+                        currentModelQuery.data?.profile_id?.slice(0, 10) ?? "custom"}
+                    </strong>
+                    profile
+                  </span>
                 </div>
-                <div className="profile-activation">
-                  <span className={`validation-state ${proposal.validation.valid ? "valid" : "invalid"}`}>
-                    {proposal.validation.valid
-                      ? "Fork-compatible profile"
-                      : proposal.validation.errors.join(", ")}
-                  </span>
-                  {!savedProposal ? (
-                    <div className="profile-save-row">
-                      <input
-                        aria-label="Expert profile name"
-                        value={profileName}
-                        onChange={(event) => setProfileName(event.target.value)}
-                      />
-                      <button
-                        className="primary-button"
-                        disabled={
-                          !proposal.validation.valid ||
-                          !profileName.trim() ||
-                          createProfile.isPending
-                        }
-                        onClick={() =>
-                          createProfile.mutate({
-                            name: profileName,
-                            description: `Fixed-budget ${metric === "routing_mass" ? "routing mass" : "selection count"} proposal from ${baselineRun?.id ?? "baseline"}.`,
-                            model_id: modelId,
-                            profile: proposal.profile,
-                            source: "proposal",
-                            source_run_id: baselineRun?.id,
-                            metric:
-                              metric === "selection_counts"
-                                ? "selection_count"
-                                : metric,
-                            observed_mass_retained:
-                              proposal.observed_mass_retained,
-                          })
-                        }
-                      >
-                        {createProfile.isPending ? "Saving…" : "Save profile"}
-                      </button>
-                    </div>
-                  ) : profileMatchesProposal ? (
-                    <button
-                      className="primary-button"
-                      disabled={
-                        baselineRun?.status !== "completed" ||
-                        runMasked.isPending ||
-                        workBusy
-                      }
-                      onClick={() => runMasked.mutate()}
-                    >
-                      {runMasked.isPending
-                        ? "Running paired cohort…"
-                        : maskedRun
-                          ? "Rerun masked cohort"
-                          : "Run masked cohort"}
-                    </button>
-                  ) : (
-                    <button
-                      className="primary-button"
-                      disabled={
-                        !proposal.validation.valid ||
-                        loadProfile.isPending ||
-                        workBusy
-                      }
-                      onClick={() => loadProfile.mutate(savedProposal)}
-                    >
-                      {loadProfile.isPending
-                        ? "Restarting with profile…"
-                        : "Load this profile"}
-                    </button>
+                <div className="active-profile-action">
+                  <button
+                    className="primary-button"
+                    disabled={
+                      baselineRun.status !== "completed" ||
+                      runMasked.isPending ||
+                      workBusy
+                    }
+                    onClick={() => runMasked.mutate()}
+                  >
+                    {runMasked.isPending
+                      ? "Running paired cohort…"
+                      : maskedRun
+                        ? "Rerun paired cohort"
+                        : "Run paired cohort"}
+                  </button>
+                  {baselineRun.status !== "completed" && (
+                    <small>A completed baseline is required for comparison.</small>
                   )}
                 </div>
+              </div>
+            )}
+
+            {routingVariant === "baseline" && baselineRun ? (
+              <>
+                <div className="profile-workbench">
+                  <div>
+                    <span className="section-label">Profile proposal</span>
+                    <h3>Keep {keepPerLayer} experts per layer</h3>
+                    <p>
+                      Rank experts from this baseline capture by observed {metric === "routing_mass" ? "routing mass" : "selection count"},
+                      while preserving the router’s top-k floor.
+                    </p>
+                  </div>
+                  <div className="range-field">
+                    <input
+                      aria-label="Experts to keep per routed layer"
+                      type="range"
+                      min={model?.topology.top_k ?? 8}
+                      max={model?.topology.num_experts ?? 256}
+                      step="8"
+                      value={keepPerLayer}
+                      disabled={proposeProfile.isPending}
+                      onChange={(event) =>
+                        changeKeepPerLayer(Number(event.target.value))
+                      }
+                    />
+                    <div><span>More selective</span><span>More coverage</span></div>
+                  </div>
+                  <button
+                    className="primary-button"
+                    disabled={proposeProfile.isPending}
+                    onClick={() => proposeProfile.mutate()}
+                  >
+                    {proposeProfile.isPending ? "Calculating…" : "Create proposal"}
+                  </button>
+                </div>
+                {proposal && (
+                  <div className="proposal-result">
+                    <div>
+                      <span className="proposal-value">
+                        {Math.round(proposal.observed_mass_retained * 1000) / 10}%
+                      </span>
+                      <span>observed routing mass retained</span>
+                    </div>
+                    <div>
+                      <span className="proposal-value">
+                        {Math.round(proposal.validation.retained_fraction * 100)}%
+                      </span>
+                      <span>experts eligible</span>
+                    </div>
+                    <div className="profile-activation">
+                      <span className={`validation-state ${proposal.validation.valid ? "valid" : "invalid"}`}>
+                        {proposal.validation.valid
+                          ? "Fork-compatible profile"
+                          : proposal.validation.errors.join(", ")}
+                      </span>
+                      {!savedProposal ? (
+                        <div className="profile-save-row">
+                          <input
+                            aria-label="Expert profile name"
+                            value={profileName}
+                            disabled={createProfile.isPending}
+                            onChange={(event) => setProfileName(event.target.value)}
+                          />
+                          <button
+                            className="primary-button"
+                            disabled={
+                              !proposal.validation.valid ||
+                              !profileName.trim() ||
+                              createProfile.isPending
+                            }
+                            onClick={() =>
+                              createProfile.mutate({
+                                name: profileName.trim(),
+                                description: `Fixed-budget ${metric === "routing_mass" ? "routing mass" : "selection count"} proposal from ${baselineRun.id}.`,
+                                model_id: modelId,
+                                profile: proposal.profile,
+                                source: "proposal",
+                                source_run_id: baselineRun.id,
+                                metric:
+                                  metric === "selection_counts"
+                                    ? "selection_count"
+                                    : metric,
+                                observed_mass_retained:
+                                  proposal.observed_mass_retained,
+                              })
+                            }
+                          >
+                            {createProfile.isPending ? "Saving…" : "Save profile"}
+                          </button>
+                        </div>
+                      ) : profileMatchesProposal ? (
+                        <span className="active-artifact">
+                          Loaded in runtime · ready to pair above
+                        </span>
+                      ) : (
+                        <button
+                          className="primary-button"
+                          disabled={
+                            !proposal.validation.valid ||
+                            loadProfile.isPending ||
+                            workBusy
+                          }
+                          onClick={() => loadProfile.mutate(savedProposal)}
+                        >
+                          {loadProfile.isPending
+                            ? "Restarting with profile…"
+                            : "Load this profile"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="profile-context-note">
+                <div>
+                  <span className="section-label">Profile proposals use baselines</span>
+                  <h3>
+                    {baselineRun
+                      ? "Return to baseline routing to shape another mask."
+                      : "Choose a baseline run before shaping or comparing profiles."}
+                  </h3>
+                </div>
+                {baselineRun ? (
+                  <button
+                    className="text-button"
+                    onClick={() => setRoutingVariant("baseline")}
+                  >
+                    View baseline routing →
+                  </button>
+                ) : (
+                  <a className="text-button" href="#archive">
+                    Choose from archive →
+                  </a>
+                )}
               </div>
             )}
           </section>
@@ -1020,6 +1247,41 @@ export default function App() {
                     : "neutral"
                 }
               />
+            </div>
+            <div className="comparison-persistence" aria-live="polite">
+              {savedComparison ? (
+                <span>
+                  ✓ Saved paired comparison · {savedComparison.name}
+                </span>
+              ) : (
+                <>
+                  <span className={createComparison.error ? "inline-error" : ""}>
+                    {createComparison.error
+                      ? `Could not save this pairing: ${createComparison.error.message}`
+                      : "The results are visible now; save the pairing to keep it in the research archive."}
+                  </span>
+                  <button
+                    className="text-button"
+                    disabled={
+                      baselineRun.status !== "completed" ||
+                      maskedRun.status !== "completed" ||
+                      createComparison.isPending
+                    }
+                    onClick={() =>
+                      createComparison.mutate({
+                        baseline: baselineRun,
+                        candidate: maskedRun,
+                      })
+                    }
+                  >
+                    {createComparison.isPending
+                      ? "Saving comparison…"
+                      : createComparison.error
+                        ? "Retry save"
+                        : "Save comparison"}
+                  </button>
+                </>
+              )}
             </div>
             <div className="comparison-table-wrap">
               <table className="comparison-table">
@@ -1217,6 +1479,35 @@ function formatProgress(job: JobRecord) {
 function formatBytes(value: number) {
   if (value < 1_000) return `${value} B`;
   return `${(value / 1_000).toFixed(value < 100_000 ? 1 : 0)} kB`;
+}
+
+function jobKindLabel(kind: JobRecord["kind"]) {
+  if (kind === "model_load") return "model load";
+  if (kind === "dataset_prepare") return "dataset preparation";
+  if (kind === "agent_run") return "coding run";
+  return "benchmark run";
+}
+
+function findCompatibleBaseline(
+  candidate: BenchmarkRun,
+  runs: BenchmarkRun[],
+  sessions: ModelSession[],
+) {
+  if (candidate.status !== "completed") return undefined;
+  const sessionById = new Map(sessions.map((session) => [session.id, session]));
+  const candidateIds = candidate.items.map((item) => item.item_id).join("\0");
+  return runs.find((run) => {
+    const session = sessionById.get(run.model_session_id);
+    return (
+      run.id !== candidate.id &&
+      session?.profile === null &&
+      run.status === "completed" &&
+      run.benchmark_id === candidate.benchmark_id &&
+      (run.cohort_id && candidate.cohort_id
+        ? run.cohort_id === candidate.cohort_id
+        : run.items.map((item) => item.item_id).join("\0") === candidateIds)
+    );
+  });
 }
 
 function CompareMetric({

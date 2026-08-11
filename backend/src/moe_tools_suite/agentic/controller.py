@@ -676,10 +676,7 @@ class AgenticController:
                     model_session=model_session,
                     messages=_bounded_messages(messages),
                     generation=generation,
-                    request_key=(
-                        f"agent:{run.contract_fingerprint}:{trial.task_id}:"
-                        f"{trial.attempt}:{turn_index}"
-                    ),
+                    request_key=f"agent:{trial.id}:{turn_index}",
                     scripted_content=scripted_content,
                 )
                 self.inferences[gateway_result.inference.id] = gateway_result.inference
@@ -836,9 +833,32 @@ class AgenticController:
                     sandbox_session.updated_at = sandbox_session.deleted_at
                 self.store.save_sandbox_session(sandbox_session)
             else:
-                sandbox_session.state = SandboxSessionState.ERROR
-                sandbox_session.cleanup_error = trial.error
-                sandbox_session.updated_at = utc_now()
+                if provider.provider_id == "fake":
+                    sandbox_session.state = SandboxSessionState.ERROR
+                    sandbox_session.cleanup_error = trial.error
+                    sandbox_session.updated_at = utc_now()
+                else:
+                    sandbox_session.state = SandboxSessionState.DELETING
+                    sandbox_session.updated_at = utc_now()
+                    self.store.save_sandbox_session(sandbox_session)
+                    try:
+                        await provider.cleanup_owned(None, ownership)
+                    except Exception as cleanup_error:
+                        sandbox_session.state = SandboxSessionState.CLEANUP_PENDING
+                        sandbox_session.cleanup_error = _error_text(cleanup_error)
+                        trial.error = (
+                            f"{trial.error}; cleanup: {sandbox_session.cleanup_error}"
+                            if trial.error
+                            else sandbox_session.cleanup_error
+                        )
+                        trial.termination_cause = TerminationCause.CLEANUP_ERROR
+                        error = cleanup_error
+                        sandbox_session.updated_at = utc_now()
+                    else:
+                        sandbox_session.state = SandboxSessionState.DELETED
+                        sandbox_session.deleted_at = utc_now()
+                        sandbox_session.updated_at = sandbox_session.deleted_at
+                        sandbox_session.cleanup_error = None
                 self.store.save_sandbox_session(sandbox_session)
 
         trajectory = finalize_trajectory(

@@ -6,7 +6,7 @@ on:
       image_tag:
         description: Container tag to publish
         required: true
-        default: 0.2.0-rc.1
+        default: 0.2.0-rc.3
         type: string
   push:
     tags:
@@ -16,7 +16,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   VLLM_SOURCE_REPOSITORY: sampazdan/vllm-moe-tools
-  VLLM_SOURCE_REF: 79df5217ef23fa282ed7cab324cdeb7bce5d8bc1
+  VLLM_SOURCE_REF: 729d4f23ae9cc27f797b8c13a9276565976637ed
 
 jobs:
   build-and-push:

@@ -61,6 +61,10 @@ def decode_routing_payloads(
         raise ValueError("routed expert ID is outside the model topology")
     if not np.isfinite(weights).all():
         raise ValueError("routed expert weights must be finite")
+    if np.any(weights < 0):
+        raise ValueError("routed expert weights must be non-negative")
+    if ids.shape[2] > 1 and np.any(np.diff(np.sort(ids, axis=2), axis=2) == 0):
+        raise ValueError("routed expert IDs must be unique within each top_k row")
     return DecodedRouting(expert_ids=ids, expert_weights=weights)
 
 
@@ -70,9 +74,7 @@ def aggregate_routing(
 ) -> AggregatedRouting:
     """Aggregate selection count and routing mass by routed layer and expert."""
 
-    counts = np.zeros(
-        (topology.num_layers, topology.num_experts), dtype=np.int64
-    )
+    counts = np.zeros((topology.num_layers, topology.num_experts), dtype=np.int64)
     mass = np.zeros((topology.num_layers, topology.num_experts), dtype=np.float64)
     for layer_index in range(topology.num_layers):
         layer_ids = decoded.expert_ids[:, layer_index, :].reshape(-1)

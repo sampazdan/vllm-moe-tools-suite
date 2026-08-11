@@ -1,66 +1,82 @@
 # MoE Tools Test Suite Roadmap
 
-Status: active implementation plan, updated 2026-08-10
+Status: active implementation and release-gating plan, updated 2026-08-11
 
-Implementation status as of 2026-08-10:
+Implementation status as of 2026-08-11:
 
-- **Milestone 0 complete:** the repository now contains a tested FastAPI backend,
-  fork-compatible telemetry decoder/aggregator and profile validator, deterministic
-  A3B mock runtime, selectable fixture benchmark, responsive React application,
-  40-by-256 engagement heatmap, fixed-budget profile proposal, and Runpod-aware
-  Dockerfile skeleton.
-- **Verified locally:** 35 backend tests, Ruff, the production TypeScript/Vite build,
-  authenticated base-to-mask workflows in desktop and 390-pixel browser layouts,
-  shell/JSON startup syntax, and Docker Buildx static validation all pass.
-- **Milestone 1 implemented locally:** single-user token sessions and CSRF,
-  fail-closed Runpod startup, SQLite metadata plus compressed routing artifacts,
-  persisted background jobs, official HTTP-proxy/template configuration, managed
-  vLLM process lifecycle, per-session logs and profile files, and the paired
-  baseline-to-mask comparison UI. GPU behavior remains unverified.
-- **Profile/comparison workspace implemented locally:** named expert profiles are
-  immutable, fingerprinted, revision-linked, importable/exportable, and persisted.
-  Manual per-layer expert overrides, strict same-cohort comparisons, run/profile
-  provenance, and restart-safe archive views now work on desktop and phone.
-- **Benchmark engine implemented locally:** adapter-owned dataset loading, prompt
-  rendering, scoring, and generation defaults now support the arithmetic fixture,
-  a checksum-verified pinned GSM8K test split, and validated custom JSONL. Runs use
-  immutable cohort fingerprints covering dataset, item order, prompt, scorer, and
-  generation settings; item errors, ungraded results, cancellation, and JSON/CSV
-  exports are first-class. Standard dataset files and custom imports persist on the
-  mounted volume.
-- **Native agentic slice implemented locally:** `bash-json-v1` runs a bounded JSON
-  shell-action loop through an instrumented per-inference model gateway. Durable
-  agent runs/trials, `ATIF-v1.7` trajectories, verifier and routing artifacts, the
-  immutable three-task `smoke-python-v1` pack, fake/Daytona provider boundaries, an
-  API-backed trial-to-profile flow, and the agentic workbench are present.
-- **Provider and deployment safety implemented locally:** the fake provider never
-  executes a host subprocess; the remote adapter requires exact
-  [`daytona==0.192.0`](https://pypi.org/project/daytona/0.192.0/), keeps credentials
-  controller-side, labels owned sandboxes, applies task egress policy, and confirms
-  deletion. A private agentic Runpod template uses secret references rather than
-  embedding tokens.
-- **Next acceptance checkpoint:** run the bounded paid ladder: Daytona preflight,
-  one real task, all three tasks on the baseline model, a single-trial-derived
-  profile reload, the identical three tasks masked, and explicit sandbox/Pod
-  teardown. The target RTX and Daytona live lifecycles remain unverified tonight.
+- **A previous container crossed the first live boundary:** the authenticated
+  Runpod proxy appliance and supported Qwen model ran on the target RTX PRO 6000,
+  and the native agentic flow completed work through Daytona. That live use exposed
+  two important defects: a transient browser fetch failure could abandon a still-
+  running model-load job, and several expert-profile transitions were confusing or
+  incorrect. This is evidence for the architecture, not acceptance of the current
+  release candidate.
+- **Durable job recovery is implemented in the current local candidate:** a model
+  session and its queued job are persisted atomically before the API response;
+  execution is scheduled and owned by the application rather than the response
+  lifecycle; a disconnected response waiter cannot cancel it; identical model-load
+  retries adopt the same job; and incompatible submissions return a typed conflict
+  containing the recoverable active job. `GET /api/jobs/active` and the planned
+  `starting` session make reload and process-restart state explicit.
+- **Browser recovery is implemented locally:** job polling treats network/5xx/429
+  failures as transient with bounded backoff, wakes on reconnect or tab visibility,
+  discovers the server's active job after a reload, and adopts typed conflicts. The
+  UI keeps the operation and last terminal error visible instead of reverting to
+  “no model loaded” while server-side work continues.
+- **Profile and comparison workflows are hardened locally:** proposals are scoped
+  to baseline routing, changing the metric or budget invalidates stale proposals,
+  a saved profile must be loaded before a paired rerun, saved comparisons update the
+  archive immediately, and manual edits create a named immutable revision and close
+  cleanly. Partial profiles now materialize omitted routed layers as “all experts
+  eligible” while explicit empty layers remain invalid.
+- **Agentic telemetry is de-duplicated exactly for verified multi-turn prefixes:**
+  the gateway retains prompt/generated token IDs per trial, tokenizes each extended
+  prompt, computes an exact common-token prefix, and asks the fork to omit only that
+  prefix from returned routing rows. Ambiguous or unrelated prompts fail open to a
+  zero skip, row counts are validated, and cache keys are isolated by trial so one
+  task cannot borrow another task's prefix state.
+- **Provider and process cleanup are hardened locally:** a remote Daytona create
+  failure that yields no handle still triggers exact-ownership-label cleanup and is
+  persisted as deleted or cleanup-pending. New work retries/blocks around pending
+  cleanup. Managed vLLM runs in its own process group, shutdown escalates safely
+  from `TERM` to `KILL`, startup reconciles only validated owned processes, and the
+  Runpod hook no longer mistakes a reused stale PID for a healthy app.
+- **Automated release gates are present:** GitHub CI runs backend Ruff and pytest,
+  frontend Node contract tests and the production Vite build, plus deployment shell
+  and JSON validation. A public-API acceptance canary can authenticate, adopt an
+  active/unknown-outcome job, load the baseline, run an explicit fixture cohort,
+  save and load a profile by ID, rerun the identical cohort, and validate the saved
+  comparison. Its Daytona task is deliberately opt-in because it creates paid work.
+- **Current local verification:** all 66 backend tests and all five frontend contract
+  tests pass; backend Ruff and the production TypeScript/Vite build pass. Pytest has
+  one dependency deprecation warning, and Vite has a non-blocking large-chunk warning
+  for the 807 kB ECharts-heavy bundle. In the fork, the two scheduler boundary tests
+  and two SamplingParams forwarding tests pass, as does the direct request-to-
+  scheduler contract check; fork Ruff and format checks are clean.
+- **Current release gate:** publish the candidate app image with the immutable fork
+  revision, rerun the canary and targeted recovery/profile checks on the RTX PRO
+  6000, run the bounded Daytona ladder, then explicitly confirm zero paid sandboxes
+  and stop the Pod. The new release candidate must not be described as live-verified
+  until this gate passes.
 
 Approximate milestone accounting (local implementation, not production readiness):
 
 | Milestone | Progress | Largest remaining gap |
 | --- | ---: | --- |
-| 0 · Local skeleton | 90% | CI and frontend automation |
-| 1 · Runpod appliance | 85% | Real proxy/volume acceptance |
-| 2 · Model lifecycle | 55% | Real topology, chat, stop/cancel, GPU acceptance |
-| 3 · Benchmark engine | 78% | More standard adapters and automated frontend tests |
-| 4 · Profile lab | 60% | Undo/redo and additional assisted strategies |
-| 5 · Masked comparison | 65% | Routing redistribution, reports, performance mode |
-| 6 · Agentic foundation | 70% | Live RTX/Daytona acceptance and broader harnesses |
+| 0 · Local skeleton | 95% | Broader component/browser automation and CI image smoke |
+| 1 · Runpod appliance | 90% | Current immutable-image proxy/volume/restart acceptance |
+| 2 · Model lifecycle | 75% | Candidate recovery, stop/cancel, topology, and GPU acceptance |
+| 3 · Benchmark engine | 84% | More standard adapters and browser-level regression coverage |
+| 4 · Profile lab | 72% | Undo/redo, brush selection, and additional assisted strategies |
+| 5 · Masked comparison | 74% | Routing redistribution, reports, and performance mode |
+| 6 · Agentic foundation | 78% | Current RTX/Daytona gate, formal pairing, multi-trial profiles |
 | 7 · Repository agentic | 10% | Full Harbor/Aider integration and public task adapters |
-| 8 · Breadth/hardening | 5% | Additional adapters, failure injection, and browser tests |
+| 8 · Breadth/hardening | 18% | Failure injection, Playwright, migrations, and recovery drills |
 
-The interactive MVP surface is roughly two thirds implemented. Production readiness
-is substantially lower because the container, managed fork, and remote sandbox have
-not yet crossed the real Runpod/GPU/Daytona acceptance checkpoints.
+The interactive MVP surface is roughly three quarters implemented. Production
+readiness remains lower: an earlier build proved the Runpod/GPU/Daytona boundaries,
+but the current hardening candidate still needs immutable-image acceptance and an
+intentional teardown audit before it can replace that build.
 
 This repository will contain a single-user research application for measuring how
 expert eligibility changes affect a task-focused MoE model. The first useful
@@ -78,8 +94,8 @@ experimental constraints of the current fork.
 
 ## What already exists in `vllm-moe-tools`
 
-The implementation plan is based on the local `stage_2` branch at commit
-`79df5217e` (also `origin/stage_2`). That history contains three relevant pieces:
+This implementation began from the `stage_2` fork at commit `79df5217e`. That
+original masking/telemetry history contains three relevant pieces:
 
 - Version 1 expert-selection profiles with per-layer logical expert allowlists.
 - Routed-expert capture returned through the OpenAI-compatible completions and
@@ -97,6 +113,17 @@ The runtime flags exposed by the fork are:
 Telemetry is transported as base64-encoded NumPy arrays. IDs and weights have
 shape `[tokens, routed_layers, top_k]`. The app will decode and aggregate these
 arrays rather than changing vLLM's internal capture path in the first phase.
+
+The current release-candidate fork commit
+`729d4f23ae9cc27f797b8c13a9276565976637ed` extends the chat request contract with
+an optional non-negative `routed_experts_prompt_start`. When routed capture is
+enabled, the fork returns prompt routing beginning at that token offset followed by
+generated-token routing. The app uses it only after exact token-prefix alignment;
+ordinary clients omit it and preserve the original behavior. The container publish
+workflow pins that full SHA; the resulting combined image remains part of the
+outstanding live release gate. Negative offsets fail request validation; an offset
+equal to or beyond the prompt length safely clamps to that length and returns no
+prompt rows rather than tripping the scheduler.
 
 The profile contract is intentionally small:
 
@@ -335,10 +362,14 @@ The Daytona API key remains in the controller and is never passed to the agent t
 Real sandboxes are private and ephemeral, receive only task files plus an empty
 environment/secrets map, carry controller/run/trial ownership labels, enforce the
 requested deny/allowlist/public egress policy, and are verified before operations
-and deletion. Cleanup polls until destruction is confirmed. Sandbox session state,
+and deletion. Cleanup polls until destruction is confirmed. If creation fails after
+Daytona has allocated a sandbox but before it returns a handle, the controller now
+performs an exact-label cleanup lookup; deletion is persisted as confirmed or as
+`cleanup_pending`, never silently treated as complete. Sandbox session state,
 timeouts, CPU/RAM/disk requests, verifier output, deletion failures, and sanitized
-provider errors are persisted. The live Daytona lifecycle remains an acceptance
-target, not a locally verified claim.
+provider errors are persisted. An earlier build completed the ordinary Daytona
+lifecycle; this harder no-handle failure path and the current candidate still need
+the bounded live release gate.
 
 ### Model registry
 
@@ -546,18 +577,26 @@ returns the ordinary response to the controller. The implemented trial view expo
 the trajectory, verifier/artifact records, inference list, and aggregate routing
 heatmap.
 
-Multi-turn prompts often repeat conversation history, so raw routing counts can
-double-count earlier context. The product will label the initial aggregate as
-**served-token engagement**. Generated-token-only, novel-context, and semantic phase
-views will ship only after token-span alignment is verified against the fork. Until
-then, a proposal from trial routing is served-token evidence and must not be described
-as unique-token attribution.
+Multi-turn prompts often repeat conversation history. The current gateway avoids
+counting that history again when it can prove an exact token prefix: it retains the
+prior prompt and generated token IDs per trial, asks the runtime tokenizer for the
+next extended prompt, computes the exact common prefix, and sends that boundary to
+the fork through `routed_experts_prompt_start`. The fork then returns routing for
+only the novel prompt suffix plus the new generated tokens. Telemetry row counts are
+checked against that token contract. Prefix state is keyed by unique trial ID; a new
+trial, unrelated prompt, clipped context, missing tokenization response, or ambiguous
+alignment uses offset zero rather than guessing.
+
+The corrected aggregate is therefore **de-duplicated served-token engagement** for
+verified chat-history extensions. It is still not semantic attribution, causal
+importance, or a generated-token-only view. Semantic phase and token-text views
+remain deferred until their alignment contracts have equivalent integration tests.
 
 The implemented agent-run contract fingerprint covers the immutable task pack and
 selected task revisions, agent/system/tool revisions, generation settings, budgets,
 sandbox provider/policy, attempts, and seed. The model-session/profile fingerprint is
 stored separately so the same contract can be rerun under a different profile. A
-formal agentic paired-comparison resource and UI remain deferred; morning acceptance
+formal agentic paired-comparison resource and UI remain deferred; the release gate
 must compare exported runs and reject any unintended contract mismatch manually.
 
 Agent outcomes are stochastic even at low temperature. The current smoke ladder uses
@@ -760,14 +799,19 @@ POST /api/profiles
 GET  /api/profiles/{id}
 POST /api/comparisons
 
+GET  /api/jobs/active
 GET  /api/jobs/{id}
 GET  /healthz
 GET  /readyz
 ```
 
-The browser polls model sessions, jobs, and runs. FastAPI publishes these contracts
-through OpenAPI; the current frontend uses explicit TypeScript request/response
-types rather than a generated client.
+Job-creating endpoints persist their resource/job transaction and schedule owned
+execution before returning `202`. A duplicate identical model-load request returns
+the same job; a cross-kind or incompatible request returns a typed `409` with the
+active job and recovery URL. The browser polls model sessions, jobs, and runs, and
+also discovers `/api/jobs/active` after reload or reconnect. FastAPI publishes these
+contracts through OpenAPI; the current frontend uses explicit TypeScript
+request/response types rather than a generated client.
 
 ## Implementation milestones
 
@@ -805,7 +849,11 @@ Runpod proxy URL, survives an app restart, and does not expose vLLM publicly.
 - Parse actual model topology and runtime/backend details.
 - Render the topology summary and empty expert matrix.
 - Add a small chat interface with clear model/profile state.
-- Reconcile interrupted model sessions after app or Pod restarts.
+- **Implemented locally:** persist the planned model session with its job before
+  response, dispatch independently of the HTTP waiter, expose active-job discovery,
+  adopt idempotent reloads/conflicts, and reconcile interrupted session/job pairs.
+- **Implemented locally:** isolate vLLM in an owned process group, validate stale
+  process metadata, and stop the complete group during cancellation or shutdown.
 
 Acceptance: the supported Qwen model can be selected, loaded, inspected, chatted
 with, stopped, and reloaded from the UI.
@@ -834,6 +882,11 @@ Acceptance: a selected 10-item GSM8K cohort produces a score, item results, and 
 Acceptance: a user can turn a baseline run into a valid profile without editing JSON,
 while still being able to inspect and override every assisted choice.
 
+The current editor implements per-layer toggles and bulk actions, partial-profile
+materialization, top-k validation, immutable revision saves, import/export, and
+lineage. It closes after a successful save and reports the new revision. Undo/redo
+and brush selection remain real gaps rather than implied capabilities.
+
 ### Milestone 5: masked rerun and comparison
 
 - Restart vLLM with the selected profile and record a new model session.
@@ -861,12 +914,17 @@ same cohort, and understand both the quality delta and eligibility reduction.
 - **Implemented:** canonical verifier restoration with isolated Python execution,
   plus startup recovery that deletes only exact-label interrupted Daytona sandboxes
   and blocks new work while retryable cleanup remains pending.
+- **Implemented:** handle-less remote-create failure recovery by exact ownership
+  labels, with cleanup completion or `cleanup_pending` persisted before trial exit.
+- **Implemented:** exact multi-turn prompt-prefix de-duplication with per-trial token
+  state, ambiguity fallback, telemetry row validation, and a fork request contract.
 - **Implemented:** immutable `smoke-python-v1` with three oracle-pass/no-op-fail tasks.
 - **Implemented:** one-trial routing proposal → agentic profile lineage → model
   profile reload → same-task rerun path.
 - **Remaining:** real RTX/Daytona create/upload/exec/read/delete and cleanup
-  acceptance, formal paired comparison, multi-trial profile aggregation, and a
-  periodic cleanup janitor beyond startup/new-run retries.
+  acceptance for the current candidate, failure-injection of the no-handle cleanup
+  path, formal paired comparison, multi-trial profile aggregation, and a periodic
+  cleanup janitor beyond startup/new-run retries.
 
 Acceptance for this milestone is now the seven-trial paid ladder: one Daytona canary,
 three baseline tasks, one representative-trial profile reload, and the identical
@@ -930,36 +988,55 @@ comparable with the logical-mask experiments.
 - Dataset pinning, item selection, prompt rendering, scoring, and cohort hashing.
 - Run compatibility fingerprints and paired comparison statistics.
 - Job state transitions, cancellation, crash recovery, and database migrations.
+- Atomic model-load session/job submission, identical retry adoption, typed
+  cross-kind conflicts, dropped-response shielding, reload discovery, and shutdown
+  interruption persistence.
 - Model-process lifecycle against a fake OpenAI-compatible server.
+- Owned process-group `TERM`/`KILL`, stale PID reuse, cancelled startup, and
+  app-startup process reconciliation without touching unrelated processes.
 - Instrumented per-inference agent-gateway linkage using fake multi-turn model
   responses and routing arrays.
 - Native task-pack validation/fingerprints, `ATIF-v1.7` construction/export, trial
   recovery, and sandbox cleanup against a fake environment provider.
+- Exact cumulative-token prefix de-duplication across multiple agent turns, plus
+  separate-trial, unrelated-prompt, clipped-context, and invalid-row fallbacks.
 - Fake-provider tests that prove unscripted commands fail closed without invoking a
   local process, plus mocked Daytona contract tests for preflight, ownership,
-  upload/exec/read, redaction, timeout, and deletion behavior.
-- Frontend components, expert selection interactions, accessibility, and responsive
-  views.
+  upload/exec/read, redaction, timeout, deletion, and handle-less create cleanup.
+- Frontend API contract tests for transient retry, terminal-job preservation, typed
+  active-job adoption, and partial-profile editing semantics.
 - Docker startup and same-origin API smoke tests.
+
+The release canary under `scripts/acceptance_canary.py` is a separate public-API
+gate rather than a unit test. It redacts its configured token, uses bounded polling,
+adopts an already active job or an interrupted submission outcome, validates every
+resource/provenance transition in the base-to-profile loop, and leaves its Daytona
+step disabled unless `--daytona` is explicitly supplied.
 
 ### Target-GPU acceptance tests
 
 1. Create a Pod from the template and verify the proxy URL from outside the Pod.
 2. Authenticate and load the pinned Qwen revision.
-3. Confirm GPU/backend/topology facts and that the routing path supports eligibility.
-4. Complete one chat request.
-5. Run a 10-item GSM8K baseline with ID/weight capture.
-6. Create a conservative profile that keeps at least `top_k` experts per layer.
-7. Restart with the profile and rerun the exact cohort.
-8. Verify comparison provenance, scoring, telemetry, exports, and persisted state.
-9. Run a small capture-disabled baseline/profile performance comparison.
-10. Stop and restart the Pod, then verify model cache and application state survive.
+3. During model load, interrupt or reload the browser and require it to rediscover
+   and adopt the same active job without creating a second vLLM process.
+4. Confirm GPU/backend/topology facts and that the routing path supports eligibility.
+5. Complete one chat request.
+6. Run the public-API acceptance canary's explicit fixture cohort, profile-by-ID
+   reload, identical masked cohort, and persisted paired comparison.
+7. Run a 10-item GSM8K baseline with ID/weight capture.
+8. Create a conservative profile that keeps at least `top_k` experts per layer.
+9. Restart with the profile and rerun the exact cohort.
+10. Verify comparison provenance, scoring, telemetry, exports, and persisted state.
+11. Run a small capture-disabled baseline/profile performance comparison.
+12. Stop and restart the Pod, then verify model cache and application state survive.
 
 ### Agentic acceptance tests
 
-The target RTX PRO 6000 and Daytona lifecycle were not exercised tonight. Tomorrow's
-first paid run is intentionally serialized, uses one attempt, and stops at the first
-cleanup/provenance failure:
+An earlier image exercised the target RTX PRO 6000 and ordinary Daytona lifecycle.
+The current release candidate changes job ownership, telemetry slicing, process
+cleanup, and the handle-less sandbox failure path, so its paid gate starts fresh. It
+is intentionally serialized, uses one attempt, and stops at the first cleanup or
+provenance failure:
 
 1. **Boot and pin:** deploy one immutable image with the agentic Runpod template,
    secret references, and intended network volume. Require `/readyz`, authenticated
@@ -1019,38 +1096,35 @@ HTTP request through Runpod's public proxy, not only with the Pod's `Running` st
   effective network policy in every trial.
 - Enforce per-trial CPU, RAM, disk, time, turn, and token limits plus a global
   concurrency ceiling.
-- Delete sandboxes after verification and run a periodic orphan reaper guarded by
-  provider/run ownership tags.
+- Delete sandboxes after verification; recover exact-label orphans at startup and
+  before new work; add a periodic ownership-guarded reaper before production use.
 - Record subprocess command lines after redacting secrets.
+- Put managed app/vLLM subprocesses in owned process groups, validate ownership
+  before signaling them, and never trust a PID file alone after restart.
 - Provide explicit model-stop, Pod-stop, and Pod-terminate guidance; note that the
   independent network volume continues billing and persists after termination.
 - Use immutable image tags/digests and record them in every run.
 
 ## Questions requiring confirmation
 
-The model question is resolved: the initial model is
-`Qwen/Qwen3.6-35B-A3B-FP8`. The following do not block the local mock-mode skeleton,
-but infrastructure choices must be resolved before target-GPU or agentic acceptance.
+The initial model, target GPU, registry, and first sandbox provider are resolved:
+`Qwen/Qwen3.6-35B-A3B-FP8`, one 96 GB RTX PRO 6000 Blackwell Server Edition, GHCR
+under `sampazdan` with immutable tags, and Daytona for the bundled smoke pack. No
+remaining question blocks the current release-candidate gate. These product-policy
+questions should be answered before broadening usage:
 
-1. **Exact GPU SKU:** should the template target the 96 GB RTX PRO 6000 Blackwell
-   Server Edition used by the fork's acceptance work? “RTX 6000 Pro” can refer to
-   more than one generation/capacity in casual naming.
-2. **Container registry:** publish to GHCR under `sampazdan`, Docker Hub, or a private
-   registry? The roadmap assumes GHCR with immutable SHA tags unless directed
-   otherwise.
-3. **Daytona account and region:** the initial provider is implemented. Before paid
-   acceptance, confirm the account/API key, `us` versus `eu` target, billing limits,
-   and whether sending the bundled or later private task files to that provider is
-   acceptable.
-4. **Private-code boundary:** will custom agent tasks contain private repositories?
+1. **Private-code boundary:** will custom agent tasks contain private repositories?
    If so, the initial provider and retention policy must be approved for that data,
    or custom private tasks should wait for a self-hosted sandbox.
-5. **Raw telemetry retention:** keep raw per-item arrays indefinitely, keep them only
+2. **Raw telemetry retention:** keep raw per-item arrays indefinitely, keep them only
    for selected runs, or retain aggregates by default and raw data on opt-in? The
    planning default is compressed raw data for analysis runs with an explicit delete
    control.
-6. **Access model:** is a single shared token sufficient for the first version? The
+3. **Access model:** is a single shared token sufficient for the first version? The
    roadmap assumes one researcher and no public sharing.
+4. **Long-running cleanup policy:** how often should a periodic Daytona orphan janitor
+   run, and what retention window should apply to failed sandbox metadata? Startup
+   and pre-run exact-label cleanup are implemented, but a periodic worker is not.
 
 ## Definition of MVP complete
 

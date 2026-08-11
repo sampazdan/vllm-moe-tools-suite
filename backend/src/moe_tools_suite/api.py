@@ -7,7 +7,6 @@ from typing import Annotated, Literal
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     HTTPException,
     Query,
     Request,
@@ -32,6 +31,7 @@ from .agentic.domain import (
     TrialRoutingSummary,
 )
 from .domain import (
+    ActiveJobConflictDetail,
     BenchmarkDatasetRecord,
     BenchmarkInfo,
     BenchmarkItemPage,
@@ -56,7 +56,7 @@ from .domain import (
     SavedExpertProfile,
     SystemStatus,
 )
-from .lab import ResearchLab
+from .lab import ActiveJobConflict, ResearchLab
 
 router = APIRouter(prefix="/api")
 
@@ -65,13 +65,27 @@ def _lab(request: Request) -> ResearchLab:
     return request.app.state.lab
 
 
+def _job_conflict(error: ActiveJobConflict) -> HTTPException:
+    active_job = error.active_job
+    detail = ActiveJobConflictDetail(
+        message=str(error),
+        active_job=active_job,
+        recovery_url=f"/api/jobs/{active_job.id}",
+    )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=detail.model_dump(mode="json"),
+    )
+
+
 @router.get("/system/status", response_model=SystemStatus)
 def system_status(request: Request) -> SystemStatus:
     lab = _lab(request)
+    current_session = lab.current_model_session()
     return SystemStatus(
         mode=lab.settings.mode,
         version=__version__,
-        model_state=lab.session.state if lab.session else ModelState.UNLOADED,
+        model_state=(current_session.state if current_session else ModelState.UNLOADED),
         data_dir=str(lab.settings.data_dir),
     )
 
@@ -140,18 +154,19 @@ def list_agent_tasks(pack_id: str, request: Request) -> list[AgentTaskInfo]:
     response_model=JobRecord,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def create_agent_run(
+async def create_agent_run(
     payload: CreateAgentRunRequest,
     request: Request,
-    background_tasks: BackgroundTasks,
 ) -> JobRecord:
     try:
         lab = _lab(request)
         job = lab.submit_agent_run(payload)
-        background_tasks.add_task(lab.execute_job, job.id)
+        lab.start_job(job.id)
         return job
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except ActiveJobConflict as error:
+        raise _job_conflict(error) from error
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
@@ -273,25 +288,24 @@ def propose_agent_profile(
     response_model=JobRecord,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def create_model_session(
+async def create_model_session(
     payload: CreateModelSessionRequest,
     request: Request,
-    background_tasks: BackgroundTasks,
 ) -> JobRecord:
     try:
         lab = _lab(request)
         job = lab.submit_model_session(payload)
-        background_tasks.add_task(lab.execute_job, job.id)
+        lab.start_job(job.id)
         return job
-    except RuntimeError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ActiveJobConflict as error:
+        raise _job_conflict(error) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @router.get("/model-sessions/current", response_model=ModelSession)
 def current_model_session(request: Request) -> ModelSession:
-    session = _lab(request).session
+    session = _lab(request).current_model_session()
     if session is None:
         raise HTTPException(status_code=404, detail="no model session")
     return session
@@ -363,18 +377,19 @@ def import_custom_benchmark(
     response_model=JobRecord,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def prepare_benchmark(
+async def prepare_benchmark(
     benchmark_id: str,
     request: Request,
-    background_tasks: BackgroundTasks,
 ) -> JobRecord:
     try:
         lab = _lab(request)
         job = lab.submit_prepare_benchmark(benchmark_id)
-        background_tasks.add_task(lab.execute_job, job.id)
+        lab.start_job(job.id)
         return job
     except KeyError as error:
         raise HTTPException(status_code=404, detail="benchmark not found") from error
+    except ActiveJobConflict as error:
+        raise _job_conflict(error) from error
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -384,16 +399,17 @@ def prepare_benchmark(
     response_model=JobRecord,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def create_run(
+async def create_run(
     payload: RunRequest,
     request: Request,
-    background_tasks: BackgroundTasks,
 ) -> JobRecord:
     try:
         lab = _lab(request)
         job = lab.submit_benchmark(payload)
-        background_tasks.add_task(lab.execute_job, job.id)
+        lab.start_job(job.id)
         return job
+    except ActiveJobConflict as error:
+        raise _job_conflict(error) from error
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except KeyError as error:
@@ -509,12 +525,17 @@ def list_jobs(request: Request) -> list[JobRecord]:
     return _lab(request).list_jobs()
 
 
+@router.get("/jobs/active", response_model=JobRecord | None)
+def get_active_job(request: Request) -> JobRecord | None:
+    return _lab(request).active_job()
+
+
 @router.get("/jobs/{job_id}", response_model=JobRecord)
 def get_job(job_id: str, request: Request) -> JobRecord:
-    artifacts = _lab(request).jobs.get(job_id)
-    if artifacts is None:
-        raise HTTPException(status_code=404, detail="job not found")
-    return artifacts.record
+    try:
+        return _lab(request).get_job(job_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="job not found") from error
 
 
 @router.post("/jobs/{job_id}/cancel", response_model=JobRecord)
