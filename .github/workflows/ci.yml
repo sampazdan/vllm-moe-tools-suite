@@ -58,7 +58,7 @@ jobs:
             MOE_TOOLS_TEMPLATE_DRY_RUN=1 \
             MOE_TOOLS_TEMPLATE_MODE=v2 \
             ./scripts/create_runpod_template.sh \
-            | jq -e '.name | contains("v2") and .imageName == "ghcr.io/example/moe-tools@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
+            | jq -e '(.name | contains("v2")) and .imageName == "ghcr.io/example/moe-tools@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
             >/dev/null
 
       - name: Run backend tests
