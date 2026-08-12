@@ -160,6 +160,27 @@ def test_runpod_dockerfile_requires_a_pin_and_inherits_the_base_startup() -> Non
     assert 'io.moe-atelier.vllm-source-revision="${VLLM_SOURCE_REF}"' in dockerfile
 
 
+def test_runpod_image_pins_and_validates_tokenizer_runtime() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    dependencies = set(project["project"]["dependencies"])
+    dockerfile = (ROOT / "docker" / "Dockerfile.runpod").read_text()
+
+    expected = {
+        "hf-xet": "1.5.1",
+        "huggingface-hub": "1.26.0",
+        "safetensors": "0.8.0",
+        "sentencepiece": "0.2.1",
+        "tiktoken": "0.12.0",
+        "tokenizers": "0.22.2",
+        "transformers": "5.14.1",
+    }
+    for package, version in expected.items():
+        assert f"{package}=={version}" in dependencies
+        assert f"'{package}': '{version}'" in dockerfile
+    assert "actual = {package: version(package) for package in expected}" in dockerfile
+    assert "assert actual == expected" in dockerfile
+
+
 def test_runpod_image_contains_fail_closed_opt_in_v2_acceptance() -> None:
     dockerfile = (ROOT / "docker" / "Dockerfile.runpod").read_text()
     pre_start = (ROOT / "docker" / "runpod" / "pre_start.sh").read_text()
