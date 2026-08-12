@@ -680,6 +680,7 @@ class V2LiveAcceptance:
         }
 
     def _run_coding_acceptance(self) -> None:
+        provider_preflight = self._preflight_coding_provider()
         workload = self._require_workload(
             self.config.coding_workload_id, expected_kind="coding"
         )
@@ -738,6 +739,7 @@ class V2LiveAcceptance:
             "experiment_id": experiment_record.get("id"),
             "workload_id": workload["id"],
             "sandbox_provider_id": self.config.coding_provider_id,
+            "provider_preflight": provider_preflight,
             "release_qualifying": self.config.coding_provider_id != "fake",
             "diagnostic_reason": (
                 "FakeSandboxProvider substitutes pinned oracle actions and cannot "
@@ -747,6 +749,47 @@ class V2LiveAcceptance:
             ),
             "comparison": experiment_record.get("comparison"),
             "lanes": lane_evidence,
+        }
+
+    def _preflight_coding_provider(self) -> dict[str, Any] | None:
+        if self.config.coding_provider_id == "fake":
+            return None
+        providers = _list(self.api.get("/api/sandbox-providers"), "sandbox providers")
+        provider = next(
+            (
+                _mapping(item, "sandbox provider")
+                for item in providers
+                if isinstance(item, Mapping)
+                and item.get("id") == self.config.coding_provider_id
+            ),
+            None,
+        )
+        if provider is None or provider.get("configured") is not True:
+            raise CanaryFailure(
+                f"{self.config.coding_provider_id} sandbox provider is not configured"
+            )
+        preflight = _mapping(
+            self.api.post(
+                f"/api/sandbox-providers/{self.config.coding_provider_id}/preflight"
+            ),
+            "sandbox provider preflight",
+        )
+        if not (
+            preflight.get("status") == "ready"
+            and preflight.get("reachable") is True
+            and preflight.get("authenticated") is True
+        ):
+            raise CanaryFailure(
+                f"{self.config.coding_provider_id} provider preflight is not ready"
+            )
+        return {
+            "provider_id": preflight.get("provider_id"),
+            "status": preflight.get("status"),
+            "configured": preflight.get("configured"),
+            "reachable": preflight.get("reachable"),
+            "authenticated": preflight.get("authenticated"),
+            "api_url_host": preflight.get("api_url_host"),
+            "region": preflight.get("region"),
         }
 
     def _run_drift_acceptance(self) -> None:

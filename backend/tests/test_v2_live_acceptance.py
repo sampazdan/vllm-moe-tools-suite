@@ -43,6 +43,7 @@ class FakeV2Deployment:
         self.progress_reads = 0
         self.experiments: dict[str, str] = {}
         self.progress_payload: dict[str, Any] | None = None
+        self.daytona_preflight_posts = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         method = request.method
@@ -163,6 +164,27 @@ class FakeV2Deployment:
             return self._json(request, self.current)
         if method == "GET" and path == "/api/workloads":
             return self._json(request, self._workloads())
+        if method == "GET" and path == "/api/sandbox-providers":
+            return self._json(
+                request,
+                [{"id": "daytona", "configured": True, "status": "unknown"}],
+            )
+        if method == "POST" and path == "/api/sandbox-providers/daytona/preflight":
+            self._assert_csrf(request)
+            self.daytona_preflight_posts += 1
+            return self._json(
+                request,
+                {
+                    "provider_id": "daytona",
+                    "status": "ready",
+                    "configured": True,
+                    "reachable": True,
+                    "authenticated": True,
+                    "api_url_host": "app.daytona.io",
+                    "region": "us",
+                    "error": None,
+                },
+            )
         if method == "POST" and path == "/api/experiments":
             self._assert_csrf(request)
             assert isinstance(payload, Mapping)
@@ -627,9 +649,19 @@ def test_full_v2_harness_loads_once_and_emits_machine_readable_evidence() -> Non
         report = runner.run()
 
     assert deployment.model_load_posts == 1
+    assert deployment.daytona_preflight_posts == 1
     assert report["app_acceptance_passed"] is True
     assert report["release_acceptance_complete"] is False
     assert report["paired_coding"]["release_qualifying"] is True
+    assert report["paired_coding"]["provider_preflight"] == {
+        "provider_id": "daytona",
+        "status": "ready",
+        "configured": True,
+        "reachable": True,
+        "authenticated": True,
+        "api_url_host": "app.daytona.io",
+        "region": "us",
+    }
     assert report["model"]["process_id"] == 4242
     benchmark = report["activation_benchmark"]
     assert len(benchmark["samples"]) == 8
