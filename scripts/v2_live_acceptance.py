@@ -99,6 +99,7 @@ REQUESTED_DETAILED_LOAD_PHASES = {
     "warming",
 }
 MINIMUM_ORDINARY_LANE_UNITS = 20
+V2_ACCEPTANCE_STEP_COUNT = 10
 
 
 @dataclass(frozen=True)
@@ -1831,7 +1832,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"V2 acceptance configuration failed: {error}", file=sys.stderr)
         return 2
     reporter = Reporter(
-        total_steps=9,
+        total_steps=V2_ACCEPTANCE_STEP_COUNT,
         secrets=(config.token or "",),
     )
     runner: V2LiveAcceptance | None = None

@@ -11,6 +11,7 @@ from moe_tools_suite.v2_domain import canonical_fingerprint
 
 from scripts.acceptance_canary import ApiClient, CanaryFailure, Reporter
 from scripts.v2_live_acceptance import (
+    V2_ACCEPTANCE_STEP_COUNT,
     V2AcceptanceConfig,
     V2LiveAcceptance,
     _activation_statistics,
@@ -621,6 +622,7 @@ class FakeV2Deployment:
 
 def test_full_v2_harness_loads_once_and_emits_machine_readable_evidence() -> None:
     deployment = FakeV2Deployment()
+    messages: list[str] = []
     config = V2AcceptanceConfig(
         base_url="https://v2.test",
         token="live-secret",
@@ -642,7 +644,9 @@ def test_full_v2_harness_loads_once_and_emits_machine_readable_evidence() -> Non
             config,
             api,
             Reporter(
-                total_steps=9, secrets=(config.token or "",), write=lambda _: None
+                total_steps=V2_ACCEPTANCE_STEP_COUNT,
+                secrets=(config.token or "",),
+                write=messages.append,
             ),
             reconnect_client=client,
         )
@@ -697,6 +701,12 @@ def test_full_v2_harness_loads_once_and_emits_machine_readable_evidence() -> Non
         report["activation_failure_safety"]["transactional_commit_failure_injected"]
         is False
     )
+    step_starts = [message for message in messages if message.endswith(" ...")]
+    assert len(step_starts) == V2_ACCEPTANCE_STEP_COUNT
+    assert [message.split(maxsplit=1)[0] for message in step_starts] == [
+        f"[{index:02d}/{V2_ACCEPTANCE_STEP_COUNT:02d}]"
+        for index in range(1, V2_ACCEPTANCE_STEP_COUNT + 1)
+    ]
 
 
 def test_profile_generator_is_full_non_uniform_and_distinct() -> None:
