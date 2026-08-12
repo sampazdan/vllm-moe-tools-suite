@@ -6,18 +6,94 @@ runner_path="${MOE_TOOLS_ACCEPTANCE_RUNNER_PATH:-/usr/local/bin/run-v2-live-acce
 python_path="${MOE_TOOLS_ACCEPTANCE_PYTHON_PATH:-/opt/vllm-venv/bin/python}"
 app_root="${MOE_TOOLS_APP_ROOT:-/opt/moe-tools-test-suite}"
 data_root="${MOE_TOOLS_DATA_DIR:-/workspace/moe-tools}"
-acceptance_dir="${data_root}/acceptance"
-status_file="${acceptance_dir}/v2-live-acceptance.status"
-pid_file="${acceptance_dir}/v2-live-acceptance.pid"
-start_file="${acceptance_dir}/v2-live-acceptance.start"
-lock_file="${acceptance_dir}/v2-live-acceptance.lock"
-log_file="${acceptance_dir}/v2-live-acceptance.log"
-evidence_file="${acceptance_dir}/v2-live-acceptance.json"
-before_file="${acceptance_dir}/daytona-before.json"
-after_file="${acceptance_dir}/daytona-after.json"
+guard_dir="${data_root}/acceptance"
+private_dir="${MOE_TOOLS_ACCEPTANCE_PRIVATE_DIR:-/var/lib/moe-tools/acceptance}"
+status_file="${guard_dir}/v2-live-acceptance.status"
+pid_file="${guard_dir}/v2-live-acceptance.pid"
+start_file="${guard_dir}/v2-live-acceptance.start"
+lock_file="${guard_dir}/v2-live-acceptance.lock"
+log_file="${private_dir}/v2-live-acceptance.log"
+evidence_file="${private_dir}/v2-live-acceptance.json"
+before_file="${private_dir}/daytona-before.json"
+after_file="${private_dir}/daytona-after.json"
 
 utc_now() {
     date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+read_mode() {
+    local path="$1"
+    local mode
+    if mode="$(stat -c '%a' -- "${path}" 2>/dev/null)"; then
+        :
+    elif mode="$(stat -f '%Lp' -- "${path}" 2>/dev/null)"; then
+        :
+    else
+        return 1
+    fi
+    [[ "${mode}" =~ ^[0-7]+$ ]] || return 1
+    printf '%s\n' "${mode}"
+}
+
+secure_private_directory() {
+    if [[ -L "${private_dir}" ]]; then
+        echo "Private acceptance artifact directory must not be a symlink." >&2
+        return 1
+    fi
+    mkdir -p "${private_dir}" || return 1
+    if [[ ! -d "${private_dir}" || -L "${private_dir}" ]]; then
+        echo "Private acceptance artifact path is not a real directory." >&2
+        return 1
+    fi
+    chmod 0700 "${private_dir}" || return 1
+    local mode
+    mode="$(read_mode "${private_dir}")" || return 1
+    if [[ "${mode}" != "700" ]]; then
+        echo "Private acceptance artifact directory did not retain mode 0700." >&2
+        return 1
+    fi
+}
+
+secure_private_file() {
+    local path="$1"
+    if [[ ! -f "${path}" || -L "${path}" ]]; then
+        echo "Private acceptance artifact is missing or is not a regular file." >&2
+        return 1
+    fi
+    chmod 0600 "${path}" || return 1
+    local mode
+    mode="$(read_mode "${path}")" || return 1
+    if [[ "${mode}" != "600" ]]; then
+        echo "Private acceptance artifact did not retain mode 0600." >&2
+        return 1
+    fi
+}
+
+secure_private_file_if_present() {
+    local path="$1"
+    if [[ -e "${path}" || -L "${path}" ]]; then
+        secure_private_file "${path}"
+    fi
+}
+
+probe_private_artifact_storage() {
+    secure_private_directory || return 1
+    local probe
+    probe="$(mktemp "${private_dir}/.permissions.XXXXXX")" || return 1
+    if ! secure_private_file "${probe}"; then
+        rm -f "${probe}"
+        return 1
+    fi
+    rm -f "${probe}"
+}
+
+create_private_log() {
+    if [[ -L "${log_file}" || ( -e "${log_file}" && ! -f "${log_file}" ) ]]; then
+        echo "Private acceptance log path is not a regular file." >&2
+        return 1
+    fi
+    : >"${log_file}" || return 1
+    secure_private_file "${log_file}"
 }
 
 write_status() {
@@ -27,11 +103,11 @@ write_status() {
     local after_exit_code="$4"
     local cancellation_exit_code="$5"
     local secret_scan_exit_code="$6"
-    local started_at="$7"
-    local finished_at="$8"
+    local artifact_permissions_exit_code="$7"
+    local started_at="$8"
+    local finished_at="$9"
     local temporary
-    temporary="$(mktemp "${acceptance_dir}/.v2-live-acceptance.status.XXXXXX")"
-    chmod 0600 "${temporary}"
+    temporary="$(mktemp "${guard_dir}/.v2-live-acceptance.status.XXXXXX")"
     jq -n \
         --arg state "${state}" \
         --arg evidence_path "${evidence_file}" \
@@ -45,6 +121,7 @@ write_status() {
         --arg after_exit_code "${after_exit_code}" \
         --arg cancellation_exit_code "${cancellation_exit_code}" \
         --arg secret_scan_exit_code "${secret_scan_exit_code}" \
+        --arg artifact_permissions_exit_code "${artifact_permissions_exit_code}" \
         '{
             schema_version: "moe-atelier-v2-startup-acceptance-status/v1",
             state: $state,
@@ -78,6 +155,11 @@ write_status() {
                 if $secret_scan_exit_code == "" then null
                 else ($secret_scan_exit_code | tonumber)
                 end
+            ),
+            artifact_permissions_exit_code: (
+                if $artifact_permissions_exit_code == "" then null
+                else ($artifact_permissions_exit_code | tonumber)
+                end
             )
         }' >"${temporary}"
     mv -f "${temporary}" "${status_file}"
@@ -97,6 +179,51 @@ worker_is_live() {
     [[ -r "/proc/${worker_pid}/cmdline" ]] || return 1
     tr '\0' ' ' <"/proc/${worker_pid}/cmdline" \
         | grep -Fq "${runner_path} --worker"
+}
+
+claim_worker_handoff() {
+    exec 9>"${lock_file}"
+    if ! flock -w 10 9; then
+        echo "V2 startup acceptance worker could not acquire its handoff lock." >&2
+        return 1
+    fi
+
+    local state worker_pid
+    for _ in {1..100}; do
+        state="$(jq -er '.state | strings' "${status_file}" 2>/dev/null)" || {
+            sleep 0.1
+            continue
+        }
+        if [[ "${state}" != "starting" && "${state}" != "running" ]]; then
+            echo "V2 startup acceptance worker handoff is not running." >&2
+            return 1
+        fi
+        if [[ "${state}" != "running" || ! -e "${pid_file}" ]]; then
+            sleep 0.1
+            continue
+        fi
+        if [[ ! -f "${pid_file}" || -L "${pid_file}" ]]; then
+            echo "V2 startup acceptance worker PID handoff is invalid." >&2
+            return 1
+        fi
+        worker_pid="$(<"${pid_file}")"
+        if [[ ! "${worker_pid}" =~ ^[0-9]+$ || "${worker_pid}" != "$$" ]]; then
+            echo "V2 startup acceptance worker PID does not match its handoff." >&2
+            return 1
+        fi
+        if [[ -L "${start_file}" ]]; then
+            echo "V2 startup acceptance one-shot handoff is invalid." >&2
+            return 1
+        fi
+        if [[ ! -f "${start_file}" ]]; then
+            sleep 0.1
+            continue
+        fi
+        rm -f "${start_file}"
+        return 0
+    done
+    echo "V2 startup acceptance worker handoff timed out." >&2
+    return 1
 }
 
 worker_interrupted=0
@@ -158,12 +285,10 @@ run_worker() {
     trap handle_worker_signal HUP INT TERM
     local started_at
     started_at="$(utc_now)"
-    for _ in {1..50}; do
-        [[ -f "${start_file}" ]] && break
-        sleep 0.1
-    done
-    if [[ ! -f "${start_file}" ]]; then
-        write_status "interrupted" "" "" "" "" "" "${started_at}" "$(utc_now)"
+    if ! probe_private_artifact_storage \
+        || ! secure_private_file "${log_file}"; then
+        write_status "failed" "" "" "" "" "" "1" \
+            "${started_at}" "$(utc_now)"
         return 1
     fi
 
@@ -171,9 +296,13 @@ run_worker() {
     export MOE_TOOLS_CANARY_BASE_URL="http://127.0.0.1:8080"
 
     set +e
+    local artifact_permissions_exit_code=0
     run_tracked "${python_path}" "${app_root}/scripts/daytona_inventory.py" \
         --output "${before_file}"
     local before_exit_code=$?
+    if ! secure_private_file_if_present "${before_file}"; then
+        artifact_permissions_exit_code=1
+    fi
     if (( before_exit_code == 0 )) && ! jq -e \
         '.success == true and .provider_wide_empty == true and .sandbox_count == 0' \
         "${before_file}" >/dev/null; then
@@ -181,7 +310,7 @@ run_worker() {
     fi
 
     local harness_exit_code=125
-    if (( before_exit_code == 0 )); then
+    if (( before_exit_code == 0 && artifact_permissions_exit_code == 0 )); then
         run_tracked "${python_path}" "${app_root}/scripts/v2_live_acceptance.py" \
             --base-url "http://127.0.0.1:8080" \
             --model-id "Qwen/Qwen3.6-35B-A3B-FP8" \
@@ -190,7 +319,12 @@ run_worker() {
             --output "${evidence_file}"
         harness_exit_code=$?
     else
-        echo "Refusing paid acceptance because Daytona inventory is not empty."
+        echo "Refusing paid acceptance because its preflight did not pass."
+    fi
+    if ! secure_private_file_if_present "${evidence_file}"; then
+        artifact_permissions_exit_code=1
+    elif (( harness_exit_code == 0 )) && [[ ! -f "${evidence_file}" ]]; then
+        artifact_permissions_exit_code=1
     fi
 
     trap mark_worker_interrupted HUP INT TERM
@@ -203,10 +337,17 @@ run_worker() {
     run_tracked "${python_path}" "${app_root}/scripts/daytona_inventory.py" \
         --output "${after_file}"
     local after_exit_code=$?
+    if ! secure_private_file_if_present "${after_file}"; then
+        artifact_permissions_exit_code=1
+    fi
     if (( after_exit_code == 0 )) && ! jq -e \
         '.success == true and .provider_wide_empty == true and .sandbox_count == 0' \
         "${after_file}" >/dev/null; then
         after_exit_code=3
+    fi
+
+    if ! secure_private_file "${log_file}"; then
+        artifact_permissions_exit_code=1
     fi
 
     run_tracked "${python_path}" -c '
@@ -243,6 +384,7 @@ for raw_path in sys.argv[1:]:
         || after_exit_code != 0
         || secret_scan_exit_code != 0
         || cancellation_exit_code != 0
+        || artifact_permissions_exit_code != 0
     )); then
         if [[ "${state}" != "interrupted" ]]; then
             state="failed"
@@ -255,6 +397,7 @@ for raw_path in sys.argv[1:]:
         "${after_exit_code}" \
         "${cancellation_exit_code}" \
         "${secret_scan_exit_code}" \
+        "${artifact_permissions_exit_code}" \
         "${started_at}" \
         "$(utc_now)"
     if [[ "${state}" == "completed" ]]; then
@@ -263,10 +406,10 @@ for raw_path in sys.argv[1:]:
     return 1
 }
 
-mkdir -p "${acceptance_dir}"
-chmod 0700 "${acceptance_dir}"
+mkdir -p "${guard_dir}"
 
 if [[ "${1:-}" == "--worker" ]]; then
+    claim_worker_handoff || exit 1
     run_worker >>"${log_file}" 2>&1
     exit $?
 fi
@@ -301,7 +444,6 @@ if ! credential_is_resolved "${MOE_TOOLS_DAYTONA_API_KEY:-}"; then
 fi
 
 exec 9>"${lock_file}"
-chmod 0600 "${lock_file}"
 if ! flock -n 9; then
     echo "V2 startup acceptance launch is already being evaluated."
     exit 0
@@ -317,7 +459,7 @@ if [[ -f "${status_file}" ]]; then
             echo "V2 startup acceptance is already running."
             exit 0
         fi
-        write_status "interrupted" "" "" "" "" "" "" "$(utc_now)"
+        write_status "interrupted" "" "" "" "" "" "" "" "$(utc_now)"
         echo "Stale V2 startup acceptance was marked interrupted; not rerunning."
         exit 0
     fi
@@ -325,17 +467,21 @@ if [[ -f "${status_file}" ]]; then
     exit 0
 fi
 
-: >"${log_file}"
-chmod 0600 "${log_file}"
-write_status "starting" "" "" "" "" "" "" ""
+permission_check_started_at="$(utc_now)"
+if ! probe_private_artifact_storage || ! create_private_log; then
+    write_status "failed" "" "" "" "" "" "1" \
+        "${permission_check_started_at}" "$(utc_now)"
+    echo "Private acceptance artifact storage cannot enforce POSIX modes." >&2
+    exit 1
+fi
+
+write_status "starting" "" "" "" "" "" "0" "" ""
 rm -f "${start_file}"
 setsid "${runner_path}" --worker >/dev/null 2>&1 < /dev/null &
 worker_pid=$!
-pid_temporary="$(mktemp "${acceptance_dir}/.v2-live-acceptance.pid.XXXXXX")"
+pid_temporary="$(mktemp "${guard_dir}/.v2-live-acceptance.pid.XXXXXX")"
 printf '%s\n' "${worker_pid}" >"${pid_temporary}"
-chmod 0600 "${pid_temporary}"
 mv -f "${pid_temporary}" "${pid_file}"
-write_status "running" "" "" "" "" "" "$(utc_now)" ""
+write_status "running" "" "" "" "" "" "0" "$(utc_now)" ""
 : >"${start_file}"
-chmod 0600 "${start_file}"
 echo "V2 startup acceptance launched in the background; see ${status_file}."

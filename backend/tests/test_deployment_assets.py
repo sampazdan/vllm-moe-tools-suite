@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
@@ -11,6 +12,8 @@ from pathlib import Path
 
 import pytest
 from moe_tools_suite import __version__
+
+from scripts.v2_live_acceptance import _write_report as write_v2_acceptance_report
 
 ROOT = Path(__file__).parents[2]
 EXPECTED_IMAGE_TAG = "ghcr.io/sampazdan/vllm-moe-tools-suite:0.3.0-rc.1"
@@ -29,6 +32,10 @@ EXPECTED_VLLM_ENV = {
     "RUNPOD_VLLM_MODEL": "Qwen/Qwen3.6-35B-A3B-FP8",
     "RUNPOD_VLLM_PORT": "8000",
 }
+
+
+def _permission_mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
 
 
 @pytest.mark.parametrize(
@@ -198,6 +205,9 @@ def test_runpod_image_contains_fail_closed_opt_in_v2_acceptance() -> None:
     assert "provider_wide_empty == true" in runner
     assert "daytona-before.json" in runner
     assert "daytona-after.json" in runner
+    assert "MOE_TOOLS_ACCEPTANCE_PRIVATE_DIR" in runner
+    assert "artifact_permissions_exit_code" in runner
+    assert "secure_private_file" in runner
 
     result = subprocess.run(
         ["bash", "-n", str(runner_path)],
@@ -288,6 +298,240 @@ def test_daytona_inventory_fails_secret_free_without_inherited_credential(
     assert output.stat().st_mode & 0o777 == 0o600
 
 
+def test_v2_acceptance_report_replaces_with_explicit_private_mode(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "v2-live-acceptance.json"
+    output.write_text("stale")
+    output.chmod(0o666)
+    previous_umask = os.umask(0)
+    try:
+        write_v2_acceptance_report(output, {"app_acceptance_passed": True})
+    finally:
+        os.umask(previous_umask)
+
+    assert json.loads(output.read_text()) == {"app_acceptance_passed": True}
+    assert _permission_mode(output) == 0o600
+    assert list(tmp_path.glob(".v2-live-acceptance.json.*.tmp")) == []
+
+
+def test_startup_acceptance_separates_guard_and_private_artifact_planes(
+    tmp_path: Path,
+) -> None:
+    runner_path = ROOT / "docker" / "runpod" / "run_v2_live_acceptance_on_start.sh"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    harness_marker = tmp_path / "harness-started"
+    scan_marker = tmp_path / "secret-scan-paths"
+    python_stub = bin_dir / "python-stub"
+    python_stub.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+    *daytona_inventory.py|*v2_live_acceptance.py)
+        script="$1"
+        shift
+        output=""
+        while (( $# > 0 )); do
+            if [[ "$1" == "--output" ]]; then
+                output="$2"
+                shift 2
+            else
+                shift
+            fi
+        done
+        [[ -n "${output}" ]]
+        if [[ "${script}" == *daytona_inventory.py ]]; then
+            printf '%s\n' \
+                '{"success":true,"provider_wide_empty":true,"sandbox_count":0}' \
+                >"${output}"
+        else
+            : >"${HARNESS_MARKER}"
+            printf '%s\n' '{"app_acceptance_passed":true}' >"${output}"
+        fi
+        ;;
+    -c)
+        shift 2
+        printf '%s\n' "$@" >"${SCAN_MARKER}"
+        exit 0
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+"""
+    )
+    python_stub.chmod(0o700)
+    for name, body in {
+        "flock": "#!/usr/bin/env bash\nexit 0\n",
+        "setsid": '#!/usr/bin/env bash\nexec "$@"\n',
+    }.items():
+        path = bin_dir / name
+        path.write_text(body)
+        path.chmod(0o700)
+
+    data_dir = tmp_path / "persistent-data"
+    private_dir = tmp_path / "container-disk" / "acceptance"
+    environment = os.environ | {
+        "HARNESS_MARKER": str(harness_marker),
+        "SCAN_MARKER": str(scan_marker),
+        "MOE_TOOLS_ACCEPTANCE_PRIVATE_DIR": str(private_dir),
+        "MOE_TOOLS_ACCEPTANCE_PYTHON_PATH": str(python_stub),
+        "MOE_TOOLS_ACCEPTANCE_RUNNER_PATH": str(runner_path),
+        "MOE_TOOLS_APP_ROOT": str(tmp_path / "app"),
+        "MOE_TOOLS_AUTH_TOKEN": "a" * 32,
+        "MOE_TOOLS_DATA_DIR": str(data_dir),
+        "MOE_TOOLS_DAYTONA_API_KEY": "d" * 32,
+        "MOE_TOOLS_MODE": "vllm",
+        "MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START": "1",
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+    }
+    launched = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'umask 000; exec bash "$1"',
+            "startup-acceptance",
+            str(runner_path),
+        ],
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert launched.returncode == 0, launched.stderr
+
+    guard_dir = data_dir / "acceptance"
+    status_file = guard_dir / "v2-live-acceptance.status"
+    report: dict[str, object] = {}
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if status_file.exists():
+            report = json.loads(status_file.read_text())
+            if report.get("state") in {"completed", "failed", "interrupted"}:
+                break
+        time.sleep(0.02)
+
+    assert report["state"] == "completed"
+    assert report["artifact_permissions_exit_code"] == 0
+    assert harness_marker.exists()
+    assert not (guard_dir / "v2-live-acceptance.start").exists()
+    expected_paths = {
+        "evidence_path": private_dir / "v2-live-acceptance.json",
+        "log_path": private_dir / "v2-live-acceptance.log",
+        "daytona_before_path": private_dir / "daytona-before.json",
+        "daytona_after_path": private_dir / "daytona-after.json",
+    }
+    assert _permission_mode(private_dir) == 0o700
+    for field, path in expected_paths.items():
+        assert report[field] == str(path)
+        assert path.is_file()
+        assert _permission_mode(path) == 0o600
+        assert not (guard_dir / path.name).exists()
+    assert scan_marker.read_text().splitlines() == [
+        str(expected_paths["daytona_before_path"]),
+        str(expected_paths["evidence_path"]),
+        str(expected_paths["daytona_after_path"]),
+        str(expected_paths["log_path"]),
+    ]
+
+    terminal_status = status_file.read_bytes()
+    terminal_artifacts = {path: path.read_bytes() for path in expected_paths.values()}
+    replayed = subprocess.run(
+        ["bash", str(runner_path), "--worker"],
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert replayed.returncode == 1
+    assert status_file.read_bytes() == terminal_status
+    assert {
+        path: path.read_bytes() for path in expected_paths.values()
+    } == terminal_artifacts
+
+
+def test_startup_acceptance_fails_once_when_private_modes_cannot_be_enforced(
+    tmp_path: Path,
+) -> None:
+    runner_path = ROOT / "docker" / "runpod" / "run_v2_live_acceptance_on_start.sh"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    called_marker = tmp_path / "paid-work-started"
+    python_stub = bin_dir / "python-stub"
+    python_stub.write_text('#!/usr/bin/env bash\n: >"${CALLED_MARKER}"\nexit 0\n')
+    python_stub.chmod(0o700)
+    for name, body in {
+        "flock": "#!/usr/bin/env bash\nexit 0\n",
+    }.items():
+        path = bin_dir / name
+        path.write_text(body)
+        path.chmod(0o700)
+    real_stat = shutil.which("stat")
+    assert real_stat is not None
+    stat_stub = bin_dir / "stat"
+    stat_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'target="${!#}"\n'
+        'if [[ "${target}" == */.permissions.* ]]; then\n'
+        "    printf '666\\n'\n"
+        "    exit 0\n"
+        "fi\n"
+        f'exec "{real_stat}" "$@"\n'
+    )
+    stat_stub.chmod(0o700)
+
+    data_dir = tmp_path / "fuse-data"
+    private_dir = tmp_path / "mode-incompatible" / "acceptance"
+    private_dir.mkdir(parents=True)
+    auth_token = "a" * 32
+    daytona_key = "d" * 32
+    environment = os.environ | {
+        "CALLED_MARKER": str(called_marker),
+        "MOE_TOOLS_ACCEPTANCE_PRIVATE_DIR": str(private_dir),
+        "MOE_TOOLS_ACCEPTANCE_PYTHON_PATH": str(python_stub),
+        "MOE_TOOLS_ACCEPTANCE_RUNNER_PATH": str(runner_path),
+        "MOE_TOOLS_APP_ROOT": str(tmp_path / "app"),
+        "MOE_TOOLS_AUTH_TOKEN": auth_token,
+        "MOE_TOOLS_DATA_DIR": str(data_dir),
+        "MOE_TOOLS_DAYTONA_API_KEY": daytona_key,
+        "MOE_TOOLS_MODE": "vllm",
+        "MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START": "1",
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+    }
+
+    first = subprocess.run(
+        ["bash", str(runner_path)],
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert first.returncode == 1
+    assert "cannot enforce POSIX modes" in first.stderr
+    assert not called_marker.exists()
+
+    status_file = data_dir / "acceptance" / "v2-live-acceptance.status"
+    status_text = status_file.read_text()
+    report = json.loads(status_text)
+    assert report["state"] == "failed"
+    assert report["artifact_permissions_exit_code"] == 1
+    assert report["evidence_path"] == str(private_dir / "v2-live-acceptance.json")
+    assert auth_token not in status_text
+    assert daytona_key not in status_text
+
+    second = subprocess.run(
+        ["bash", str(runner_path)],
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert second.returncode == 0
+    assert "already has terminal state failed" in second.stdout
+    assert not called_marker.exists()
+
+
 def test_interrupted_startup_acceptance_runs_post_inventory(
     tmp_path: Path,
 ) -> None:
@@ -343,6 +587,7 @@ esac
     environment = os.environ | {
         "AFTER_MARKER": str(after_marker),
         "HARNESS_MARKER": str(harness_marker),
+        "MOE_TOOLS_ACCEPTANCE_PRIVATE_DIR": str(tmp_path / "private-acceptance"),
         "MOE_TOOLS_ACCEPTANCE_PYTHON_PATH": str(python_stub),
         "MOE_TOOLS_ACCEPTANCE_RUNNER_PATH": str(runner_path),
         "MOE_TOOLS_APP_ROOT": str(tmp_path / "app"),
@@ -381,7 +626,15 @@ esac
     assert report["state"] == "interrupted"
     assert report["cancellation_exit_code"] == 0
     assert report["daytona_after_exit_code"] == 0
+    assert report["artifact_permissions_exit_code"] == 0
     assert after_marker.exists()
+    private_dir = tmp_path / "private-acceptance"
+    for name in (
+        "v2-live-acceptance.log",
+        "daytona-before.json",
+        "daytona-after.json",
+    ):
+        assert _permission_mode(private_dir / name) == 0o600
 
 
 def test_release_workflows_pin_actions_and_require_both_source_revisions() -> None:

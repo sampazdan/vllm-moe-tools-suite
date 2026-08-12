@@ -20,6 +20,7 @@ import statistics
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -592,22 +593,16 @@ class V2LiveAcceptance:
         execution_policy = _answer_execution_policy()
         expected_contract_fingerprint = _contract_fingerprint(evaluation_contract)
         expected_policy_fingerprint = _contract_fingerprint(execution_policy)
-        expected_cohort_fingerprint = _canonical_fingerprint(
-            {
-                "version": 1,
-                "workload_fingerprint": _sha256(
-                    workload.get("content_fingerprint"),
-                    "answer workload content fingerprint",
-                ),
-                "workload_unit_ids": workload_unit_ids,
-                "scenario_ids": [],
-                "conditions": [],
-                "horizons": [],
-                "seeds": seeds,
-                "generation": generation,
-                "evaluation_contract_fingerprint": (expected_contract_fingerprint),
-                "execution_policy_fingerprint": expected_policy_fingerprint,
-            }
+        expected_cohort_fingerprint = _answer_cohort_fingerprint(
+            workload_fingerprint=_sha256(
+                workload.get("content_fingerprint"),
+                "answer workload content fingerprint",
+            ),
+            workload_unit_ids=workload_unit_ids,
+            seeds=seeds,
+            generation=generation,
+            evaluation_contract_fingerprint=expected_contract_fingerprint,
+            execution_policy_fingerprint=expected_policy_fingerprint,
         )
         experiment = self._submit_experiment(
             {
@@ -1544,6 +1539,32 @@ def _contract_fingerprint(value: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _answer_cohort_fingerprint(
+    *,
+    workload_fingerprint: str,
+    workload_unit_ids: Sequence[str],
+    seeds: Sequence[int],
+    generation: Mapping[str, Any],
+    evaluation_contract_fingerprint: str,
+    execution_policy_fingerprint: str,
+) -> str:
+    return _canonical_fingerprint(
+        {
+            "version": 1,
+            "workload_fingerprint": workload_fingerprint,
+            "workload_unit_ids": list(workload_unit_ids),
+            "scenario_ids": [],
+            "conditions": [],
+            "horizons": [],
+            "seeds": list(seeds),
+            "generation": generation,
+            "evaluation_contract_fingerprint": evaluation_contract_fingerprint,
+            "execution_policy_fingerprint": execution_policy_fingerprint,
+            "drift_parameter_fingerprint": None,
+        }
+    )
+
+
 def _canonical_fingerprint(value: object) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -1876,11 +1897,20 @@ def _write_report(path: Path, report: Mapping[str, Any]) -> None:
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    payload = (
+        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with suppress(OSError):
+            temporary.unlink()
+        raise
 
 
 def _nearest_rank(values: Sequence[float], quantile: float) -> float:

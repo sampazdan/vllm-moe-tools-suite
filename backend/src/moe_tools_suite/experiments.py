@@ -1964,7 +1964,9 @@ def _record_completion(
         performance.generation_time_ms or performance.time_to_first_token_ms or 0
     )
     routing = aggregate_routing(completion.routing, topology)
-    layer_totals = [sum(layer) for layer in routing.selection_counts]
+    selection_counts = routing.selection_counts.tolist()
+    routing_mass = routing.routing_mass.tolist()
+    layer_totals = [sum(layer) for layer in selection_counts]
     telemetry.routing.append(
         {
             "checkpoint": checkpoint,
@@ -1973,12 +1975,12 @@ def _record_completion(
             "topology_fingerprint": completion.topology_fingerprint,
             "total_routed_slots": routing.total_routed_slots,
             "selection_count_by_layer": layer_totals,
-            "selection_counts": routing.selection_counts,
-            "routing_mass": routing.routing_mass,
+            "selection_counts": selection_counts,
+            "routing_mass": routing_mass,
             "routing_fingerprint": canonical_fingerprint(
                 {
-                    "selection_counts": routing.selection_counts,
-                    "routing_mass": routing.routing_mass,
+                    "selection_counts": selection_counts,
+                    "routing_mass": routing_mass,
                 }
             ),
         }

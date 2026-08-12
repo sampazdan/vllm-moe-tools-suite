@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from moe_tools_suite.domain import EvaluationContract, ExecutionPolicy
-from moe_tools_suite.v2_domain import canonical_fingerprint
+from moe_tools_suite.main import create_app
+from moe_tools_suite.settings import Settings
 
 from scripts.acceptance_canary import ApiClient, CanaryFailure, Reporter
 from scripts.v2_live_acceptance import (
@@ -15,11 +18,11 @@ from scripts.v2_live_acceptance import (
     V2AcceptanceConfig,
     V2LiveAcceptance,
     _activation_statistics,
+    _answer_cohort_fingerprint,
     _answer_evaluation_contract,
     _answer_execution_policy,
     _answer_generation,
     _answer_seed_repetitions,
-    _canonical_fingerprint,
     _contract_fingerprint,
     _drift_insight,
     _profile_payloads,
@@ -394,19 +397,13 @@ class FakeV2Deployment:
                 self.progress_payload["execution_policy"]
             ),
         }
-        cohort_fingerprint = _canonical_fingerprint(
-            {
-                "version": 1,
-                "workload_fingerprint": ANSWER_CONTENT_FINGERPRINT,
-                "workload_unit_ids": list(ANSWER_UNIT_IDS),
-                "scenario_ids": [],
-                "conditions": [],
-                "horizons": [],
-                "seeds": [0, 1],
-                "generation": self.progress_payload["generation"],
-                "evaluation_contract_fingerprint": contract["fingerprint"],
-                "execution_policy_fingerprint": policy["fingerprint"],
-            }
+        cohort_fingerprint = _answer_cohort_fingerprint(
+            workload_fingerprint=ANSWER_CONTENT_FINGERPRINT,
+            workload_unit_ids=ANSWER_UNIT_IDS,
+            seeds=[0, 1],
+            generation=self.progress_payload["generation"],
+            evaluation_contract_fingerprint=contract["fingerprint"],
+            execution_policy_fingerprint=policy["fingerprint"],
         )
         return {
             "experiment": {
@@ -758,21 +755,11 @@ def test_answer_seed_repetitions_choose_minimum_twenty_unit_cohort() -> None:
         _answer_seed_repetitions(12, configured=1)
 
 
-def test_harness_contract_and_cohort_fingerprints_match_server_contract() -> None:
+def test_harness_contract_and_cohort_fingerprints_match_server_contract(
+    tmp_path: Path,
+) -> None:
     evaluation = _answer_evaluation_contract()
     policy = _answer_execution_policy()
-    cohort_identity = {
-        "version": 1,
-        "workload_fingerprint": ANSWER_CONTENT_FINGERPRINT,
-        "workload_unit_ids": list(ANSWER_UNIT_IDS),
-        "scenario_ids": [],
-        "conditions": [],
-        "horizons": [],
-        "seeds": [0, 1],
-        "generation": _answer_generation(),
-        "evaluation_contract_fingerprint": _contract_fingerprint(evaluation),
-        "execution_policy_fingerprint": _contract_fingerprint(policy),
-    }
 
     assert (
         _contract_fingerprint(evaluation)
@@ -782,9 +769,45 @@ def test_harness_contract_and_cohort_fingerprints_match_server_contract() -> Non
         _contract_fingerprint(policy)
         == ExecutionPolicy.model_validate(policy).fingerprint
     )
-    assert _canonical_fingerprint(cohort_identity) == canonical_fingerprint(
-        cohort_identity
+
+    app = create_app(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
     )
+    with TestClient(app) as client:
+        loaded = client.post("/api/model-sessions", json={"model_id": MODEL_ID})
+        assert loaded.status_code == 202
+        workload = next(
+            item
+            for item in client.get("/api/workloads").json()
+            if item["id"] == "answer:fixture-arithmetic"
+        )
+        submitted = client.post(
+            "/api/experiments",
+            json={
+                "model_id": MODEL_ID,
+                "workload_id": workload["id"],
+                "workload_unit_ids": workload["unit_ids"],
+                "seeds": [0, 1],
+                "generation": _answer_generation(),
+                "evaluation_contract": evaluation,
+                "execution_policy": policy,
+            },
+        )
+
+    assert submitted.status_code == 202
+    expected = _answer_cohort_fingerprint(
+        workload_fingerprint=workload["content_fingerprint"],
+        workload_unit_ids=workload["unit_ids"],
+        seeds=[0, 1],
+        generation=_answer_generation(),
+        evaluation_contract_fingerprint=_contract_fingerprint(evaluation),
+        execution_policy_fingerprint=_contract_fingerprint(policy),
+    )
+    assert expected == submitted.json()["cohort_fingerprint"]
 
 
 def test_drift_insight_fails_closed_without_real_routing_metrics() -> None:

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -33,6 +34,8 @@ from moe_tools_suite.experiments import (
     ExperimentAdapterResult,
     _largest_routing_shifts,
     _parse_tool_call,
+    _ProviderTelemetry,
+    _record_completion,
     _routing_distance,
 )
 from moe_tools_suite.lab import MODEL_ID, ResearchLab
@@ -2624,6 +2627,58 @@ def test_routing_comparison_quantifies_overlap_divergence_and_expert_shifts() ->
     assert shifts[0]["layer"] == 0
     assert shifts[0]["expert"] in {0, 1}
     assert abs(float(shifts[0]["delta"])) == pytest.approx(0.75)
+
+
+@pytest.mark.asyncio
+async def test_drift_routing_telemetry_is_json_native_and_persistable(
+    tmp_path: Path,
+) -> None:
+    topology = ModelTopology(
+        num_layers=2,
+        num_experts=4,
+        top_k=2,
+        routed_layer_ids=[0, 1],
+    )
+    runtime = MockModelRuntime(topology)
+    completion = await runtime.complete_chat(
+        [{"role": "user", "content": "Return 4."}],
+        request_key="drift:test:baseline:unit:1",
+        profile=None,
+    )
+    telemetry = _ProviderTelemetry()
+
+    _record_completion(completion, 1, telemetry, topology)
+
+    serialized = json.dumps(telemetry.routing)
+    assert json.loads(serialized) == telemetry.routing
+
+    lab = ResearchLab(Settings(mode="mock", data_dir=tmp_path / "data"))
+    try:
+        await lab.create_model_session(CreateModelSessionRequest())
+        experiment = lab.submit_experiment(
+            CreateExperimentRequest(
+                model_id=MODEL_ID,
+                workload_id="state-drift-v1",
+                scenario_ids=["ledger-reconciliation-v1"],
+                conditions=[DriftCondition.CHAINED],
+                horizons=[2],
+                seeds=[0],
+            )
+        )
+        unit = next(
+            item
+            for item in lab.experiments.units.values()
+            if item.experiment_id == experiment.id
+        )
+        unit.result = {"routing": telemetry.routing}
+
+        lab.store.save_run_unit(unit)
+
+        persisted = lab.store.load_run_units()[unit.id]
+        assert persisted.result == unit.result
+    finally:
+        await runtime.aclose()
+        await lab.shutdown()
 
 
 @pytest.mark.asyncio

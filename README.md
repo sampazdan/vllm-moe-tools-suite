@@ -603,21 +603,27 @@ For a disposable acceptance Pod whose secrets are supplied by its private Runpod
 template, set `MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START=1`. After the application is
 ready, the image starts the same Daytona-qualified driver against loopback HTTP.
 The runner never passes credentials on the command line, performs provider-wide
-Daytona inventories before and after the run, and stores private artifacts under
-`${MOE_TOOLS_DATA_DIR}/acceptance/`:
+Daytona inventories before and after the run, and separates its persistent guard
+state from its private artifacts. Runpod's `/workspace` FUSE mount can report
+`0666` even after a successful `chmod 0600`, so it is not used for logs or
+evidence that may contain provider output.
 
-- `v2-live-acceptance.status` records the atomic terminal state and exit codes;
-- `v2-live-acceptance.json` is the driver evidence;
-- `daytona-before.json` and `daytona-after.json` must both report an empty
-  provider-wide inventory; and
-- `v2-live-acceptance.log` contains the redacted driver output. The terminal
-  status also requires a byte-level scan of every generated artifact to find no
-  app or Daytona credential.
+- `${MOE_TOOLS_DATA_DIR}/acceptance/v2-live-acceptance.status` is the nonsecret,
+  atomic at-most-once guard that survives a container restart on `/workspace`.
+- `${MOE_TOOLS_ACCEPTANCE_PRIVATE_DIR}` defaults to the POSIX-capable container
+  disk path `/var/lib/moe-tools/acceptance`. Its `v2-live-acceptance.json`,
+  `daytona-before.json`, `daytona-after.json`, and `v2-live-acceptance.log` are
+  required to retain mode `0600`; the directory must retain `0700`.
+- The terminal status records the private absolute paths and requires both a
+  byte-level credential scan and a successful permission readback. The runner
+  writes a persistent terminal failure and refuses paid work if those modes
+  cannot be enforced.
 
 This paid opt-in is at most once per persistent data directory. A terminal failure
 is not retried on container restart, and an interrupted run is marked rather than
-silently repeated. Inspect and preserve the artifacts before deliberately removing
-the acceptance status/evidence for a new attempt. The secure session cookie is
+silently repeated. Copy the container-disk artifacts before deleting the Pod, and
+inspect and preserve them before deliberately removing the persistent status for a
+new attempt. The secure session cookie is
 rebound as non-Secure only inside the private canary client and only for literal
 plain-HTTP loopback; public proxy and arbitrary HTTP origins retain secure-cookie
 behavior. Browser, GPU-memory/equivalence, spend, and infrastructure teardown
