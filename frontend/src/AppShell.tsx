@@ -162,6 +162,9 @@ function RuntimeStatus({
 }
 
 function jobHref(job: JobRecord) {
+  if (job.kind === "experiment_run" && job.result_id) {
+    return `/experiments/${encodeURIComponent(job.result_id)}`;
+  }
   if (job.kind === "agent_run" && job.result_id) {
     return `/agent-runs/${encodeURIComponent(job.result_id)}`;
   }
@@ -172,6 +175,7 @@ function jobHref(job: JobRecord) {
 }
 
 function jobLabel(job: JobRecord) {
+  if (job.kind === "experiment_run") return "Experiment";
   if (job.kind === "agent_run") return "Agent run";
   if (job.kind === "benchmark_run") return "Benchmark";
   if (job.kind === "model_load") return "Model load";

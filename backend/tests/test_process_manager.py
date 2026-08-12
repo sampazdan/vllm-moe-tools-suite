@@ -6,8 +6,11 @@ from pathlib import Path
 
 import httpx
 import pytest
-from moe_tools_suite.domain import ExpertProfile, ProfileLayer
-from moe_tools_suite.process_manager import ManagedVllmServer
+from moe_tools_suite.domain import ExpertProfile, ModelRuntimeRecipe, ProfileLayer
+from moe_tools_suite.process_manager import (
+    ManagedVllmServer,
+    _vllm_child_environment,
+)
 
 MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8"
 
@@ -79,6 +82,37 @@ def _mock_owned_process_group(
     )
 
 
+def test_vllm_child_environment_has_explicit_allowlist_and_secret_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allowed = {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "NCCL_DEBUG": "INFO",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "RUNPOD_VLLM_TENSOR_PARALLEL_SIZE": "2",
+        "VLLM_USE_V1": "1",
+        "HF_HOME": "/tmp/hf-cache",
+        "HF_TOKEN": "minimum-model-download-credential",
+    }
+    denied = {
+        "CUDA_SECRET_CHANNEL": "must-not-reach-vllm",
+        "NCCL_PASSWORD": "must-not-reach-vllm",
+        "PYTORCH_AUTH_TOKEN": "must-not-reach-vllm",
+        "RUNPOD_VLLM_CONTROL_TOKEN": "must-not-reach-vllm",
+        "VLLM_API_KEY": "must-not-reach-vllm",
+        "MOE_TOOLS_AUTH_TOKEN": "must-not-reach-vllm",
+        "AWS_ACCESS_KEY_ID": "must-not-reach-vllm",
+        "CUSTOM_PASSWORD": "must-not-reach-vllm",
+    }
+    for key, value in {**allowed, **denied}.items():
+        monkeypatch.setenv(key, value)
+
+    environment = _vllm_child_environment()
+
+    assert {key: environment.get(key) for key in allowed} == allowed
+    assert all(key not in environment for key in denied)
+
+
 def test_process_group_validation_fails_closed_for_a_nonleader_pid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -111,6 +145,10 @@ async def test_managed_server_writes_profile_and_capture_environment(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-vllm")
     monkeypatch.setenv("MOE_TOOLS_OPENAI_API_KEY", "must-not-reach-vllm")
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-vllm")
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-reach-vllm")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-reach-vllm")
+    monkeypatch.setenv("CUSTOM_PASSWORD", "must-not-reach-vllm")
+    monkeypatch.setenv("HF_TOKEN", "minimum-model-download-credential")
     transport = httpx.MockTransport(
         lambda request: httpx.Response(
             200, json={"data": [{"id": MODEL_ID}]}, request=request
@@ -125,14 +163,34 @@ async def test_managed_server_writes_profile_and_capture_environment(
             lambda pid: ("100", f"{manager.command} {pid}"),
         )
         profile = ExpertProfile(layers={"0": ProfileLayer(keep=list(range(8)))})
+        revision = "1" * 40
+        recipe = ModelRuntimeRecipe(
+            revision=revision,
+            tensor_parallel_size=2,
+            max_model_len=8192,
+            reasoning_parser="qwen3",
+        )
 
-        await manager.start(profile=profile, session_id="masked-session")
+        await manager.start(
+            profile=profile,
+            session_id="masked-session",
+            model_id=MODEL_ID,
+            model_revision=revision,
+            runtime_recipe=recipe,
+        )
 
         assert manager.pid == 4242
-        assert invocation["args"] == (str(manager.command),)
+        assert invocation["args"] == (
+            str(manager.command),
+            "--tensor-parallel-size",
+            "2",
+        )
         environment = invocation["kwargs"]["env"]
         assert environment["RUNPOD_CAPTURE_ROUTING"] == "1"
         assert environment["RUNPOD_VLLM_MODEL"] == MODEL_ID
+        assert environment["RUNPOD_VLLM_REVISION"] == revision
+        assert environment["RUNPOD_VLLM_MAX_MODEL_LEN"] == "8192"
+        assert environment["RUNPOD_REASONING_PARSER"] == "qwen3"
         assert "MOE_TOOLS_AUTH_TOKEN" not in environment
         assert "RUNPOD_API_KEY" not in environment
         assert "MOE_TOOLS_DAYTONA_API_KEY" not in environment
@@ -143,6 +201,10 @@ async def test_managed_server_writes_profile_and_capture_environment(
         assert "ANTHROPIC_API_KEY" not in environment
         assert "MOE_TOOLS_OPENAI_API_KEY" not in environment
         assert "OPENAI_API_KEY" not in environment
+        assert "GITHUB_TOKEN" not in environment
+        assert "AWS_SECRET_ACCESS_KEY" not in environment
+        assert "CUSTOM_PASSWORD" not in environment
+        assert environment["HF_TOKEN"] == "minimum-model-download-credential"
         profile_path = Path(environment["MOE_PROFILE"])
         assert json.loads(profile_path.read_text()) == profile.model_dump(mode="json")
         process_record = json.loads((manager.runtime_dir / "vllm.pid").read_text())
@@ -150,6 +212,8 @@ async def test_managed_server_writes_profile_and_capture_environment(
             "pid": 4242,
             "session_id": "masked-session",
             "start_ticks": "100",
+            "model_id": MODEL_ID,
+            "model_revision": revision,
         }
 
         await manager.stop()
@@ -287,6 +351,59 @@ async def test_baseline_start_removes_inherited_profile(
 
         assert "MOE_PROFILE" not in invocation["env"]
         await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_expert_context_control_uses_internal_token_and_validates_receipt(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert len(request.headers["X-vLLM-Expert-Context-Token"]) >= 32
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "supported": True,
+                    "unsupported_reason": None,
+                    "topology_fingerprint": "t" * 64,
+                    "layers": [],
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "old_context_id": "baseline",
+                "old_context_fingerprint": "a" * 64,
+                "new_context_id": "mask-a",
+                "new_context_fingerprint": "b" * 64,
+                "topology_fingerprint": "c" * 64,
+                "duration_ms": 12.5,
+                "process_id": 4242,
+                "weights_reloaded": False,
+            },
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        manager = _manager(tmp_path, _launcher(tmp_path), client)
+        manager._process = FakeProcess()
+
+        capabilities = await manager.context_capabilities()
+        receipt = await manager.activate_context("mask-a")
+
+    assert capabilities["supported"] is True
+    assert receipt.new_context_id == "mask-a"
+    assert receipt.weights_reloaded is False
+    assert [request.url.path for request in requests] == [
+        "/v1/internal/moe-contexts/capabilities",
+        "/v1/internal/moe-contexts/activate",
+    ]
+    for request in requests:
+        assert request.extensions["timeout"]["read"] >= 300
 
 
 @pytest.mark.asyncio
@@ -448,3 +565,110 @@ async def test_cancelled_startup_stops_the_spawned_process(
         assert process.terminated
         assert manager.pid is None
         assert not (manager.runtime_dir / "vllm.pid").exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_spawn_waits_for_handle_then_stops_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = FakeProcess()
+    spawned = asyncio.Event()
+    release = asyncio.Event()
+
+    async def create_subprocess(*args, **kwargs):
+        del args, kwargs
+        spawned.set()
+        await release.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, request=request)
+        )
+    ) as client:
+        manager = _manager(tmp_path, _launcher(tmp_path), client)
+        _mock_owned_process_group(manager, process, monkeypatch)
+        startup = asyncio.create_task(
+            manager.start(profile=None, session_id="cancelled-during-spawn")
+        )
+        await asyncio.wait_for(spawned.wait(), timeout=1)
+
+        startup.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await startup
+
+        assert process.terminated
+        assert manager.pid is None
+        assert manager._log_handle is None
+
+
+@pytest.mark.asyncio
+async def test_pid_record_failure_stops_spawned_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = FakeProcess()
+
+    async def create_subprocess(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, request=request)
+        )
+    ) as client:
+        manager = _manager(tmp_path, _launcher(tmp_path), client)
+        _mock_owned_process_group(manager, process, monkeypatch)
+        monkeypatch.setattr(
+            manager,
+            "_write_pid_file",
+            lambda _pid, _session_id: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        with pytest.raises(OSError, match="disk full"):
+            await manager.start(profile=None, session_id="pid-record-failure")
+
+        assert process.terminated
+        assert manager.pid is None
+        assert manager._log_handle is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_startup_during_recorded_process_cleanup_finishes_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cleanup_entered = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    calls = 0
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, request=request)
+        )
+    ) as client:
+        manager = _manager(tmp_path, _launcher(tmp_path), client)
+
+        async def stop_recorded_process() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                cleanup_entered.set()
+                await cleanup_release.wait()
+
+        monkeypatch.setattr(manager, "_stop_recorded_process", stop_recorded_process)
+        startup = asyncio.create_task(
+            manager.start(profile=None, session_id="cancelled-before-spawn")
+        )
+        await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
+
+        startup.cancel()
+        cleanup_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await startup
+
+        assert calls == 2
+        assert manager.pid is None
+        assert manager._log_handle is None

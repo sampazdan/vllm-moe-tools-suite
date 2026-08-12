@@ -587,6 +587,13 @@ class RoutingArtifactInfo(AgenticModel):
     sha256: Annotated[str, Field(min_length=64, max_length=64)]
     token_count: Annotated[int, Field(ge=0)]
     total_routed_slots: Annotated[int, Field(ge=0)]
+    context_id: str | None = None
+    context_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
+    topology_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
 
 
 class TrialRoutingSummary(AgenticModel):
@@ -604,6 +611,13 @@ class TrialRoutingSummary(AgenticModel):
     model_session_id: str
     profile_id: str | None = None
     profile_fingerprint: str | None = None
+    context_id: str | None = None
+    context_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
+    topology_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
     artifacts: list[RoutingArtifactInfo] = Field(default_factory=list)
 
 
@@ -612,6 +626,13 @@ class InferenceCall(AgenticModel):
     trial_id: str
     trajectory_step_id: str
     model_session_id: str
+    context_id: str | None = None
+    context_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
+    topology_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
     request_hash: Annotated[str, Field(min_length=64, max_length=64)]
     prompt_tokens: Annotated[int, Field(ge=0)] = 0
     reasoning_tokens: Annotated[int, Field(ge=0)] | None = None
@@ -678,6 +699,13 @@ class AgentTrial(AgenticModel):
     attempt: Annotated[int, Field(ge=1)] = 1
     seed: int = 0
     model_session_id: str
+    context_id: str | None = None
+    context_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
+    topology_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
     status: AgentTrialStatus = AgentTrialStatus.QUEUED
     sandbox_session_id: str | None = None
     reward: Annotated[float, Field(ge=0, le=1)] | None = None
@@ -713,6 +741,13 @@ class AgentTrialSummary(AgenticModel):
     commands: Annotated[int, Field(ge=0)] = 0
     prompt_tokens: Annotated[int, Field(ge=0)] = 0
     completion_tokens: Annotated[int, Field(ge=0)] = 0
+    context_id: str | None = None
+    context_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
+    topology_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
     inference_calls: Annotated[int, Field(ge=0)] = 0
     routed_inference_calls: Annotated[int, Field(ge=0)] = 0
     termination_reason: str | None = None
@@ -734,6 +769,13 @@ class AgentRun(AgenticModel):
     model_session_id: str
     profile_id: str | None = None
     profile_fingerprint: str | None = None
+    context_id: str | None = None
+    context_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
+    topology_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
     agent_id: AgenticId
     agent_revision: str
     sandbox_provider_id: AgenticId
@@ -780,6 +822,13 @@ class AgentRunView(AgenticModel):
     model_session_id: str
     profile_id: str | None = None
     profile_fingerprint: str | None = None
+    context_id: str | None = None
+    context_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
+    topology_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
     agent_id: AgenticId
     agent_revision: str
     sandbox_provider_id: AgenticId
@@ -810,6 +859,13 @@ class AgentRunView(AgenticModel):
 
 class InferenceCallSummary(AgenticModel):
     id: str
+    context_id: str | None = None
+    context_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
+    topology_fingerprint: Annotated[str, Field(min_length=64, max_length=64)] | None = (
+        None
+    )
     prompt_tokens: Annotated[int, Field(ge=0)] = 0
     reasoning_tokens: Annotated[int, Field(ge=0)] | None = None
     completion_tokens: Annotated[int, Field(ge=0)] = 0

@@ -15,8 +15,11 @@ from sqlalchemy import (
     Text,
     create_engine,
     event,
+    func,
     inspect,
+    select,
     text,
+    update,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -30,15 +33,35 @@ from .domain import (
     ExecutionPolicy,
     ExpertProfile,
     JobKind,
+    JobPhaseRecord,
     JobRecord,
     JobStatus,
     LLMJudgeResult,
+    ModelLoadPhase,
+    ModelRuntimeRecipe,
     ModelSession,
     ModelState,
+    ModelTopology,
     ProfileValidation,
     RoutingSummary,
     RunProvenance,
     SavedExpertProfile,
+)
+from .v2_domain import (
+    EvaluationResultRecord,
+    Experiment,
+    ExperimentLane,
+    ExperimentStatus,
+    InterventionContextRef,
+    PerformanceSnapshot,
+    RunEvent,
+    RunEventKind,
+    RunUnit,
+    RunUnitStatus,
+    WorkloadDescriptor,
+    WorkloadRun,
+    WorkloadRunStatus,
+    utc_now,
 )
 
 
@@ -54,6 +77,9 @@ class ModelSessionRow(Base):
     state: Mapped[str] = mapped_column(String, nullable=False, index=True)
     mode: Mapped[str] = mapped_column(String, nullable=False)
     profile_json: Mapped[str | None] = mapped_column(Text)
+    model_revision: Mapped[str | None] = mapped_column(String(40))
+    topology_json: Mapped[str | None] = mapped_column(Text)
+    runtime_recipe_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -199,6 +225,7 @@ class JobRow(Base):
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     result_id: Mapped[str | None] = mapped_column(String)
     error: Mapped[str | None] = mapped_column(Text)
+    phase_history_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -283,6 +310,140 @@ class JudgeEvaluationRow(Base):
     )
 
 
+class InterventionContextRow(Base):
+    __tablename__ = "intervention_contexts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    model_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    profile_id: Mapped[str | None] = mapped_column(String, index=True)
+    profile_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    context_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, index=True
+    )
+    topology_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class WorkloadDescriptorRow(Base):
+    __tablename__ = "workload_descriptors"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    content_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, index=True
+    )
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class ExperimentRow(Base):
+    __tablename__ = "experiments"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    job_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    model_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    workload_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    latest_event_sequence: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ExperimentLaneRow(Base):
+    __tablename__ = "experiment_lanes"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    experiment_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class WorkloadRunRow(Base):
+    __tablename__ = "workload_runs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    experiment_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    lane_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    workload_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class RunUnitRow(Base):
+    __tablename__ = "run_units"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    experiment_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    lane_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    workload_run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class RunEventRow(Base):
+    __tablename__ = "run_events"
+
+    experiment_id: Mapped[str] = mapped_column(String, primary_key=True, nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    lane_id: Mapped[str | None] = mapped_column(String, index=True)
+    workload_run_id: Mapped[str | None] = mapped_column(String, index=True)
+    run_unit_id: Mapped[str | None] = mapped_column(String, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class ExperimentEvaluationResultRow(Base):
+    __tablename__ = "experiment_evaluation_results"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    workload_run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    run_unit_id: Mapped[str | None] = mapped_column(String, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class PerformanceSnapshotRow(Base):
+    __tablename__ = "performance_snapshots"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    workload_run_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    run_unit_id: Mapped[str | None] = mapped_column(String, index=True)
+    record_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class SqliteStore:
     """Durable metadata and routing artifacts for one application writer."""
 
@@ -312,6 +473,13 @@ class SqliteStore:
             },
             "benchmark_run_metadata": {"record_json": "TEXT"},
             "expert_profiles": {"metadata_json": "TEXT"},
+            "model_sessions": {
+                "model_revision": "VARCHAR(40)",
+                "topology_json": "TEXT",
+                "runtime_recipe_json": "TEXT",
+            },
+            "jobs": {"phase_history_json": "TEXT"},
+            "experiments": {"latest_event_sequence": "INTEGER NOT NULL DEFAULT 0"},
         }
         with self.engine.begin() as connection:
             inspector = inspect(connection)
@@ -328,6 +496,15 @@ class SqliteStore:
                             f'ADD COLUMN "{column_name}" {column_type}'
                         )
                     )
+            if inspector.has_table("experiments") and inspector.has_table("run_events"):
+                connection.execute(
+                    text(
+                        "UPDATE experiments SET latest_event_sequence = "
+                        "MAX(latest_event_sequence, COALESCE((SELECT MAX(sequence) "
+                        "FROM run_events WHERE run_events.experiment_id = "
+                        "experiments.id), 0))"
+                    )
+                )
 
     def save_model_session(self, model_session: ModelSession) -> None:
         now = datetime.now(UTC)
@@ -346,6 +523,17 @@ class SqliteStore:
                         state=model_session.state.value,
                         mode=model_session.mode,
                         profile_json=profile_json,
+                        model_revision=model_session.model_revision,
+                        topology_json=(
+                            model_session.topology.model_dump_json()
+                            if model_session.topology is not None
+                            else None
+                        ),
+                        runtime_recipe_json=(
+                            model_session.runtime_recipe.model_dump_json()
+                            if model_session.runtime_recipe is not None
+                            else None
+                        ),
                         created_at=model_session.created_at,
                         updated_at=now,
                     )
@@ -353,6 +541,17 @@ class SqliteStore:
             else:
                 row.state = model_session.state.value
                 row.profile_json = profile_json
+                row.model_revision = model_session.model_revision
+                row.topology_json = (
+                    model_session.topology.model_dump_json()
+                    if model_session.topology is not None
+                    else None
+                )
+                row.runtime_recipe_json = (
+                    model_session.runtime_recipe.model_dump_json()
+                    if model_session.runtime_recipe is not None
+                    else None
+                )
                 row.updated_at = now
             profile_link = database.get(ModelSessionProfileRow, model_session.id)
             if model_session.profile_id is not None:
@@ -388,6 +587,17 @@ class SqliteStore:
                         if model_session.profile is not None
                         else None
                     ),
+                    model_revision=model_session.model_revision,
+                    topology_json=(
+                        model_session.topology.model_dump_json()
+                        if model_session.topology is not None
+                        else None
+                    ),
+                    runtime_recipe_json=(
+                        model_session.runtime_recipe.model_dump_json()
+                        if model_session.runtime_recipe is not None
+                        else None
+                    ),
                     created_at=model_session.created_at,
                     updated_at=now,
                 )
@@ -409,6 +619,10 @@ class SqliteStore:
                     payload_json=json.dumps(payload, separators=(",", ":")),
                     result_id=job.result_id,
                     error=job.error,
+                    phase_history_json=json.dumps(
+                        [phase.model_dump(mode="json") for phase in job.phase_history],
+                        separators=(",", ":"),
+                    ),
                     created_at=job.created_at,
                     started_at=job.started_at,
                     completed_at=job.completed_at,
@@ -445,6 +659,32 @@ class SqliteStore:
                     row.error = (
                         "application restarted during model loading; the linked "
                         "model session was marked failed and the request can be retried"
+                    )
+                    phase_history = (
+                        [
+                            JobPhaseRecord.model_validate(value)
+                            for value in json.loads(row.phase_history_json)
+                        ]
+                        if row.phase_history_json
+                        else []
+                    )
+                    for phase in reversed(phase_history):
+                        if phase.status == "active":
+                            phase.status = "failed"
+                            phase.completed_at = now
+                            break
+                    phase_history.append(
+                        JobPhaseRecord(
+                            phase=ModelLoadPhase.FAILED,
+                            status="failed",
+                            started_at=now,
+                            completed_at=now,
+                            detail=row.error,
+                        )
+                    )
+                    row.phase_history_json = json.dumps(
+                        [phase.model_dump(mode="json") for phase in phase_history],
+                        separators=(",", ":"),
                     )
                 else:
                     row.error = "application restarted before the job completed"
@@ -490,6 +730,17 @@ class SqliteStore:
                     mode=row.mode,
                     profile=profile,
                     profile_id=profile_ids.get(row.id),
+                    model_revision=row.model_revision,
+                    topology=(
+                        ModelTopology.model_validate_json(row.topology_json)
+                        if row.topology_json is not None
+                        else None
+                    ),
+                    runtime_recipe=(
+                        ModelRuntimeRecipe.model_validate_json(row.runtime_recipe_json)
+                        if row.runtime_recipe_json is not None
+                        else None
+                    ),
                     created_at=_as_utc(row.created_at),
                 )
         return loaded
@@ -600,6 +851,10 @@ class SqliteStore:
                     payload_json=json.dumps(payload, separators=(",", ":")),
                     result_id=job.result_id,
                     error=job.error,
+                    phase_history_json=json.dumps(
+                        [phase.model_dump(mode="json") for phase in job.phase_history],
+                        separators=(",", ":"),
+                    ),
                     created_at=job.created_at,
                     started_at=job.started_at,
                     completed_at=job.completed_at,
@@ -635,6 +890,14 @@ class SqliteStore:
                     progress_total=row.progress_total,
                     result_id=row.result_id,
                     error=row.error,
+                    phase_history=(
+                        [
+                            JobPhaseRecord.model_validate(value)
+                            for value in json.loads(row.phase_history_json)
+                        ]
+                        if row.phase_history_json
+                        else []
+                    ),
                     created_at=_as_utc(row.created_at),
                     started_at=_as_utc(row.started_at) if row.started_at else None,
                     completed_at=(
@@ -864,6 +1127,9 @@ class SqliteStore:
                                 for ref in profile.source_refs
                             ],
                             "source_fingerprint": profile.source_fingerprint,
+                            "profile_fingerprint_version": (
+                                profile.profile_fingerprint_version
+                            ),
                             "selection_strategy": profile.selection_strategy,
                             "selection_config": profile.selection_config,
                         },
@@ -909,6 +1175,9 @@ class SqliteStore:
                     model_id=row.model_id,
                     profile=ExpertProfile.model_validate_json(row.profile_json),
                     profile_fingerprint=row.profile_fingerprint,
+                    profile_fingerprint_version=profile_metadata.get(
+                        "profile_fingerprint_version"
+                    ),
                     source=row.source,
                     source_run_id=row.source_run_id,
                     source_trial_id=trial_ids.get(row.id),
@@ -1031,6 +1300,451 @@ class SqliteStore:
                     created_at=_as_utc(row.created_at),
                 )
         return loaded
+
+    def save_intervention_context(self, context: InterventionContextRef) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                InterventionContextRow(
+                    id=context.context_id,
+                    model_id=context.model_id,
+                    kind=context.kind.value,
+                    profile_id=context.profile_id,
+                    profile_fingerprint=context.profile_fingerprint,
+                    context_fingerprint=context.context_fingerprint,
+                    topology_fingerprint=context.topology_fingerprint,
+                    record_json=context.model_dump_json(),
+                    created_at=utc_now(),
+                )
+            )
+
+    def load_intervention_contexts(self) -> dict[str, InterventionContextRef]:
+        with self.sessions() as database:
+            rows = database.query(InterventionContextRow).order_by(
+                InterventionContextRow.created_at
+            )
+            return {
+                row.id: InterventionContextRef.model_validate_json(row.record_json)
+                for row in rows
+            }
+
+    def save_workload_descriptor(self, descriptor: WorkloadDescriptor) -> None:
+        with self.sessions.begin() as database:
+            database.merge(
+                WorkloadDescriptorRow(
+                    id=descriptor.id,
+                    kind=descriptor.kind.value,
+                    content_fingerprint=descriptor.content_fingerprint,
+                    record_json=descriptor.model_dump_json(),
+                )
+            )
+
+    def save_experiment(self, experiment: Experiment) -> None:
+        with self.sessions.begin() as database:
+            persisted_sequence = database.scalar(
+                select(ExperimentRow.latest_event_sequence).where(
+                    ExperimentRow.id == experiment.id
+                )
+            )
+            if persisted_sequence is not None:
+                experiment.latest_event_sequence = max(
+                    experiment.latest_event_sequence, persisted_sequence
+                )
+            database.merge(self._experiment_row(experiment))
+            for lane in experiment.lanes:
+                database.merge(self._experiment_lane_row(lane))
+
+    def save_experiment_bundle(
+        self,
+        experiment: Experiment,
+        workload_runs: list[WorkloadRun],
+        units: list[RunUnit],
+        initial_event: RunEvent,
+    ) -> None:
+        """Persist an executable experiment graph before it becomes observable."""
+
+        if initial_event.experiment_id != experiment.id or initial_event.sequence != 1:
+            raise ValueError("initial experiment event must have sequence one")
+        with self.sessions.begin() as database:
+            database.merge(self._experiment_row(experiment))
+            database.merge(
+                WorkloadDescriptorRow(
+                    id=experiment.workload.id,
+                    kind=experiment.workload.kind.value,
+                    content_fingerprint=experiment.workload.content_fingerprint,
+                    record_json=experiment.workload.model_dump_json(),
+                )
+            )
+            for lane in experiment.lanes:
+                database.merge(self._experiment_lane_row(lane))
+                database.merge(
+                    InterventionContextRow(
+                        id=lane.context.context_id,
+                        model_id=lane.context.model_id,
+                        kind=lane.context.kind.value,
+                        profile_id=lane.context.profile_id,
+                        profile_fingerprint=lane.context.profile_fingerprint,
+                        context_fingerprint=lane.context.context_fingerprint,
+                        topology_fingerprint=lane.context.topology_fingerprint,
+                        record_json=lane.context.model_dump_json(),
+                        created_at=experiment.created_at,
+                    )
+                )
+            for workload_run in workload_runs:
+                database.merge(self._workload_run_row(workload_run))
+            for unit in units:
+                database.merge(self._run_unit_row(unit))
+            database.add(self._run_event_row(initial_event))
+            database.execute(
+                update(ExperimentRow)
+                .where(ExperimentRow.id == experiment.id)
+                .values(latest_event_sequence=initial_event.sequence)
+            )
+
+    def save_workload_run(self, workload_run: WorkloadRun) -> None:
+        with self.sessions.begin() as database:
+            database.merge(self._workload_run_row(workload_run))
+
+    def save_run_unit(self, unit: RunUnit) -> None:
+        with self.sessions.begin() as database:
+            database.merge(self._run_unit_row(unit))
+            if unit.evaluation is not None:
+                database.merge(self._evaluation_result_row(unit.evaluation))
+            if unit.performance is not None:
+                database.merge(self._performance_snapshot_row(unit.performance))
+
+    def append_run_event(
+        self,
+        *,
+        experiment_id: str,
+        kind: RunEventKind,
+        phase: str,
+        message: str = "",
+        lane_id: str | None = None,
+        workload_run_id: str | None = None,
+        run_unit_id: str | None = None,
+        checkpoint: int | None = None,
+        data: dict[str, object] | None = None,
+    ) -> RunEvent:
+        """Append one event using the next durable per-experiment sequence."""
+
+        with self.sessions.begin() as database:
+            next_sequence = database.execute(
+                update(ExperimentRow)
+                .where(ExperimentRow.id == experiment_id)
+                .values(latest_event_sequence=(ExperimentRow.latest_event_sequence + 1))
+                .returning(ExperimentRow.latest_event_sequence)
+            ).scalar_one_or_none()
+            if next_sequence is None:
+                raise KeyError(experiment_id)
+            event_record = RunEvent(
+                experiment_id=experiment_id,
+                sequence=int(next_sequence),
+                kind=kind,
+                phase=phase,
+                message=message,
+                lane_id=lane_id,
+                workload_run_id=workload_run_id,
+                run_unit_id=run_unit_id,
+                checkpoint=checkpoint,
+                data=data or {},
+            )
+            database.add(self._run_event_row(event_record))
+        return event_record
+
+    def save_experiment_event(
+        self,
+        experiment: Experiment,
+        *,
+        kind: RunEventKind,
+        phase: str,
+        message: str = "",
+        lane_id: str | None = None,
+        workload_runs: list[WorkloadRun] | None = None,
+        unit: RunUnit | None = None,
+        checkpoint: int | None = None,
+        data: dict[str, object] | None = None,
+    ) -> RunEvent:
+        """Commit experiment state and its next event as one transition."""
+
+        with self.sessions.begin() as database:
+            next_sequence = database.execute(
+                update(ExperimentRow)
+                .where(ExperimentRow.id == experiment.id)
+                .values(latest_event_sequence=(ExperimentRow.latest_event_sequence + 1))
+                .returning(ExperimentRow.latest_event_sequence)
+            ).scalar_one_or_none()
+            if next_sequence is None:
+                raise KeyError(experiment.id)
+            committed_sequence = int(next_sequence)
+            persisted_experiment = experiment.model_copy(
+                update={"latest_event_sequence": committed_sequence}
+            )
+            event = RunEvent(
+                experiment_id=experiment.id,
+                sequence=committed_sequence,
+                kind=kind,
+                phase=phase,
+                message=message,
+                lane_id=lane_id,
+                workload_run_id=(
+                    unit.workload_run_id
+                    if unit is not None
+                    else (
+                        workload_runs[0].id
+                        if workload_runs is not None and len(workload_runs) == 1
+                        else None
+                    )
+                ),
+                run_unit_id=(unit.id if unit else None),
+                checkpoint=checkpoint,
+                data=data or {},
+            )
+            database.merge(self._experiment_row(persisted_experiment))
+            for lane in experiment.lanes:
+                database.merge(self._experiment_lane_row(lane))
+            for workload_run in workload_runs or []:
+                database.merge(self._workload_run_row(workload_run))
+            if unit is not None:
+                database.merge(self._run_unit_row(unit))
+                if unit.evaluation is not None:
+                    database.merge(self._evaluation_result_row(unit.evaluation))
+                if unit.performance is not None:
+                    database.merge(self._performance_snapshot_row(unit.performance))
+            database.add(self._run_event_row(event))
+        experiment.latest_event_sequence = committed_sequence
+        return event
+
+    def load_experiments(self) -> dict[str, Experiment]:
+        with self.sessions() as database:
+            rows = database.query(ExperimentRow).order_by(ExperimentRow.created_at)
+            loaded = {
+                row.id: Experiment.model_validate_json(row.record_json) for row in rows
+            }
+            latest_sequences = dict(
+                database.query(
+                    RunEventRow.experiment_id,
+                    func.max(RunEventRow.sequence),
+                ).group_by(RunEventRow.experiment_id)
+            )
+        for experiment_id, experiment in loaded.items():
+            experiment.latest_event_sequence = int(
+                latest_sequences.get(experiment_id, 0) or 0
+            )
+        return loaded
+
+    def load_workload_runs(self) -> dict[str, WorkloadRun]:
+        with self.sessions() as database:
+            rows = database.query(WorkloadRunRow).order_by(WorkloadRunRow.created_at)
+            return {
+                row.id: WorkloadRun.model_validate_json(row.record_json) for row in rows
+            }
+
+    def load_run_units(self) -> dict[str, RunUnit]:
+        with self.sessions() as database:
+            rows = database.query(RunUnitRow).order_by(
+                RunUnitRow.experiment_id, RunUnitRow.ordinal
+            )
+            return {
+                row.id: RunUnit.model_validate_json(row.record_json) for row in rows
+            }
+
+    def load_run_events(
+        self,
+        experiment_id: str,
+        *,
+        after: int = 0,
+        limit: int = 500,
+    ) -> tuple[list[RunEvent], int, bool]:
+        if after < 0:
+            raise ValueError("event cursor cannot be negative")
+        if not 1 <= limit <= 1000:
+            raise ValueError("event page limit must be between 1 and 1000")
+        with self.sessions() as database:
+            rows = (
+                database.query(RunEventRow)
+                .filter(
+                    RunEventRow.experiment_id == experiment_id,
+                    RunEventRow.sequence > after,
+                )
+                .order_by(RunEventRow.sequence)
+                .limit(limit + 1)
+                .all()
+            )
+            latest = (
+                database.query(func.max(RunEventRow.sequence))
+                .filter(RunEventRow.experiment_id == experiment_id)
+                .scalar()
+            )
+        has_more = len(rows) > limit
+        return (
+            [RunEvent.model_validate_json(row.record_json) for row in rows[:limit]],
+            int(latest or 0),
+            has_more,
+        )
+
+    def reconcile_interrupted_experiments(self) -> int:
+        """Fail active V2 records without inventing completed work after restart."""
+
+        active_experiments = {
+            ExperimentStatus.QUEUED,
+            ExperimentStatus.RUNNING,
+            ExperimentStatus.CANCELLING,
+        }
+        active_runs = {WorkloadRunStatus.QUEUED, WorkloadRunStatus.RUNNING}
+        active_units = {RunUnitStatus.QUEUED, RunUnitStatus.RUNNING}
+        now = utc_now()
+        reconciled = 0
+        with self.sessions.begin() as database:
+            for row in database.query(ExperimentRow):
+                experiment = Experiment.model_validate_json(row.record_json)
+                if experiment.status not in active_experiments:
+                    continue
+                experiment.status = ExperimentStatus.FAILED
+                experiment.error = (
+                    "application restarted before the experiment completed"
+                )
+                experiment.completed_at = now
+                for lane in experiment.lanes:
+                    if lane.status in active_runs:
+                        lane.status = WorkloadRunStatus.FAILED
+                    lane_row = database.get(ExperimentLaneRow, lane.id)
+                    if lane_row is not None:
+                        lane_row.status = lane.status.value
+                        lane_row.record_json = lane.model_dump_json()
+                latest_sequence = database.scalar(
+                    select(func.max(RunEventRow.sequence)).where(
+                        RunEventRow.experiment_id == experiment.id
+                    )
+                )
+                next_sequence = int(latest_sequence or 0) + 1
+                experiment.latest_event_sequence = next_sequence
+                database.add(
+                    self._run_event_row(
+                        RunEvent(
+                            experiment_id=experiment.id,
+                            sequence=next_sequence,
+                            kind=RunEventKind.FAILED,
+                            phase="failed",
+                            message=experiment.error,
+                            data={"reconciled_after_restart": True},
+                            created_at=now,
+                        )
+                    )
+                )
+                row.status = experiment.status.value
+                row.latest_event_sequence = next_sequence
+                row.record_json = experiment.model_dump_json()
+                row.updated_at = now
+                reconciled += 1
+            for row in database.query(WorkloadRunRow):
+                run = WorkloadRun.model_validate_json(row.record_json)
+                if run.status not in active_runs:
+                    continue
+                run.status = WorkloadRunStatus.FAILED
+                run.error = "application restarted before the workload run completed"
+                run.completed_at = now
+                row.status = run.status.value
+                row.record_json = run.model_dump_json()
+                row.updated_at = now
+            for row in database.query(RunUnitRow):
+                unit = RunUnit.model_validate_json(row.record_json)
+                if unit.status not in active_units:
+                    continue
+                unit.status = RunUnitStatus.ERROR
+                unit.completed_at = now
+                row.status = unit.status.value
+                row.record_json = unit.model_dump_json()
+                row.updated_at = now
+        return reconciled
+
+    @staticmethod
+    def _experiment_row(experiment: Experiment) -> ExperimentRow:
+        return ExperimentRow(
+            id=experiment.id,
+            job_id=experiment.job_id,
+            model_id=experiment.model_id,
+            workload_id=experiment.workload.id,
+            status=experiment.status.value,
+            latest_event_sequence=experiment.latest_event_sequence,
+            record_json=experiment.model_dump_json(),
+            created_at=experiment.created_at,
+            updated_at=utc_now(),
+        )
+
+    @staticmethod
+    def _experiment_lane_row(lane: ExperimentLane) -> ExperimentLaneRow:
+        return ExperimentLaneRow(
+            id=lane.id,
+            experiment_id=lane.experiment_id,
+            role=lane.role.value,
+            status=lane.status.value,
+            record_json=lane.model_dump_json(),
+        )
+
+    @staticmethod
+    def _workload_run_row(workload_run: WorkloadRun) -> WorkloadRunRow:
+        return WorkloadRunRow(
+            id=workload_run.id,
+            experiment_id=workload_run.experiment_id,
+            lane_id=workload_run.lane_id,
+            workload_id=workload_run.workload.id,
+            status=workload_run.status.value,
+            record_json=workload_run.model_dump_json(),
+            created_at=workload_run.created_at,
+            updated_at=utc_now(),
+        )
+
+    @staticmethod
+    def _run_unit_row(unit: RunUnit) -> RunUnitRow:
+        return RunUnitRow(
+            id=unit.id,
+            experiment_id=unit.experiment_id,
+            lane_id=unit.lane_id,
+            workload_run_id=unit.workload_run_id,
+            ordinal=unit.ordinal,
+            unit_key=unit.unit_key,
+            status=unit.status.value,
+            record_json=unit.model_dump_json(),
+            created_at=unit.created_at,
+            updated_at=utc_now(),
+        )
+
+    @staticmethod
+    def _run_event_row(event_record: RunEvent) -> RunEventRow:
+        return RunEventRow(
+            experiment_id=event_record.experiment_id,
+            sequence=event_record.sequence,
+            kind=event_record.kind.value,
+            lane_id=event_record.lane_id,
+            workload_run_id=event_record.workload_run_id,
+            run_unit_id=event_record.run_unit_id,
+            record_json=event_record.model_dump_json(),
+            created_at=event_record.created_at,
+        )
+
+    @staticmethod
+    def _evaluation_result_row(
+        result: EvaluationResultRecord,
+    ) -> ExperimentEvaluationResultRow:
+        return ExperimentEvaluationResultRow(
+            id=result.id,
+            workload_run_id=result.workload_run_id,
+            run_unit_id=result.run_unit_id,
+            record_json=result.model_dump_json(),
+            created_at=result.created_at,
+        )
+
+    @staticmethod
+    def _performance_snapshot_row(
+        snapshot: PerformanceSnapshot,
+    ) -> PerformanceSnapshotRow:
+        return PerformanceSnapshotRow(
+            id=snapshot.id,
+            workload_run_id=snapshot.workload_run_id,
+            run_unit_id=snapshot.run_unit_id,
+            record_json=snapshot.model_dump_json(),
+            created_at=snapshot.captured_at,
+        )
 
     def count_rows(self, model) -> int:
         with self.sessions() as database:

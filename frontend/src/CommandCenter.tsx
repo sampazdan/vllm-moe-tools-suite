@@ -1181,7 +1181,11 @@ async function fetchRoutingExplore(
     });
   } catch (error) {
     if (!(error instanceof ApiError) || ![404, 405].includes(error.status)) throw error;
-    if (!model || request.sources.length !== 1 || request.comparison_sources?.length) throw error;
+    if (
+      !model?.topology ||
+      request.sources.length !== 1 ||
+      request.comparison_sources?.length
+    ) throw error;
     const source = request.sources[0];
     const summary = source.kind === "benchmark_run"
       ? await api<TrialRoutingSummary>(`/api/runs/${encodeURIComponent(source.id)}/routing`)
@@ -1249,9 +1253,9 @@ function RunItemDetail({ item }: { item: RunItemResult }) {
 }
 
 function ProfileShape({ profile, model }: { profile: ExpertProfile; model: ModelRegistryEntry | null }) {
-  const layerIds = model?.topology.routed_layer_ids ??
+  const layerIds = model?.topology?.routed_layer_ids ??
     Object.keys(profile.layers).map(Number).sort((a, b) => a - b);
-  const numExperts = model?.topology.num_experts ??
+  const numExperts = model?.topology?.num_experts ??
     Math.max(...Object.values(profile.layers).flatMap((layer) => layer.keep), 0) + 1;
   return (
     <section className="profile-shape">

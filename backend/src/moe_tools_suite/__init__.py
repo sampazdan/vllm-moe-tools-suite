@@ -1,3 +1,3 @@
 """MoE Tools Test Suite backend."""
 
-__version__ = "0.3.0rc1"
+__version__ = "0.4.0rc1"

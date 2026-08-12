@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -72,6 +73,18 @@ from .domain import (
 from .expert_explorer import RoutingExploreRequest, RoutingExploreResponse
 from .judges import JudgeProviderError
 from .lab import ActiveJobConflict, ResearchLab
+from .v2_domain import (
+    ActivateExpertContextRequest,
+    ContextActivationResult,
+    CreateExperimentRequest,
+    Experiment,
+    ExperimentDetail,
+    ExperimentStatus,
+    InterventionContextRef,
+    RunEventPage,
+    UpdateProfileMetadataRequest,
+    WorkloadDescriptor,
+)
 
 router = APIRouter(prefix="/api")
 
@@ -108,6 +121,181 @@ def system_status(request: Request) -> SystemStatus:
 @router.get("/models", response_model=list[ModelRegistryEntry])
 def list_models(request: Request) -> list[ModelRegistryEntry]:
     return _lab(request).models
+
+
+@router.get("/workloads", response_model=list[WorkloadDescriptor])
+def list_workloads(request: Request) -> list[WorkloadDescriptor]:
+    return _lab(request).list_workloads()
+
+
+@router.post(
+    "/expert-contexts/activate",
+    response_model=ContextActivationResult,
+)
+async def activate_expert_context(
+    payload: ActivateExpertContextRequest,
+    request: Request,
+) -> ContextActivationResult:
+    try:
+        return await _lab(request).activate_expert_context(payload.profile_id)
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404, detail="expert profile not found"
+        ) from error
+    except ActiveJobConflict as error:
+        raise _job_conflict(error) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get(
+    "/expert-contexts/current",
+    response_model=InterventionContextRef | None,
+)
+def current_expert_context(request: Request) -> InterventionContextRef | None:
+    return _lab(request).current_intervention_context()
+
+
+@router.post(
+    "/experiments",
+    response_model=Experiment,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_experiment(
+    payload: CreateExperimentRequest,
+    request: Request,
+) -> Experiment:
+    try:
+        lab = _lab(request)
+        experiment = lab.submit_experiment(payload)
+        lab.start_job(experiment.job_id)
+        return experiment
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404,
+            detail="experiment profile or workload not found",
+        ) from error
+    except ActiveJobConflict as error:
+        raise _job_conflict(error) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/experiments", response_model=list[Experiment])
+def list_experiments(request: Request) -> list[Experiment]:
+    return _lab(request).list_experiments()
+
+
+@router.get("/experiments/{experiment_id}", response_model=ExperimentDetail)
+def get_experiment(experiment_id: str, request: Request) -> ExperimentDetail:
+    try:
+        return _lab(request).get_experiment(experiment_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="experiment not found") from error
+
+
+@router.get(
+    "/experiments/{experiment_id}/events",
+    response_model=RunEventPage,
+)
+def get_experiment_events(
+    experiment_id: str,
+    request: Request,
+    after: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 500,
+) -> RunEventPage:
+    try:
+        return _lab(request).get_experiment_events(
+            experiment_id,
+            after=after,
+            limit=limit,
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="experiment not found") from error
+
+
+@router.get(
+    "/experiments/{experiment_id}/events/stream",
+    response_model=None,
+)
+async def stream_experiment_events(
+    experiment_id: str,
+    request: Request,
+    after: Annotated[int | None, Query(ge=0)] = None,
+) -> StreamingResponse:
+    lab = _lab(request)
+    try:
+        lab.experiments.get(experiment_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="experiment not found") from error
+    header_cursor = request.headers.get("Last-Event-ID")
+    if after is None and header_cursor is not None:
+        try:
+            cursor = int(header_cursor)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422, detail="Last-Event-ID must be an integer"
+            ) from error
+        if cursor < 0:
+            raise HTTPException(
+                status_code=422, detail="Last-Event-ID cannot be negative"
+            )
+    else:
+        cursor = after or 0
+
+    async def generate() -> Iterator[str]:
+        nonlocal cursor
+        heartbeat_ticks = 0
+        while not await request.is_disconnected():
+            page = lab.get_experiment_events(
+                experiment_id,
+                after=cursor,
+                limit=500,
+            )
+            for event in page.events:
+                cursor = event.sequence
+                body = event.model_dump_json()
+                yield (
+                    f"id: {event.sequence}\nevent: {event.kind.value}\ndata: {body}\n\n"
+                )
+            experiment = lab.experiments.get(experiment_id)
+            terminal = experiment.status in {
+                ExperimentStatus.COMPLETED,
+                ExperimentStatus.FAILED,
+                ExperimentStatus.CANCELLED,
+            }
+            if terminal and cursor >= page.latest_sequence:
+                break
+            heartbeat_ticks += 1
+            if heartbeat_ticks % 15 == 0:
+                yield ": keepalive\n\n"
+            await asyncio.sleep(0.2)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post(
+    "/experiments/{experiment_id}/cancel",
+    response_model=Experiment,
+)
+def cancel_experiment(experiment_id: str, request: Request) -> Experiment:
+    try:
+        return _lab(request).cancel_experiment(experiment_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="experiment not found") from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.get("/runtime/status", response_model=RuntimeStatus)
@@ -806,6 +994,22 @@ def get_expert_profile(profile_id: str, request: Request) -> SavedExpertProfile:
     if profile is None:
         raise HTTPException(status_code=404, detail="expert profile not found")
     return profile
+
+
+@router.patch("/profiles/{profile_id}", response_model=SavedExpertProfile)
+def update_expert_profile_metadata(
+    profile_id: str,
+    payload: UpdateProfileMetadataRequest,
+    request: Request,
+) -> SavedExpertProfile:
+    try:
+        return _lab(request).update_profile_metadata(profile_id, payload)
+    except KeyError as error:
+        raise HTTPException(
+            status_code=404, detail="expert profile not found"
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.get("/profiles/{profile_id}/export", response_model=ExpertProfile)

@@ -27,6 +27,10 @@ class AgentArtifactStore:
         trial_id: str,
         inference_id: str,
         routing: DecodedRouting,
+        *,
+        context_id: str | None = None,
+        context_fingerprint: str | None = None,
+        topology_fingerprint: str | None = None,
     ) -> RoutingArtifactInfo:
         directory = self._trial_dir(trial_id) / "routing"
         directory.mkdir(parents=True, exist_ok=True)
@@ -37,6 +41,9 @@ class AgentArtifactStore:
                 output,
                 expert_ids=routing.expert_ids,
                 expert_weights=routing.expert_weights,
+                context_id=np.asarray(context_id or ""),
+                context_fingerprint=np.asarray(context_fingerprint or ""),
+                topology_fingerprint=np.asarray(topology_fingerprint or ""),
             )
         os.replace(temporary, path)
         payload = path.read_bytes()
@@ -46,6 +53,9 @@ class AgentArtifactStore:
             sha256=hashlib.sha256(payload).hexdigest(),
             token_count=int(routing.expert_ids.shape[0]),
             total_routed_slots=int(routing.expert_ids.size),
+            context_id=context_id,
+            context_fingerprint=context_fingerprint,
+            topology_fingerprint=topology_fingerprint,
         )
 
     def save_routing_summary(self, summary: TrialRoutingSummary) -> None:
@@ -77,6 +87,9 @@ class AgentArtifactStore:
                             "model_session_id": summary.model_session_id,
                             "profile_id": summary.profile_id,
                             "profile_fingerprint": summary.profile_fingerprint,
+                            "context_id": summary.context_id,
+                            "context_fingerprint": summary.context_fingerprint,
+                            "topology_fingerprint": summary.topology_fingerprint,
                         },
                         separators=(",", ":"),
                     )
@@ -106,8 +119,11 @@ class AgentArtifactStore:
                 served_tokens=metadata["served_tokens"],
                 model_id=metadata["model_id"],
                 model_session_id=metadata["model_session_id"],
-                profile_id=metadata["profile_id"],
-                profile_fingerprint=metadata["profile_fingerprint"],
+                profile_id=metadata.get("profile_id"),
+                profile_fingerprint=metadata.get("profile_fingerprint"),
+                context_id=metadata.get("context_id"),
+                context_fingerprint=metadata.get("context_fingerprint"),
+                topology_fingerprint=metadata.get("topology_fingerprint"),
                 artifacts=json.loads(str(payload["artifacts_json"])),
             )
 

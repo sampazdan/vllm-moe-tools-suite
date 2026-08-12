@@ -12,6 +12,7 @@ import numpy as np
 
 from .domain import ExpertProfile, GenerationConfig, ModelTopology
 from .telemetry import DecodedRouting, decode_routing_payloads
+from .v2_domain import InterventionContextRef
 
 
 @dataclass(frozen=True)
@@ -35,9 +36,14 @@ class CompletionResult:
     reasoning: str | None = None
     finish_reason: str | None = None
     performance: CompletionPerformance = field(default_factory=CompletionPerformance)
+    context_id: str | None = None
+    context_fingerprint: str | None = None
+    topology_fingerprint: str | None = None
 
 
 class ModelRuntime(Protocol):
+    def set_active_context(self, context: InterventionContextRef | None) -> None: ...
+
     async def complete(
         self,
         prompt: str,
@@ -64,6 +70,10 @@ class MockModelRuntime:
 
     def __init__(self, topology: ModelTopology) -> None:
         self._topology = topology
+        self._active_context: InterventionContextRef | None = None
+
+    def set_active_context(self, context: InterventionContextRef | None) -> None:
+        self._active_context = context
 
     async def complete(
         self,
@@ -121,6 +131,19 @@ class MockModelRuntime:
             completion_tokens=1,
             routing=DecodedRouting(expert_ids=ids, expert_weights=weights),
             finish_reason="stop",
+            context_id=(
+                self._active_context.context_id if self._active_context else None
+            ),
+            context_fingerprint=(
+                self._active_context.context_fingerprint
+                if self._active_context
+                else None
+            ),
+            topology_fingerprint=(
+                self._active_context.topology_fingerprint
+                if self._active_context
+                else None
+            ),
         )
 
     async def aclose(self) -> None:
@@ -143,6 +166,13 @@ class VllmRuntime:
             base_url=base_url.rstrip("/"), timeout=90
         )
         self._routing_prefixes: dict[tuple[str, str], tuple[int, ...]] = {}
+        self._active_context: InterventionContextRef | None = None
+
+    def set_active_context(self, context: InterventionContextRef | None) -> None:
+        if context == self._active_context:
+            return
+        self._active_context = context
+        self._routing_prefixes.clear()
 
     async def complete(
         self,
@@ -195,6 +225,9 @@ class VllmRuntime:
         )
         response.raise_for_status()
         payload = response.json()
+        context_id, context_fingerprint, topology_fingerprint = (
+            self._response_context_provenance(payload)
+        )
         choice = payload["choices"][0]
         if not choice.get("routed_experts") or not choice.get("routed_expert_weights"):
             raise ValueError(
@@ -236,6 +269,57 @@ class VllmRuntime:
             reasoning=reasoning,
             finish_reason=_optional_string(choice.get("finish_reason")),
             performance=_completion_performance(payload.get("metrics")),
+            context_id=context_id,
+            context_fingerprint=context_fingerprint,
+            topology_fingerprint=topology_fingerprint,
+        )
+
+    def _response_context_provenance(
+        self, payload: dict[str, object]
+    ) -> tuple[str | None, str | None, str | None]:
+        choice = payload.get("choices")
+        first_choice = choice[0] if isinstance(choice, list) and choice else None
+        choice_payload = first_choice if isinstance(first_choice, dict) else {}
+        fingerprint = _optional_string(
+            payload.get("expert_context_fingerprint")
+            or choice_payload.get("expert_context_fingerprint")
+        )
+        context_id = _optional_string(
+            payload.get("expert_context_id") or choice_payload.get("expert_context_id")
+        )
+        topology_fingerprint = _optional_string(
+            payload.get("expert_context_topology_fingerprint")
+            or choice_payload.get("expert_context_topology_fingerprint")
+        )
+        active = self._active_context
+        if active is None:
+            return context_id, fingerprint, topology_fingerprint
+        if fingerprint is None:
+            raise ValueError(
+                "vLLM response omitted expert_context_fingerprint while an "
+                "expert context was active"
+            )
+        if fingerprint != active.context_fingerprint:
+            raise ValueError(
+                "vLLM response expert-context fingerprint does not match the "
+                "active intervention context"
+            )
+        if context_id is not None and context_id != active.context_id:
+            raise ValueError(
+                "vLLM response expert-context ID does not match the active context"
+            )
+        if (
+            topology_fingerprint is not None
+            and topology_fingerprint != active.topology_fingerprint
+        ):
+            raise ValueError(
+                "vLLM response expert-context topology does not match the active "
+                "context"
+            )
+        return (
+            context_id or active.context_id,
+            fingerprint,
+            topology_fingerprint or active.topology_fingerprint,
         )
 
     async def _routed_prompt_start(

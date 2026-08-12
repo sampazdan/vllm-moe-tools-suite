@@ -11,17 +11,21 @@ FROM --platform=linux/amd64 runpod/pytorch:1.0.3-cu1300-torch290-ubuntu2404@sha2
 
 ARG VLLM_PRECOMPILED_WHEEL_COMMIT=b1e12d142d8c9533f857f8da13d8fc368e95a8cd
 ARG VLLM_PRECOMPILED_WHEEL_VARIANT=cu130
-ARG VLLM_IMAGE_VERSION=0.1.dev1+moe-tools
+ARG VLLM_IMAGE_VERSION=0.2.dev0+moe-atelier-v2
+ARG APP_SOURCE_REF
 ARG VLLM_SOURCE_REF
 ARG IMAGE_SOURCE=https://github.com/sampazdan/vllm-moe-tools-suite
 
+RUN printf '%s\n' "${APP_SOURCE_REF}" \
+    | grep -Eq '^[0-9a-f]{40}$'
 RUN printf '%s\n' "${VLLM_SOURCE_REF}" \
     | grep -Eq '^[0-9a-f]{40}$'
 
 LABEL org.opencontainers.image.title="MoE Tools Test Suite" \
       org.opencontainers.image.description="Interactive expert-routing and pruning research appliance" \
       org.opencontainers.image.source="${IMAGE_SOURCE}" \
-      org.opencontainers.image.revision="${VLLM_SOURCE_REF}"
+      org.opencontainers.image.revision="${APP_SOURCE_REF}" \
+      io.moe-atelier.vllm-source-revision="${VLLM_SOURCE_REF}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -36,8 +40,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCHINDUCTOR_CACHE_DIR=/workspace/cache/torchinductor \
     TRITON_CACHE_DIR=/workspace/cache/triton \
     RUNPOD_RESULTS_DIR=/workspace/results \
+    MOE_TOOLS_APP_SOURCE_REF=${APP_SOURCE_REF} \
     RUNPOD_VLLM_SOURCE_REF=${VLLM_SOURCE_REF} \
     RUNPOD_VLLM_MODEL=Qwen/Qwen3.6-35B-A3B-FP8 \
+    RUNPOD_VLLM_REVISION=95a723d08a9490559dae23d0cff1d9466213d989 \
     RUNPOD_VLLM_HOST=127.0.0.1 \
     RUNPOD_VLLM_PORT=8000 \
     RUNPOD_VLLM_MAX_MODEL_LEN=4096 \

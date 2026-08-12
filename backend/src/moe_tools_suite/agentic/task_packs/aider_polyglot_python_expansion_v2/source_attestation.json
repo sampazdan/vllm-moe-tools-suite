@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "source": {
+    "url": "https://github.com/laude-institute/harbor-datasets",
+    "revision": "f30b14415dd733c83627204bad0af69a89ceb46f",
+    "selected_git_tree_hash_algorithm": "SHA-256 of the newline-terminated, bytewise path-sorted `git ls-tree -r` records for the five selected task directories",
+    "selected_git_tree_sha256": "cdafc517554ca0494a0b164f7df561ea1497a188c3d77a655bccbe37fb99cc0d"
+  },
+  "harbor_adapter": {
+    "url": "https://github.com/harbor-framework/harbor/tree/488af1b12b3b728b9364ab5e1bb663bd3e0ae643/adapters/aider_polyglot",
+    "revision": "488af1b12b3b728b9364ab5e1bb663bd3e0ae643",
+    "license": "Apache-2.0"
+  },
+  "component_license": {
+    "copyright": "Copyright (c) 2021 Exercism",
+    "license": "MIT",
+    "notice_resource": "THIRD_PARTY_NOTICES.md"
+  },
+  "effective_image": {
+    "reference": "python:3.12-slim",
+    "digest": "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36"
+  },
+  "isolation_adapter": {
+    "candidate_runner_sha256": "02b2afcc8d3410a009e4f499d59ce83d12cdb8db6f1851cc765c496404d35fa5",
+    "verifier_support_sha256": "735d1898c3a96a6786b9ac155b4247617a03aae00ffa1a65f1aff0683c78cb1a"
+  },
+  "tasks": {
+    "polyglot_python_affine-cipher": {
+      "instruction_sha256": "0f155ca3b12898641d1b643cea1a20794566f2c3a562a4d94cf3970de4ba9f07",
+      "starter_sha256": "d3164dc77d13a429fb14899cd5e74a81d848ed0c7b95b02db3247a75e0bbd72b",
+      "upstream_test_sha256": "4d9dac99b726068707a37e36145d73f74a52704145fb95bb4acaccdd7cd3ef54",
+      "oracle_sha256": "6952153be60d7690e0bfad52c89c4647e9edb4bd068c77f1c15735e00d9216ba",
+      "verifier_sha256": "3464cff9cc9a70b8cbfb266130ee20dfd367081e9c53a77d120a6ef56fcc33e4",
+      "assertion_count": 16,
+      "noop_failed": true,
+      "oracle_passed": true
+    },
+    "polyglot_python_dominoes": {
+      "instruction_sha256": "7e0bf14844482feccbb48b579d56a964526701f187a4c6ff05cd05e76ee55809",
+      "starter_sha256": "89f1fede34db8dbd73fb7103476080307e769425049014bf60b7d5e632f9743b",
+      "upstream_test_sha256": "9645efc873738b9247ced09ccdce782fe2124646d24588d52c23df59e23ab140",
+      "oracle_sha256": "4a51af33d2fed21b11146fb6ef03179771481f27f4c59d53fe442218fc9e2d6a",
+      "verifier_sha256": "acd936afc3fd8978cdf8c5e0f9e8f602323c929a066189c1b4a0f1e6ba2d5cef",
+      "assertion_count": 13,
+      "noop_failed": true,
+      "oracle_passed": true
+    },
+    "polyglot_python_proverb": {
+      "instruction_sha256": "50bef0aa8271d474e4a86e6d4e793964189f6cb01985fb51a372dc49ab5857ea",
+      "starter_sha256": "6ffde7190552cc3a19fdabc7d0624359302e3663a06671b28e1c65b13af61a42",
+      "upstream_test_sha256": "6792db661176bc5dfd4447b8f68209d441797631a3896b880421ceba98895682",
+      "oracle_sha256": "21defe08a5cbfe2c9c25eed0b70c2b8d1367e575ea5a2c25165eb56208bd0a4e",
+      "verifier_sha256": "32ba2dcc72b84de65875638d9f2075e35849fcdc51487590f9df08f90e9bb8df",
+      "assertion_count": 8,
+      "noop_failed": true,
+      "oracle_passed": true
+    },
+    "polyglot_python_transpose": {
+      "instruction_sha256": "f1faad5fc9a19d6063bfd0066da3097f37af6903848eddb9d33fcb4e817f2ef6",
+      "starter_sha256": "009152d0e004d0e7ec4de2c7aec36bdfbb0c3dd7061553e9494cabeaae7c4797",
+      "upstream_test_sha256": "7ac879485ac2de3e925a39b0ebe65788543491625b0931bd08b450293e1f681b",
+      "oracle_sha256": "33b60c3de3f36df81ab7443a9b51e788364746914e3cb3bbe67952bca5a7e877",
+      "verifier_sha256": "6e9ef3c72bbe8115908a1cefa380f616372f1f4f83f986ede433c0e0bd252bdb",
+      "assertion_count": 12,
+      "noop_failed": true,
+      "oracle_passed": true
+    },
+    "polyglot_python_variable-length-quantity": {
+      "instruction_sha256": "8d9dd6e289d1a4967239145ccfb7969313990004ad672e751699f612a89a8474",
+      "starter_sha256": "c065d92722a1b8b9723bae2de3662583b65287c3fa2a459768f65e667a2ac695",
+      "upstream_test_sha256": "e9ecd83a153958e4ef268faa83df2441ef7deb509e01040dc042af53b7aaf7ef",
+      "oracle_sha256": "a516b77e06bb9961d956494e5953708510efd37a65ba6996d453ca932f07319d",
+      "verifier_sha256": "1f0ce404d13572b68d29084ee50d1e51a0ae9138cd8c53aec31421a7db6ec4fa",
+      "assertion_count": 26,
+      "noop_failed": true,
+      "oracle_passed": true
+    }
+  }
+}

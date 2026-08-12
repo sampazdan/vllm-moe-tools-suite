@@ -22,6 +22,7 @@ from ..domain import (
     DeterministicScorerKind,
     EvaluationContract,
     ExecutionPolicy,
+    ExpertProfile,
     GenerationConfig,
     JudgeEvaluationRequest,
     JudgeMode,
@@ -37,8 +38,10 @@ from ..judges import (
     judge_request_cost_upper_bound,
 )
 from ..persistence import SqliteStore
+from ..profiles import expert_profile_fingerprint
 from ..runtime import ModelRuntime
 from ..settings import Settings
+from ..v2_domain import InterventionContextRef
 from .artifacts import AgentArtifactStore
 from .atif import (
     BASH_JSON_SYSTEM_PROMPT,
@@ -284,6 +287,7 @@ class AgenticController:
         job_id: str,
         request: CreateAgentRunRequest,
         model_session: ModelSession,
+        intervention_context: InterventionContextRef | None = None,
     ) -> AgentRun:
         request = self.normalize_run_request(request)
         pack, tasks, agent = self.validate_run_request(request, model_session)
@@ -293,7 +297,11 @@ class AgenticController:
             tasks=tasks,
             agent=agent,
         )
-        profile_fingerprint = _profile_fingerprint(model_session)
+        profile_fingerprint = (
+            intervention_context.profile_fingerprint
+            if intervention_context is not None
+            else _profile_fingerprint(model_session, self.topology)
+        )
         run = AgentRun(
             id=run_id,
             job_id=job_id,
@@ -303,8 +311,27 @@ class AgenticController:
             task_pack_content_hash=pack.content_hash,
             task_ids=request.task_ids,
             model_session_id=model_session.id,
-            profile_id=model_session.profile_id,
+            profile_id=(
+                intervention_context.profile_id
+                if intervention_context is not None
+                else model_session.profile_id
+            ),
             profile_fingerprint=profile_fingerprint,
+            context_id=(
+                intervention_context.context_id
+                if intervention_context is not None
+                else None
+            ),
+            context_fingerprint=(
+                intervention_context.context_fingerprint
+                if intervention_context is not None
+                else None
+            ),
+            topology_fingerprint=(
+                intervention_context.topology_fingerprint
+                if intervention_context is not None
+                else None
+            ),
             agent_id=agent.id,
             agent_revision=agent.revision,
             sandbox_provider_id=request.sandbox_provider_id,
@@ -330,6 +357,21 @@ class AgenticController:
                     attempt=attempt,
                     seed=request.seed + attempt - 1,
                     model_session_id=model_session.id,
+                    context_id=(
+                        intervention_context.context_id
+                        if intervention_context is not None
+                        else None
+                    ),
+                    context_fingerprint=(
+                        intervention_context.context_fingerprint
+                        if intervention_context is not None
+                        else None
+                    ),
+                    topology_fingerprint=(
+                        intervention_context.topology_fingerprint
+                        if intervention_context is not None
+                        else None
+                    ),
                 )
                 self.trials[trial.id] = trial
                 self.store.save_agent_trial(trial)
@@ -342,8 +384,28 @@ class AgenticController:
         model_session: ModelSession,
         on_progress: Callable[[int, int], None],
         should_cancel: Callable[[], bool],
+        intervention_context: InterventionContextRef | None = None,
+        profile: ExpertProfile | None = None,
     ) -> AgentRun:
         run = self.runs[run_id]
+        if intervention_context is not None and (
+            run.context_fingerprint != intervention_context.context_fingerprint
+            or run.context_id != intervention_context.context_id
+        ):
+            raise RuntimeError("agent run expert-context provenance changed")
+        if intervention_context is not None:
+            if intervention_context.profile_id is None and profile is not None:
+                raise RuntimeError("baseline agent context cannot use an expert mask")
+            if intervention_context.profile_id is not None and profile is None:
+                raise RuntimeError("masked agent context requires its expert profile")
+            if profile is not None and (
+                expert_profile_fingerprint(profile, self.topology)
+                != intervention_context.profile_fingerprint
+            ):
+                raise RuntimeError("agent profile does not match context provenance")
+        active_profile = (
+            model_session.profile if intervention_context is None else profile
+        )
         run.status = AgentRunStatus.RUNNING
         run.started_at = utc_now()
         self.store.save_agent_run(run)
@@ -404,6 +466,8 @@ class AgenticController:
                     model_session=model_session,
                     budgets=effective_budgets,
                     should_cancel=should_cancel,
+                    intervention_context=intervention_context,
+                    profile=active_profile,
                 )
                 self._update_run_metrics(run)
                 on_progress(run.completed_trials, run.total_trials)
@@ -530,6 +594,9 @@ class AgenticController:
             model_session_id=run.model_session_id,
             profile_id=run.profile_id,
             profile_fingerprint=run.profile_fingerprint,
+            context_id=run.context_id,
+            context_fingerprint=run.context_fingerprint,
+            topology_fingerprint=run.topology_fingerprint,
             agent_id=run.agent_id,
             agent_revision=run.agent_revision,
             sandbox_provider_id=run.sandbox_provider_id,
@@ -810,6 +877,8 @@ class AgenticController:
         model_session: ModelSession,
         budgets: AgentBudgets,
         should_cancel: Callable[[], bool],
+        intervention_context: InterventionContextRef | None,
+        profile: ExpertProfile | None,
     ) -> None:
         wall_started = time.perf_counter()
         trial_deadline = time.monotonic() + budgets.timeout_seconds
@@ -828,7 +897,10 @@ class AgenticController:
                 "task_pack_id": run.task_pack_id,
                 "task_id": task.id,
                 "model_session_id": model_session.id,
-                "profile_id": model_session.profile_id,
+                "profile_id": run.profile_id,
+                "context_id": run.context_id,
+                "context_fingerprint": run.context_fingerprint,
+                "topology_fingerprint": run.topology_fingerprint,
             },
         )
         self.trajectories[trial.id] = trajectory
@@ -930,6 +1002,8 @@ class AgenticController:
                             trial_id=trial.id,
                             trajectory_step_id=str(step_id),
                             model_session=model_session,
+                            profile=profile,
+                            context=intervention_context,
                             messages=request_messages,
                             generation=generation,
                             request_key=f"agent:{trial.id}:{turn_index}",
@@ -1250,8 +1324,11 @@ class AgenticController:
                 served_tokens=trial.prompt_tokens + trial.completion_tokens,
                 model_id=self.model_id,
                 model_session_id=model_session.id,
-                profile_id=model_session.profile_id,
+                profile_id=run.profile_id,
                 profile_fingerprint=run.profile_fingerprint,
+                context_id=run.context_id,
+                context_fingerprint=run.context_fingerprint,
+                topology_fingerprint=run.topology_fingerprint,
                 artifacts=valid_routing_artifacts,
             )
             self.routings[trial.id] = summary
@@ -1799,6 +1876,9 @@ class AgenticController:
             commands=trial.commands,
             prompt_tokens=trial.prompt_tokens,
             completion_tokens=trial.completion_tokens,
+            context_id=trial.context_id,
+            context_fingerprint=trial.context_fingerprint,
+            topology_fingerprint=trial.topology_fingerprint,
             inference_calls=len(inferences),
             routed_inference_calls=sum(
                 item.routing_artifact is not None for item in inferences
@@ -1917,16 +1997,16 @@ class AgenticController:
                 self._update_run_metrics(self.runs[run_id])
 
 
-def _profile_fingerprint(model_session: ModelSession) -> str | None:
+def _profile_fingerprint(
+    model_session: ModelSession,
+    topology: ModelTopology,
+) -> str | None:
     if model_session.profile is None:
         return None
-    return hashlib.sha256(
-        json.dumps(
-            model_session.profile.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    return expert_profile_fingerprint(
+        model_session.profile,
+        model_session.topology or topology,
+    )
 
 
 def _clean_room_hardening_command(
@@ -2038,6 +2118,9 @@ def _inference_summary(
     artifact = inference.routing_artifact
     return InferenceCallSummary(
         id=inference.id,
+        context_id=inference.context_id,
+        context_fingerprint=inference.context_fingerprint,
+        topology_fingerprint=inference.topology_fingerprint,
         prompt_tokens=inference.prompt_tokens,
         reasoning_tokens=inference.reasoning_tokens,
         completion_tokens=inference.completion_tokens,

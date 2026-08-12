@@ -27,6 +27,7 @@ from pydantic import ValidationError
 
 REPO_ENGINEERING_PACK_ID = "repo-engineering-v1"
 AIDER_CANARY_PACK_ID = "aider-polyglot-python-canary-3"
+AIDER_EXPANSION_PACK_ID = "aider-polyglot-python-expansion-5"
 
 
 def test_external_registry_is_pinned_inspectable_and_fail_closed() -> None:
@@ -287,6 +288,148 @@ def test_aider_python_canary_noop_fails_and_exact_oracle_passes(
     tmp_path: Path,
 ) -> None:
     pack = AgentTaskCatalog().get_pack(AIDER_CANARY_PACK_ID)
+    environment = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+        "MOE_TOOLS_VERIFIER_DEV_MODE": "1",
+    }
+
+    for task in pack.tasks:
+        workspace = tmp_path / task.id
+        workspace.mkdir()
+        for file in task.files:
+            destination = workspace / file.path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(file.content)
+
+        noop = subprocess.run(
+            ["/bin/sh", "-c", task.verifier_command],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=task.timeout_seconds,
+            check=False,
+        )
+        assert noop.returncode != 0, f"{task.id} no-op unexpectedly passed"
+
+        for command in task.oracle_commands:
+            subprocess.run(
+                ["/bin/sh", "-c", command],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=task.timeout_seconds,
+                check=True,
+            )
+        oracle = subprocess.run(
+            ["/bin/sh", "-c", task.verifier_command],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=task.timeout_seconds,
+            check=False,
+        )
+        assert oracle.returncode == 0, oracle.stdout + oracle.stderr
+
+
+def test_aider_python_expansion_is_launchable_and_honestly_scoped() -> None:
+    catalog = AgentTaskCatalog()
+    pack = catalog.get_pack(AIDER_EXPANSION_PACK_ID)
+
+    assert pack.ready and pack.oracle_passed and pack.noop_failed
+    assert len(pack.tasks) == 5
+    assert {task.id for task in pack.tasks} == {
+        "polyglot_python_affine-cipher",
+        "polyglot_python_dominoes",
+        "polyglot_python_proverb",
+        "polyglot_python_transpose",
+        "polyglot_python_variable-length-quantity",
+    }
+    assert "not an official Aider" in pack.description
+    assert "f30b14415dd733c83627204bad0af69a89ceb46f" in pack.source
+    assert "488af1b12b3b728b9364ab5e1bb663bd3e0ae643" in pack.source
+    assert "cdafc517554ca0494a0b164f7df561ea" in pack.source
+    for task in pack.tasks:
+        assert task.image_digest == (
+            "sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36"
+        )
+        assert task.network_policy.value == "none"
+        assert len(task.submission_file_paths) == 1
+        assert set(task.verifier_file_paths) == {
+            "tests/verifier.py",
+            "tests/verifier_support.py",
+        }
+        assert len(task.oracle_file_paths) == 1
+        assert not (
+            set(task.submission_file_paths)
+            & (set(task.verifier_file_paths) | set(task.oracle_file_paths))
+        )
+
+
+def test_aider_python_expansion_matches_pinned_source_attestation() -> None:
+    package = resources.files(
+        "moe_tools_suite.agentic.task_packs.aider_polyglot_python_expansion_v2"
+    )
+    attestation = json.loads(
+        package.joinpath("source_attestation.json").read_text(encoding="utf-8")
+    )
+    pack = AgentTaskCatalog().get_pack(AIDER_EXPANSION_PACK_ID)
+
+    assert attestation["source"]["revision"] == (
+        "f30b14415dd733c83627204bad0af69a89ceb46f"
+    )
+    assert attestation["harbor_adapter"]["revision"] == (
+        "488af1b12b3b728b9364ab5e1bb663bd3e0ae643"
+    )
+    for task in pack.tasks:
+        evidence = attestation["tasks"][task.id]
+        file_by_path = {file.path: file for file in task.files}
+        starter = next(
+            file for file in task.files if file.path in set(task.submission_file_paths)
+        )
+        oracle = next(
+            file for file in task.files if file.path in set(task.oracle_file_paths)
+        )
+        assert (
+            hashlib.sha256(task.instruction.encode()).hexdigest()
+            == evidence["instruction_sha256"]
+        )
+        assert (
+            hashlib.sha256(starter.content.encode()).hexdigest()
+            == evidence["starter_sha256"]
+        )
+        assert (
+            hashlib.sha256(oracle.content.encode()).hexdigest()
+            == evidence["oracle_sha256"]
+        )
+        assert (
+            hashlib.sha256(
+                file_by_path["tests/verifier.py"].content.encode()
+            ).hexdigest()
+            == evidence["verifier_sha256"]
+        )
+        assert (
+            hashlib.sha256(
+                file_by_path["tests/verifier_support.py"].content.encode()
+            ).hexdigest()
+            == attestation["isolation_adapter"]["verifier_support_sha256"]
+        )
+        assert (
+            hashlib.sha256(
+                file_by_path[".moe_tools/candidate_runner.py"].content.encode()
+            ).hexdigest()
+            == attestation["isolation_adapter"]["candidate_runner_sha256"]
+        )
+        assert evidence["noop_failed"] and evidence["oracle_passed"]
+
+
+def test_aider_python_expansion_noop_fails_and_exact_oracle_passes(
+    tmp_path: Path,
+) -> None:
+    pack = AgentTaskCatalog().get_pack(AIDER_EXPANSION_PACK_ID)
     environment = {
         **os.environ,
         "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",

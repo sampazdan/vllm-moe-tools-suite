@@ -25,6 +25,7 @@ BUNDLED_TASK_PACK_PACKAGES = (
     "moe_tools_suite.agentic.task_packs.smoke_python_v1",
     "moe_tools_suite.agentic.task_packs.repo_engineering_v1",
     "moe_tools_suite.agentic.task_packs.aider_polyglot_python_canary_v1",
+    "moe_tools_suite.agentic.task_packs.aider_polyglot_python_expansion_v2",
 )
 
 

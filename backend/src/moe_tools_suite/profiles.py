@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 import numpy as np
 
 from .domain import (
@@ -10,6 +13,8 @@ from .domain import (
     ProfileValidation,
     RoutingSummary,
 )
+
+EXPERT_PROFILE_FINGERPRINT_VERSION = 1
 
 
 def validate_profile(
@@ -57,6 +62,65 @@ def validate_profile(
         total_experts=full_total,
         retained_fraction=eligible / full_total,
     )
+
+
+def canonical_full_profile_layers(
+    profile: ExpertProfile,
+    topology: ModelTopology,
+) -> list[dict[str, object]]:
+    """Expand a sparse profile into the canonical full runtime mask."""
+    validation = validate_profile(profile, topology)
+    if not validation.valid:
+        raise ValueError("; ".join(validation.errors))
+    return [
+        {
+            "layer_id": layer_id,
+            "keep": sorted(
+                profile.layers[str(layer_id)].keep
+                if str(layer_id) in profile.layers
+                else range(topology.num_experts)
+            ),
+        }
+        for layer_id in sorted(topology.routed_layer_ids)
+    ]
+
+
+def canonical_profile_layer_map(
+    profile: ExpertProfile,
+    topology: ModelTopology,
+) -> dict[str, dict[str, list[int]]]:
+    return {
+        str(layer["layer_id"]): {"keep": list(layer["keep"])}
+        for layer in canonical_full_profile_layers(profile, topology)
+    }
+
+
+def expert_profile_fingerprint(
+    profile: ExpertProfile,
+    topology: ModelTopology,
+) -> str:
+    payload = {
+        "version": EXPERT_PROFILE_FINGERPRINT_VERSION,
+        "layers": canonical_full_profile_layers(profile, topology),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def legacy_profile_fingerprint(profile: ExpertProfile) -> str:
+    """Reproduce the pre-runtime-mask digest for persisted legacy records."""
+    encoded = json.dumps(
+        profile.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def propose_fixed_budget_profile(

@@ -1,6 +1,39 @@
 # MoE Tools Test Suite Roadmap
 
-Status: `0.3.0-rc.1` live-acceptance candidate, updated 2026-08-11
+Status: `0.4.0-rc.1` V2 candidate, updated 2026-08-12
+
+## V2 candidate
+
+V2 changes the primary experiment primitive from “reload the model with another
+profile” to “alternate immutable intervention contexts on one warm engine.” The
+fork now has a bounded, loopback-only expert-context controller with canonical
+topology/profile/context fingerprints, stable in-place router buffers, request
+admission and cache drain, tensor-parallel prepare/commit/rollback, and output
+provenance. Unsupported router, data-parallel, pipeline-parallel, and multi-API
+server configurations fail closed.
+
+The application adds migration-safe experiments, lanes, workload runs, run units,
+evaluations, performance snapshots, intervention refs, and append-only sequenced
+events. Answer, coding, and deterministic state-drift adapters use the same command
+center and paired-lane model. Polling and reconnectable SSE expose durable progress;
+refresh never turns an active experiment back into an anonymous job.
+
+State Drift Bench measures exact checkpoint state rather than only final success.
+Seven first-party scenario families cover ledger and order lifecycles, dependency
+release planning, repository evolution, structured-data transformation, ticket/CRM
+workflow, and branch/counterfactual rollback under oracle-reset, chained, and
+state-anchored conditions. Formula and scenario configuration are fingerprinted,
+and paired comparisons separate local competence from compounding penalty.
+
+The model registry is manifest-backed and pins verified Hugging Face revisions.
+Only `Qwen/Qwen3.6-35B-A3B-FP8` inherits qualified V1 evidence; V2 hot activation
+remains experimental until immutable-image GPU acceptance records PID, timing,
+memory, output/routing equivalence, and rollback evidence. Qwen 122B, GPTQ, gpt-oss
+120B, and GLM entries remain disabled/fail-closed until their real router paths are
+live-qualified.
+
+The V1 sections and coordinates below remain historical evidence. A V2 manifest,
+mock run, or local unit test is never substituted for live model acceptance.
 
 The product is now a complete research loop rather than a collection of MVP cards.
 Its exact application and fork commits were published as an attested image and

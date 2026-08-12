@@ -35,7 +35,8 @@ export type JobKind =
   | "model_load"
   | "benchmark_run"
   | "dataset_prepare"
-  | "agent_run";
+  | "agent_run"
+  | "experiment_run";
 export type JobStatus =
   | "queued"
   | "running"
@@ -69,7 +70,7 @@ export interface ModelRegistryEntry {
   display_name: string;
   enabled: boolean;
   revision: string | null;
-  topology: ModelTopology;
+  topology: ModelTopology | null;
   notes: string;
 }
 
