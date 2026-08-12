@@ -797,6 +797,87 @@ async def test_expert_context_control_uses_internal_token_and_validates_receipt(
 
 
 @pytest.mark.asyncio
+async def test_expert_context_control_error_preserves_bounded_redacted_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_secret = "runtime-diagnostic-secret"
+    arbitrary_body_marker = "must-not-expose-arbitrary-json-fields"
+    monkeypatch.setenv("RUNTIME_DIAGNOSTIC_TOKEN", runtime_secret)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        control_token = request.headers["X-vLLM-Expert-Context-Token"]
+        return httpx.Response(
+            409,
+            json={
+                "detail": (
+                    "collective RPC failed\n"
+                    f"runtime={runtime_secret} control={control_token} " + "x" * 2_000
+                ),
+                "internal_dump": arbitrary_body_marker,
+            },
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        manager = _manager(tmp_path, _launcher(tmp_path), client)
+        manager._process = FakeProcess()
+
+        with pytest.raises(RuntimeError) as raised:
+            await manager.context_capabilities()
+
+    message = str(raised.value)
+    assert "409 Conflict" in message
+    assert "server detail: collective RPC failed" in message
+    assert "runtime=[REDACTED] control=[REDACTED]" in message
+    assert runtime_secret not in message
+    assert manager._context_control_token not in message
+    assert arbitrary_body_marker not in message
+    assert message.endswith("...")
+    _, detail = message.split("server detail: ", maxsplit=1)
+    assert len(detail) <= 1_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "content_type", "body_marker"),
+    [
+        (b"raw control failure", "text/plain", "raw control failure"),
+        (
+            b'{"detail":{"message":"nested control failure"}}',
+            "application/json",
+            "nested control failure",
+        ),
+    ],
+)
+async def test_expert_context_control_error_omits_unstructured_bodies(
+    tmp_path: Path,
+    content: bytes,
+    content_type: str,
+    body_marker: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            content=content,
+            headers={"Content-Type": content_type},
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        manager = _manager(tmp_path, _launcher(tmp_path), client)
+        manager._process = FakeProcess()
+
+        with pytest.raises(RuntimeError) as raised:
+            await manager.context_capabilities()
+
+    message = str(raised.value)
+    assert "409 Conflict" in message
+    assert "server detail:" not in message
+    assert body_marker not in message
+
+
+@pytest.mark.asyncio
 async def test_startup_failure_includes_log_tail_and_cleans_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

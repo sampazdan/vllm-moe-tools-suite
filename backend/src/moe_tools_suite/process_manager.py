@@ -46,6 +46,7 @@ _VLLM_ENV_PREFIXES = (
     "TORCH_",
     "VLLM_",
 )
+_CONTROL_ERROR_DETAIL_MAX_LENGTH = 1000
 
 ModelLoadPhaseCallback = Callable[
     [ModelLoadPhase, str, Literal["observed", "unavailable"]], None
@@ -699,8 +700,21 @@ class ManagedVllmServer:
             response.raise_for_status()
             body = response.json()
         except (httpx.HTTPError, TypeError, ValueError) as error:
+            message = f"vLLM expert-context control request failed: {error}"
+            if isinstance(error, httpx.HTTPStatusError):
+                detail = _bounded_control_error_detail(
+                    error.response,
+                    self._context_control_token,
+                    self._model_load_progress_token,
+                )
+                if detail is not None:
+                    message = f"{message}; server detail: {detail}"
             raise RuntimeError(
-                f"vLLM expert-context control request failed: {error}"
+                redact_runtime_secrets(
+                    message,
+                    self._context_control_token,
+                    self._model_load_progress_token,
+                )
             ) from error
         if not isinstance(body, dict):
             raise RuntimeError("vLLM expert-context control returned a non-object")
@@ -938,3 +952,24 @@ def redact_runtime_secrets(text: str, *additional_secrets: str) -> str:
     for secret in sorted(secrets, key=len, reverse=True):
         redacted = redacted.replace(secret, "[REDACTED]")
     return redacted
+
+
+def _bounded_control_error_detail(
+    response: httpx.Response,
+    *additional_secrets: str,
+) -> str | None:
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    detail = payload.get("detail")
+    if not isinstance(detail, str):
+        return None
+    sanitized = " ".join(redact_runtime_secrets(detail, *additional_secrets).split())
+    if not sanitized:
+        return None
+    if len(sanitized) <= _CONTROL_ERROR_DETAIL_MAX_LENGTH:
+        return sanitized
+    return sanitized[: _CONTROL_ERROR_DETAIL_MAX_LENGTH - 3].rstrip() + "..."
