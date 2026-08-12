@@ -535,6 +535,84 @@ def test_cli_fails_closed_without_an_explicit_or_environment_base_url(
     assert "supply --base-url" in capsys.readouterr().err
 
 
+def test_plain_loopback_login_rebinds_only_its_secure_session_cookie() -> None:
+    cookies_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/session":
+            return httpx.Response(
+                200,
+                json={"auth_required": True, "authenticated": False},
+                request=request,
+            )
+        if request.method == "POST" and request.url.path == "/api/session/login":
+            return httpx.Response(
+                200,
+                json={
+                    "auth_required": True,
+                    "authenticated": True,
+                    "csrf_token": "loopback-csrf",
+                },
+                headers={
+                    "set-cookie": (
+                        "moe_tools_session=opaque-session; Path=/; "
+                        "Secure; HttpOnly; SameSite=Strict"
+                    )
+                },
+                request=request,
+            )
+        if request.method == "GET" and request.url.path == "/api/jobs/active":
+            cookies_seen.append(request.headers.get("cookie", ""))
+            return httpx.Response(200, json=None, request=request)
+        raise AssertionError(request.url)
+
+    config = CanaryConfig(base_url="http://127.0.0.1:8080", token="test-token")
+    with ApiClient(config, transport=httpx.MockTransport(handler)) as api:
+        api.login()
+        api.get("/api/jobs/active")
+
+    assert cookies_seen == ["moe_tools_session=opaque-session"]
+
+
+def test_plain_non_loopback_login_keeps_secure_cookie_off_the_wire() -> None:
+    cookies_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/session":
+            return httpx.Response(
+                200,
+                json={"auth_required": True, "authenticated": False},
+                request=request,
+            )
+        if request.method == "POST" and request.url.path == "/api/session/login":
+            return httpx.Response(
+                200,
+                json={
+                    "auth_required": True,
+                    "authenticated": True,
+                    "csrf_token": "remote-csrf",
+                },
+                headers={
+                    "set-cookie": (
+                        "moe_tools_session=opaque-session; Path=/; "
+                        "Secure; HttpOnly; SameSite=Strict"
+                    )
+                },
+                request=request,
+            )
+        if request.method == "GET" and request.url.path == "/api/jobs/active":
+            cookies_seen.append(request.headers.get("cookie", ""))
+            return httpx.Response(200, json=None, request=request)
+        raise AssertionError(request.url)
+
+    config = CanaryConfig(base_url="http://canary.test", token="test-token")
+    with ApiClient(config, transport=httpx.MockTransport(handler)) as api:
+        api.login()
+        api.get("/api/jobs/active")
+
+    assert cookies_seen == [""]
+
+
 def _payload(request: httpx.Request) -> object:
     if not request.content:
         return None

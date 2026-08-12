@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
+import time
 import tomllib
 from pathlib import Path
 
@@ -156,6 +158,209 @@ def test_runpod_dockerfile_requires_a_pin_and_inherits_the_base_startup() -> Non
     assert any("/readyz" in line for line in instructions)
     assert 'org.opencontainers.image.revision="${APP_SOURCE_REF}"' in dockerfile
     assert 'io.moe-atelier.vllm-source-revision="${VLLM_SOURCE_REF}"' in dockerfile
+
+
+def test_runpod_image_contains_fail_closed_opt_in_v2_acceptance() -> None:
+    dockerfile = (ROOT / "docker" / "Dockerfile.runpod").read_text()
+    pre_start = (ROOT / "docker" / "runpod" / "pre_start.sh").read_text()
+    runner_path = ROOT / "docker" / "runpod" / "run_v2_live_acceptance_on_start.sh"
+    runner = runner_path.read_text()
+
+    assert "scripts/v2_live_acceptance.py" in dockerfile
+    assert "scripts/daytona_inventory.py" in dockerfile
+    assert "/usr/local/bin/run-v2-live-acceptance-on-start" in dockerfile
+    assert "MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START" in pre_start
+    assert pre_start.count("launch_startup_acceptance") == 3
+    assert "--token" not in runner
+    assert 'MOE_TOOLS_CANARY_TOKEN="${MOE_TOOLS_AUTH_TOKEN}"' in runner
+    assert "flock -n" in runner
+    assert "provider_wide_empty == true" in runner
+    assert "daytona-before.json" in runner
+    assert "daytona-after.json" in runner
+
+    result = subprocess.run(
+        ["bash", "-n", str(runner_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_startup_acceptance_is_disabled_by_default_and_requires_credentials(
+    tmp_path: Path,
+) -> None:
+    runner_path = ROOT / "docker" / "runpod" / "run_v2_live_acceptance_on_start.sh"
+    environment = os.environ | {"MOE_TOOLS_DATA_DIR": str(tmp_path)}
+    environment.pop("MOE_TOOLS_AUTH_TOKEN", None)
+    environment.pop("MOE_TOOLS_DAYTONA_API_KEY", None)
+
+    disabled = subprocess.run(
+        ["bash", str(runner_path)],
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert disabled.returncode == 0
+    assert not (tmp_path / "acceptance" / "v2-live-acceptance.status").exists()
+
+    enabled = subprocess.run(
+        ["bash", str(runner_path)],
+        env=environment
+        | {
+            "MOE_TOOLS_MODE": "vllm",
+            "MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START": "1",
+        },
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert enabled.returncode == 2
+    assert "requires a resolved MOE_TOOLS_AUTH_TOKEN" in enabled.stderr
+    assert not (tmp_path / "acceptance" / "v2-live-acceptance.status").exists()
+
+    mock_mode = subprocess.run(
+        ["bash", str(runner_path)],
+        env=environment
+        | {
+            "MOE_TOOLS_AUTH_TOKEN": "a" * 32,
+            "MOE_TOOLS_DAYTONA_API_KEY": "d" * 32,
+            "MOE_TOOLS_MODE": "mock",
+            "MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START": "1",
+        },
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert mock_mode.returncode == 2
+    assert "requires MOE_TOOLS_MODE=vllm" in mock_mode.stderr
+    assert not (tmp_path / "acceptance" / "v2-live-acceptance.status").exists()
+
+
+def test_daytona_inventory_fails_secret_free_without_inherited_credential(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "inventory.json"
+    environment = os.environ.copy()
+    environment.pop("MOE_TOOLS_DAYTONA_API_KEY", None)
+
+    result = subprocess.run(
+        [
+            str(ROOT / ".venv" / "bin" / "python"),
+            str(ROOT / "scripts" / "daytona_inventory.py"),
+            "--output",
+            str(output),
+        ],
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    report = json.loads(output.read_text())
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert report["success"] is False
+    assert report["error"] == {"code": "daytona_credential_unavailable"}
+    assert output.stat().st_mode & 0o777 == 0o600
+
+
+def test_interrupted_startup_acceptance_runs_post_inventory(
+    tmp_path: Path,
+) -> None:
+    runner_path = ROOT / "docker" / "runpod" / "run_v2_live_acceptance_on_start.sh"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    harness_marker = tmp_path / "harness-started"
+    after_marker = tmp_path / "after-inventory"
+    python_stub = bin_dir / "python-stub"
+    python_stub.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+    *daytona_inventory.py)
+        output="${3}"
+        printf '%s\n' \
+            '{"success":true,"provider_wide_empty":true,"sandbox_count":0}' \
+            >"${output}"
+        if [[ "${output}" == *daytona-after.json ]]; then
+            : >"${AFTER_MARKER}"
+        fi
+        ;;
+    *v2_live_acceptance.py)
+        : >"${HARNESS_MARKER}"
+        sleep 30 &
+        child=$!
+        terminate_child() {
+            kill -TERM "${child}" 2>/dev/null || true
+            wait "${child}" 2>/dev/null || true
+            exit 143
+        }
+        trap terminate_child TERM
+        wait "${child}"
+        ;;
+    -c)
+        exit 0
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+"""
+    )
+    python_stub.chmod(0o700)
+    for name, body in {
+        "flock": "#!/usr/bin/env bash\nexit 0\n",
+        "setsid": '#!/usr/bin/env bash\nexec "$@"\n',
+    }.items():
+        path = bin_dir / name
+        path.write_text(body)
+        path.chmod(0o700)
+
+    environment = os.environ | {
+        "AFTER_MARKER": str(after_marker),
+        "HARNESS_MARKER": str(harness_marker),
+        "MOE_TOOLS_ACCEPTANCE_PYTHON_PATH": str(python_stub),
+        "MOE_TOOLS_ACCEPTANCE_RUNNER_PATH": str(runner_path),
+        "MOE_TOOLS_APP_ROOT": str(tmp_path / "app"),
+        "MOE_TOOLS_AUTH_TOKEN": "a" * 32,
+        "MOE_TOOLS_DATA_DIR": str(tmp_path / "data"),
+        "MOE_TOOLS_DAYTONA_API_KEY": "d" * 32,
+        "MOE_TOOLS_MODE": "vllm",
+        "MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START": "1",
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+    }
+    launched = subprocess.run(
+        ["bash", str(runner_path)],
+        env=environment,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert launched.returncode == 0, launched.stderr
+
+    acceptance_dir = tmp_path / "data" / "acceptance"
+    pid_file = acceptance_dir / "v2-live-acceptance.pid"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not harness_marker.exists():
+        time.sleep(0.02)
+    assert harness_marker.exists()
+    os.kill(int(pid_file.read_text()), signal.SIGTERM)
+
+    status_file = acceptance_dir / "v2-live-acceptance.status"
+    report: dict[str, object] = {}
+    while time.monotonic() < deadline:
+        report = json.loads(status_file.read_text())
+        if report.get("state") == "interrupted":
+            break
+        time.sleep(0.02)
+
+    assert report["state"] == "interrupted"
+    assert report["cancellation_exit_code"] == 0
+    assert report["daytona_after_exit_code"] == 0
+    assert after_marker.exists()
 
 
 def test_release_workflows_pin_actions_and_require_both_source_revisions() -> None:

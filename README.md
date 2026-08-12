@@ -462,7 +462,10 @@ uv run ruff check backend scripts
 uv run pytest -q
 npm --prefix frontend test -- --run
 npm --prefix frontend run build
-bash -n docker/runpod/pre_start.sh scripts/create_runpod_template.sh
+bash -n \
+  docker/runpod/pre_start.sh \
+  docker/runpod/run_v2_live_acceptance_on_start.sh \
+  scripts/create_runpod_template.sh
 ```
 
 ## Container and Runpod runbook
@@ -595,6 +598,30 @@ uv run python scripts/v2_live_acceptance.py \
 
 The output is evidence for the in-appliance checks only. It does not by itself
 prove the external gates or authorize paid infrastructure.
+
+For a disposable acceptance Pod whose secrets are supplied by its private Runpod
+template, set `MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START=1`. After the application is
+ready, the image starts the same Daytona-qualified driver against loopback HTTP.
+The runner never passes credentials on the command line, performs provider-wide
+Daytona inventories before and after the run, and stores private artifacts under
+`${MOE_TOOLS_DATA_DIR}/acceptance/`:
+
+- `v2-live-acceptance.status` records the atomic terminal state and exit codes;
+- `v2-live-acceptance.json` is the driver evidence;
+- `daytona-before.json` and `daytona-after.json` must both report an empty
+  provider-wide inventory; and
+- `v2-live-acceptance.log` contains the redacted driver output. The terminal
+  status also requires a byte-level scan of every generated artifact to find no
+  app or Daytona credential.
+
+This paid opt-in is at most once per persistent data directory. A terminal failure
+is not retried on container restart, and an interrupted run is marked rather than
+silently repeated. Inspect and preserve the artifacts before deliberately removing
+the acceptance status/evidence for a new attempt. The secure session cookie is
+rebound as non-Secure only inside the private canary client and only for literal
+plain-HTTP loopback; public proxy and arbitrary HTTP origins retain secure-cookie
+behavior. Browser, GPU-memory/equivalence, spend, and infrastructure teardown
+remain separate external gates.
 
 ### Historical V1 RC1 live-acceptance driver
 

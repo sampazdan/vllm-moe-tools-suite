@@ -114,19 +114,28 @@ COPY backend/ backend/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/vllm-venv/bin/python --no-deps .
 COPY --from=frontend-build /build/frontend/dist frontend/dist
+COPY scripts/acceptance_canary.py scripts/v2_live_acceptance.py \
+    scripts/daytona_inventory.py scripts/
 
 COPY --from=vllm_source docker/runpod/profile.sh /etc/profile.d/vllm-runpod.sh
 COPY --from=vllm_source docker/runpod/runpod-serve.sh /usr/local/bin/runpod-serve
 COPY --from=vllm_source docker/runpod/runpod-bench.sh /usr/local/bin/runpod-bench
 COPY --from=vllm_source docker/runpod/make_moe_profile.py /usr/local/bin/make-moe-profile
 COPY docker/runpod/pre_start.sh /pre_start.sh
+COPY docker/runpod/run_v2_live_acceptance_on_start.sh \
+    /usr/local/bin/run-v2-live-acceptance-on-start
 
 RUN chmod 0755 \
         /pre_start.sh \
+        /usr/local/bin/run-v2-live-acceptance-on-start \
         /usr/local/bin/runpod-serve \
         /usr/local/bin/runpod-bench \
         /usr/local/bin/make-moe-profile \
-    && chmod 0644 /etc/profile.d/vllm-runpod.sh \
+    && chmod 0644 \
+        /etc/profile.d/vllm-runpod.sh \
+        /opt/moe-tools-test-suite/scripts/acceptance_canary.py \
+        /opt/moe-tools-test-suite/scripts/v2_live_acceptance.py \
+        /opt/moe-tools-test-suite/scripts/daytona_inventory.py \
     && /opt/vllm-venv/bin/python -c "from pathlib import Path; import moe_tools_suite, torch, vllm; torch_lib = Path(torch.__file__).parent / 'lib'; assert torch.version.cuda == '13.0', f'expected CUDA 13.0 PyTorch, got {torch.__version__} ({torch.version.cuda=})'; assert (torch_lib / 'libtorch_cuda.so').is_file(), f'libtorch_cuda.so missing from {torch_lib}'; print(moe_tools_suite.__version__, vllm.__version__, torch.__version__, torch.version.cuda)"
 
 WORKDIR /workspace

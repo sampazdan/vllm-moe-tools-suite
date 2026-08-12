@@ -38,7 +38,10 @@ jobs:
 
       - name: Validate deployment assets
         run: |
-          bash -n docker/runpod/pre_start.sh scripts/create_runpod_template.sh
+          bash -n \
+            docker/runpod/pre_start.sh \
+            docker/runpod/run_v2_live_acceptance_on_start.sh \
+            scripts/create_runpod_template.sh
           uv run python -m json.tool deploy/runpod-template.example.json >/dev/null
           uv run python -m json.tool deploy/runpod-agentic-template.example.json >/dev/null
           uv run python -m json.tool deploy/runpod-v2-template.example.json >/dev/null
