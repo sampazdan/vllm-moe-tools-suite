@@ -35,11 +35,11 @@ live-qualified.
 The V1 sections and coordinates below remain historical evidence. A V2 manifest,
 mock run, or local unit test is never substituted for live model acceptance.
 
-The product is now a complete research loop rather than a collection of MVP cards.
-Its exact application and fork commits were published as an attested image and
-exercised on real Runpod, Daytona, and Anthropic services. All GPU compute and owned
-Daytona sandboxes were stopped or deleted at handoff. This roadmap distinguishes
-those states deliberately:
+V2 is a local candidate, not a published or live-accepted release. No V2 image,
+attestation, Runpod template, GPU run, Daytona run, additional-model qualification,
+spend record, or external cleanup record exists yet. The publication, live
+acceptance, and cleanup statements later in this file refer only to historical V1
+`0.3.0-rc.1` evidence. This roadmap distinguishes those states deliberately:
 
 - **Implemented locally** means the code, UI, persistence contract, and automated
   coverage are present on this branch.
@@ -52,6 +52,18 @@ The exact `0.3.0-rc.1` build has bounded live evidence and a completed compute
 teardown recorded below. The stopped acceptance Pod remains undeleted only because
 deletion would irreversibly erase its fresh 150 GB Pod volume and requires explicit
 user approval. An older internal RC3 build remains historical evidence only.
+
+### V2 local gate ledger
+
+| Area | Implemented and exercised locally | Outstanding external/live gate |
+| --- | --- | --- |
+| Warm contexts | Private authenticated registration/activation API, canonical fingerprints, transactional prepare/commit/rollback code, stable router buffers, application receipts, mock rejection safety. | Real GPU switch P50/P95, unchanged PID and weight memory, no weight reads, rollback under injected commit failure, cold/hot output and routing equivalence, TP/cache, eager, and CUDA evidence. |
+| Model loading | Durable ordered application phases, optional authenticated managed-runtime phase signals, explicit unavailable phases, byte/file counters when observed, redacted diagnostics, failure code/recovery action, safe cancel/retry. | Observe all requested child phases on the immutable real runtime and prove retry remains pinned to the same model revision/topology/recipe. |
+| Unified experiments | Answer, coding, and Drift adapters share lanes, run units, evaluation, performance, routing, durable events, reconnect, and cancellation. | Run the exact published image through a real answer cohort, model-authored coding, and paired Drift experiment. |
+| Cohorts/contracts | Ordered workload/scenario subsets, search/select UI, 100-unit bounded default, 10,000-unit request cap, seed expansion, fingerprinted generation/evaluation/execution contracts, truthful unknown legacy provenance, token/time/turn/command/paid-judge cost handling. | Record real cohort IDs and results; do not substitute the 5,040-unit mock progress run for benchmark evidence. |
+| DriftBench | Seven deterministic scenario families; horizon, dependency span, branch count, rollback depth, distractor ratio, tool-error rate, and state-size parameters; full exact-state, compounding, recovery, reliability, and routing views. | Meaningful real baseline/profile run with routing at first divergence and an evidence-backed insight. |
+| Coding | Local controller/trajectory/verifier contract and fake provider diagnostics. | Daytona provider run authored by the model, trusted clean-room verification, provider-wide zero-owned-sandbox inventory, and explicit authorization for paid work. |
+| Release/operations | Digest-only V2 template and pinned publish workflow are present locally. | Push reviewed commits, open reviewable PRs, publish/attest the image, create the V2 template, qualify an additional model or record its precise blocker, audit spend, stop compute, and verify cleanup. |
 
 ## North star
 
@@ -66,7 +78,7 @@ The first causal experiment is an expert-eligibility mask:
 3. capture routed expert IDs and probabilities for every instrumented inference;
 4. inspect aggregate and per-layer engagement;
 5. create an immutable custom profile from one or more workload traces;
-6. reload vLLM with that profile;
+6. register and activate that profile on the same warm V2 engine;
 7. rerun the identical evaluation and execution contracts; and
 8. compare quality, tool behavior, routing, performance, and cost.
 
@@ -74,12 +86,12 @@ The persistence model treats the mask as one intervention. Later interventions c
 add selective quantization, offload, or physically materialized checkpoints without
 changing the benchmark and comparison records.
 
-## Finish-line capability map
+## Historical V1 capability map
 
 No percentage here stands in for evidence. Every row names what exists locally and
 what must still happen before release acceptance.
 
-| Area | Implemented locally in `0.3.0-rc.1` | Remaining release gate |
+| Area | Implemented in `0.3.0-rc.1` | Historical V1 acceptance evidence |
 | --- | --- | --- |
 | Runpod appliance | Authenticated same-origin FastAPI/React appliance; persistent data root; attested image/template tooling; managed vLLM on loopback; responsive shell. Exact-build desktop/390 px QA passed locally; public-proxy auth passed by API. | All eight account Pods were `EXITED` and no endpoints remained. Optional permanent deletion of the stopped acceptance Pod requires user approval; a second public-proxy visual pass was not claimed. |
 | Model lifecycle | Registry-based Qwen A3B load/reload; topology/runtime facts; startup log; chat; persisted sessions; job adoption; process-group cleanup and startup reconciliation. The application has no public model-stop action. | Pod stop is the paid-compute control. A separately authenticated live client adopted the same load; public-browser hard reload remains unclaimed. |
@@ -94,37 +106,83 @@ what must still happen before release acceptance.
 | Recovery | Durable jobs, typed conflicts, reconnect adoption, cooperative cancellation, restart reconciliation, periodic Daytona cleanup, bounded external errors. | Live adoption and cancellation after 1/20 passed. Public-browser reload and a destructive orphan injection were not claimed. |
 | External coding suites | Launchable Aider Python canary 3/225; pinned Terminal-Bench engineering 15, Aider balanced 12, and FeatureBench Fast manifests. | Aider zebra passed unmasked live and regressed under its custom profile. The three larger manifests remain fail-closed pending full admission. |
 
-## Current application shape
+## Current V2 application shape
 
 The frontend uses a small route-based command shell rather than nesting every
 workflow in one dashboard:
 
 ```text
 /
-/benchmarks
-/benchmarks/{benchmark_id}
-/runs
-/runs/{run_id}
-/agent-runs
-/agent-runs/{run_id}
-/agent-comparisons/{baseline_id}/{candidate_id}
+/experiments
+/experiments/new
+/experiments/{experiment_id}
+/workloads
 /profiles
 /profiles/new
 /profiles/{profile_id}
-/comparisons
-/comparisons/{comparison_id}
+/models
+/settings
 ```
 
-Home owns model lifecycle and compact chat. Benchmarks and agents each have a
-dedicated builder, live progress surface, and immutable run view. Profile Studio is
-shared across one-request and multi-turn traces. Comparison pages make provenance
-mismatches explicit. The responsive layout uses full matrices and horizontal
-controls on desktop, then switches to touch-friendly tabs, drawers, and one-column
-problem/trajectory views on a phone.
+Experiments owns answer, coding, and Drift creation, live progress, aligned lanes,
+evaluation, routing, and immutable run detail. Workloads exposes ready units and
+blockers. Models owns the expensive load lifecycle and current warm context.
+Profiles owns human identity and links to Profile Studio. Settings owns runtime and
+security readiness. The preserved `/benchmarks`, `/runs`, `/agent-runs`,
+`/agent-comparisons`, and `/comparisons` paths delegate to the V1 shell so old data
+stays readable. The responsive layout uses full matrices and horizontal controls
+on desktop, then switches to touch-friendly tabs and panels on a phone.
 
 The visual direction remains warm off-white paper, ink-like text, restrained earth
 accents, serif narrative typography, and clean sans/monospace data surfaces. Color
 is not the only status or selection signal.
+
+### V2 lifecycle evidence semantics
+
+A model load is a durable attempt with ordered phase records. Queueing, model
+resolution, runtime configuration, process launch, readiness polling, ready-context
+verification, and terminal state are application-observed. Cache checks, downloads,
+weight loading, distributed-worker initialization, compilation, graph capture, and
+warming are managed-runtime phases. They carry byte/file counters and timing only
+when the child sends complete authenticated loopback signals; otherwise each phase
+is marked `unavailable`. Missing signals are not converted into zero duration or
+100% progress. Legacy rows use `legacy_unknown` provenance.
+
+The Models surface exposes attempt history, elapsed time, safe cancellation,
+redacted diagnostics, failure codes, recovery actions, and retry. Cleanup failure
+blocks automatic retry. The immutable-image gate must still prove the detailed
+child signals and pinned retry behavior on the real runtime.
+
+### V2 cohort and contract semantics
+
+Answer and coding descriptors publish ordered unit IDs. Researchers choose a true
+subset; the UI defaults large descriptors to the first 100 stable IDs, supports
+search, and caps a request at 10,000 IDs instead of accidentally submitting a
+larger corpus. Run units are the product of selected IDs, seeds, and lanes. Drift
+uses selected scenarios × conditions × horizons × seeds × lanes. The fingerprint
+binds those dimensions to workload content, generation, evaluation, execution, and
+Drift parameters.
+
+The current paired engine requires one attempt, serialized execution, and
+temperature zero so baseline and candidate switches remain aligned. Deterministic
+workload scoring and record-only evaluation are supported. Timeout, per-unit time,
+token, turn, command, and optional priced-judge cost caps stop work without becoming
+success criteria; exhausted work remains unscored. A judge requires an explicit
+priced cost cap. Pre-V2 records with missing contracts remain unknown and cannot be
+resumed with modern defaults.
+
+### V2 DriftBench evidence
+
+Every run persists dependency span, branch count, rollback depth, distractor ratio,
+deterministic tool-error rate, state size, and their fingerprint. Exact scoring
+persists final and per-transition correctness, state fidelity and survival curves,
+first divergence, fidelity AUC, recovery, invariant violations, invalid calls,
+collateral mutations, rollback correctness, divergence slope, and 80%/50%
+reliability horizons. Paired analysis adds local competence, chained fidelity,
+local-capability delta, paired drift, compounding penalty, and excess mask drift.
+Checkpoint routing retains both normalized overlap/Jensen–Shannon divergence and
+absolute selection slots/routing mass around first divergence. Mock routing remains
+unknown and cannot support the final insight gate.
 
 ## What the custom vLLM fork provides
 
@@ -166,11 +224,18 @@ selection and fails closed on unsupported routing implementations.
 
 ### Masking limitation
 
-Profiles are bound during model load. Changing one restarts the model process.
-Ineligible expert weights remain resident, so this is behavioral masking—not
-checkpoint compaction, offload, or evidence of lower VRAM. Routed capture also has
-memory, transport, and latency cost. Quality analysis should compare runs with the
-same capture mode; throughput claims need a separate capture-disabled run.
+V1 profiles are bound during model load, so archived V1 profile changes describe a
+process restart. V2 registers baseline and profile contexts against one ready engine
+and activates them without creating a model session or intentionally rereading
+weights; unsupported paths fail closed instead of falling back to a restart. That
+hot path is implemented and mock-tested, but its stable PID, memory, weight-read,
+timing, rollback, and equivalence properties still require real-GPU evidence.
+
+In both versions, ineligible expert weights remain resident, so this is behavioral
+masking—not checkpoint compaction, offload, or evidence of lower VRAM. Routed
+capture also has memory, transport, and latency cost. Quality analysis should
+compare runs with the same capture mode; throughput claims need a separate
+capture-disabled run.
 
 ## Architecture decisions
 
@@ -179,7 +244,8 @@ same capture mode; throughput claims need a separate capture-disabled run.
 A Pod fits an interactive, stateful, warm-model appliance better than Serverless.
 The target is one compatible 96 GB RTX PRO 6000 Blackwell. The Runpod template
 describes the container, ports, storage, and environment; GPU type is selected
-separately when the Pod is created. RC1 acceptance used the Workstation Edition.
+separately when the Pod is created. Historical V1 RC1 acceptance used the
+Workstation Edition.
 The application serves `8080/http`; managed vLLM stays on `127.0.0.1:8000`.
 Persistent state and model caches live below `/workspace`, ideally on a network
 volume when they must outlive the Pod.
@@ -201,7 +267,9 @@ forward the same single port later.
 FastAPI owns the SQLite metadata store, filesystem artifacts, durable job runner,
 frontend, model gateway, and controller. Only one GPU operation is active at a time.
 The managed vLLM process runs in its own validated process group. Model/profile or
-telemetry-mode changes create a new model session and restart that group.
+telemetry-mode changes in V1 create a new model session and restart that group. In
+V2, loading a different model remains an expensive replacement lifecycle, while a
+baseline/profile context activation updates the ready child in place.
 
 SQLite uses one application writer and keeps large arrays/artifacts as files. Run
 summaries are bounded; item pages are fetched separately. JSON and CSV exports are
@@ -218,7 +286,8 @@ use the published digest where Runpod accepts that coordinate; otherwise use the
 full-application-SHA tag and record the verified digest it resolved to.
 
 Task packs also require effective image digests. The current runnable Python packs
-pin the official `python:3.12-slim` digest. RC1's immutable coordinates are:
+pin the official `python:3.12-slim` digest. Historical V1 RC1's immutable
+coordinates are:
 
 - application `0c8c8ffcbcd72f1cf9b664a1d4cf7813f701c345`;
 - fork `28a44cf4291c05af070c7d8398c462459b9992d1`;
@@ -421,8 +490,11 @@ score merely because its source manifest exists.
 ### Sandbox and clean-room boundary
 
 The fake provider is an in-memory contract double and cannot execute a local
-subprocess. Daytona is the real remote provider through the pinned 0.192.0 SDK. A
-read-only preflight proves reachability/authentication without creating a sandbox.
+subprocess. It substitutes pinned oracle actions after model requests, so it can
+diagnose controller, trajectory, verifier, persistence, and UI wiring but cannot
+qualify model-authored coding behavior. Daytona is the real remote provider through
+the pinned 0.192.0 SDK. A read-only preflight proves reachability/authentication
+without creating a sandbox.
 
 For every real trial, the controller creates a private, labelled, digest-pinned
 sandbox with no controller secrets and the task's network/resource policy. It
@@ -451,8 +523,9 @@ reported as success.
   cancelled immediately. The active-work lock remains held until worker exit.
 - Managed vLLM has an owned process group, validated identity, bounded TERM/KILL
   shutdown, and startup reconciliation that does not trust a PID file alone.
-- Managed shutdown is currently an internal reload/application-lifecycle operation;
-  there is no public model-stop endpoint or Home-screen stop control.
+- Managed shutdown is an internal different-model replacement or application-
+  lifecycle operation; V2 context activation does not shut down the child. There
+  is no public model-stop endpoint or Home-screen stop control.
 - Interrupted benchmark and agent records retain explicit provenance and terminal
   causes. Archived task titles/content hashes do not depend on the current catalog.
 - Daytona cleanup handles ordinary deletion, handle-less create failure, app
@@ -477,7 +550,34 @@ reported as success.
 - Show that network volumes continue billing after Pods stop and require explicit
   teardown confirmation.
 
-## Release gates
+## V2 acceptance driver
+
+The application-owned live sequence is encoded in
+`scripts/v2_live_acceptance.py`. It loads the model once, exercises three named
+profiles repeatedly, checks rejection and rename identity, follows and reconnects
+to an ordinary multi-item cohort, then runs paired coding and Drift workloads. It
+writes `moe-atelier-v2-live-acceptance/v1` JSON and leaves external gates explicit
+instead of inferring them from application APIs.
+
+```bash
+MOE_TOOLS_CANARY_BASE_URL=https://POD_ID-8080.proxy.runpod.net \
+MOE_TOOLS_CANARY_TOKEN="..." \
+uv run python scripts/v2_live_acceptance.py \
+  --coding-provider daytona \
+  --output artifacts/v2-live-acceptance.json
+```
+
+The default `--coding-provider fake` and optional `--allow-missing-routing` are
+diagnostic-only and intentionally make the release gate incomplete. Running
+Daytona, Runpod, publication, or other paid/external operations still requires
+explicit authorization. Provider inventories, injected transactional failure,
+memory/equivalence checks, browser hard refresh, additional-model qualification,
+spend, and teardown must be attached separately.
+
+## Historical V1 release gates
+
+The statuses and immutable coordinates in Gates A–F below apply to V1
+`0.3.0-rc.1`; they are preserved as historical evidence and do not satisfy V2.
 
 ### Gate A — integrated local validation
 
@@ -590,7 +690,7 @@ network volumes `w7jl3o07i1`, `hhsfk4sdrc`, and `gbichawf78` were retained
 untouched. Earlier stalled fresh attempt Pod `o204fumgnxb1dj` was permanently
 deleted, and its Pod-volume data is unrecoverable.
 
-## RC1 acceptance record — observed 2026-08-11
+## Historical V1 RC1 acceptance record — observed 2026-08-11
 
 - **Immutable build:** application
   `0c8c8ffcbcd72f1cf9b664a1d4cf7813f701c345`, fork
@@ -716,7 +816,7 @@ Daytona sandbox remained. The old evidence does not cover RC1's standard benchma
 breadth, editable contracts, paid judges, multi-source/custom agent profiles,
 clean-room verifier design, full-screen views, or strict paired agent comparison.
 
-## Beyond `0.3.0-rc.1`
+## Longer-term roadmap beyond V1 and the local V2 candidate
 
 These are real future stages, not hidden release blockers:
 
@@ -763,7 +863,7 @@ memory result.
 - additional model registry entries after topology/backend acceptance; and
 - optional multi-user identity only if the appliance stops being single-researcher.
 
-## Definition of release complete
+## Historical V1 definition of release complete
 
 `0.3.0-rc.1` is accepted when a new user can launch the immutable Pod template,
 authenticate from a phone or laptop, load the supported Qwen model, inspect topology
@@ -780,7 +880,9 @@ sandboxes are stopped or deleted at handoff.
 
 ## Open product-policy questions
 
-No question blocks the current release gate. Before broader usage, decide:
+These questions did not block the historical V1 gate. V2 remains blocked by the
+explicit external/live gates above, independent of these longer-term policy choices.
+Before broader usage, decide:
 
 1. whether custom tasks may contain private repositories and whether Daytona is an
    approved data boundary for them;

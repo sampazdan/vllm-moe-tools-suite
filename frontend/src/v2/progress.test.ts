@@ -4,10 +4,11 @@ import test from "node:test";
 import {
   codingTimeline,
   driftRoutingSummaries,
+  liveProgress,
   mergeRunEvents,
   stateDifferences,
 } from "./progress.ts";
-import type { ExperimentUnit, LaneUnitResult, RunEvent } from "./types.ts";
+import type { ExperimentRecord, ExperimentUnit, LaneUnitResult, RunEvent } from "./types.ts";
 
 function event(sequence: number, message = `event ${sequence}`): RunEvent {
   return {
@@ -104,4 +105,59 @@ test("routing summaries prioritize candidate first divergence and preserve shift
     candidateShare: .3,
     delta: .2,
   });
+});
+
+test("paired live progress aggregates both lanes instead of borrowing the first ETA", () => {
+  const performance = (elapsed_ms: number, mean_tps: number) => ({
+    elapsed_ms,
+    eta_ms: 1,
+    prompt_tokens: 10,
+    reasoning_tokens: null,
+    completion_tokens: 10,
+    total_tokens: 20,
+    current_tps: null,
+    mean_tps,
+    estimated_cost_usd: null,
+  });
+  const experiment = {
+    phase: "running",
+    active_unit_id: "candidate-unit",
+    progress_current: 4,
+    progress_total: 8,
+    passed: 3,
+    failed: 1,
+    unscored: 0,
+    lanes: [
+      {
+        id: "baseline",
+        role: "baseline",
+        progress_current: 3,
+        progress_total: 4,
+        passed: 3,
+        failed: 0,
+        unscored: 0,
+        performance: performance(10_000, 20),
+      },
+      {
+        id: "candidate",
+        role: "candidate",
+        progress_current: 1,
+        progress_total: 4,
+        passed: 0,
+        failed: 1,
+        unscored: 0,
+        performance: performance(4_000, 10),
+      },
+    ],
+  } as unknown as ExperimentRecord;
+  experiment.lanes[1].performance.current_tps = 12;
+
+  const progress = liveProgress(experiment, []);
+
+  assert.equal(progress.completed, 4);
+  assert.equal(progress.total, 8);
+  assert.equal(progress.elapsedMs, 10_000);
+  assert.equal(progress.etaMs, 10_000);
+  assert.equal(progress.meanTps, 17.5);
+  assert.equal(progress.currentTps, 12);
 });

@@ -22,10 +22,22 @@ test("V2 routes unify the primary research surfaces", () => {
   assert.equal(parseV2Route("/settings").name, "settings");
 });
 
-test("legacy research URLs remain delegated while profile detail is V2", () => {
+test("legacy research URLs stay delegated while profile surfaces stay in V2", () => {
   assert.equal(parseV2Route("/benchmarks/mmlu-pro").name, "legacy");
   assert.equal(parseV2Route("/agent-runs/run-1").name, "legacy");
-  assert.equal(parseV2Route("/profiles/new", "?run=run-1").name, "legacy");
+  assert.deepEqual(
+    parseV2Route(
+      "/profiles/new",
+      "?run=run-1&trial=trial-1&trial=trial-1&profile=profile-1",
+    ),
+    {
+      name: "profileStudio",
+      path: "/profiles/new",
+      runId: "run-1",
+      trialIds: ["trial-1"],
+      profileId: "profile-1",
+    },
+  );
   assert.equal(parseV2Route("/profiles/profile-1").name, "profile");
 });
 

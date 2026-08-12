@@ -6,6 +6,13 @@ export type V2Route =
   | { name: "experiment"; path: string; experimentId: string }
   | { name: "workloads"; path: string }
   | { name: "profiles"; path: string }
+  | {
+      name: "profileStudio";
+      path: "/profiles/new";
+      runId: string | null;
+      trialIds: string[];
+      profileId: string | null;
+    }
   | { name: "profile"; path: string; profileId: string }
   | { name: "models"; path: string }
   | { name: "settings"; path: string }
@@ -44,6 +51,16 @@ export function parseV2Route(pathname: string, search = ""): V2Route {
   }
   if (segments[0] === "profiles") {
     if (segments.length === 1) return { name: "profiles", path };
+    if (segments.length === 2 && segments[1] === "new") {
+      const parameters = new URLSearchParams(search);
+      return {
+        name: "profileStudio",
+        path: "/profiles/new",
+        runId: parameters.get("run"),
+        trialIds: Array.from(new Set(parameters.getAll("trial").filter(Boolean))),
+        profileId: parameters.get("profile"),
+      };
+    }
     if (segments.length === 2 && segments[1] !== "new") {
       return { name: "profile", path, profileId: segments[1] };
     }

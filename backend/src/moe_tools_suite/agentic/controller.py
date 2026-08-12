@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 import numpy as np
@@ -386,6 +386,7 @@ class AgenticController:
         should_cancel: Callable[[], bool],
         intervention_context: InterventionContextRef | None = None,
         profile: ExpertProfile | None = None,
+        on_tool_command_started: Callable[[dict[str, Any]], None] | None = None,
     ) -> AgentRun:
         run = self.runs[run_id]
         if intervention_context is not None and (
@@ -468,6 +469,7 @@ class AgenticController:
                     should_cancel=should_cancel,
                     intervention_context=intervention_context,
                     profile=active_profile,
+                    on_tool_command_started=on_tool_command_started,
                 )
                 self._update_run_metrics(run)
                 on_progress(run.completed_trials, run.total_trials)
@@ -751,6 +753,7 @@ class AgenticController:
                         content="",
                         tool_name=call.function_name,
                         command=command,
+                        tool_call_id=call.tool_call_id,
                         phase="command",
                         turn=agent_turn,
                     )
@@ -768,6 +771,7 @@ class AgenticController:
                         type=TrajectoryStepType.OBSERVATION,
                         title="Command output",
                         content=observation.content,
+                        source_call_id=observation.source_call_id,
                         phase="observation",
                         turn=agent_turn,
                         stream=(
@@ -879,6 +883,7 @@ class AgenticController:
         should_cancel: Callable[[], bool],
         intervention_context: InterventionContextRef | None,
         profile: ExpertProfile | None,
+        on_tool_command_started: Callable[[dict[str, Any]], None] | None,
     ) -> None:
         wall_started = time.perf_counter()
         trial_deadline = time.monotonic() + budgets.timeout_seconds
@@ -1061,6 +1066,22 @@ class AgenticController:
                     break
                 command = action.command or ""
                 tool_call_id = str(uuid4())
+                if on_tool_command_started is not None:
+                    on_tool_command_started(
+                        {
+                            "id": f"pending-tool-{tool_call_id}",
+                            "sequence": len(trajectory.steps) + 1,
+                            "timestamp": utc_now().isoformat(),
+                            "type": "tool_start",
+                            "title": "shell",
+                            "content": "",
+                            "tool_name": "shell",
+                            "command": command,
+                            "tool_call_id": tool_call_id,
+                            "phase": "command",
+                            "turn": turn_index + 1,
+                        }
+                    )
                 command_result = await provider.exec(
                     handle,
                     command,
@@ -1117,6 +1138,10 @@ class AgenticController:
             if (
                 not cancelled
                 and trial.termination_cause is not TerminationCause.TIME_LIMIT
+                and not (
+                    trial.turns == 0
+                    and trial.termination_cause is TerminationCause.TOKEN_LIMIT
+                )
             ):
                 trial.status = AgentTrialStatus.VERIFYING
                 self.store.save_agent_trial(trial)
@@ -1456,12 +1481,6 @@ class AgenticController:
         maximum = run.execution_policy.max_cost_usd
         if maximum is None:
             return None
-        inference_cost = sum(
-            inference.estimated_cost_usd or 0
-            for inference in self.inferences.values()
-            if self.trials.get(inference.trial_id) is not None
-            and self.trials[inference.trial_id].run_id == run.id
-        )
         judge_cost = sum(
             (
                 trial.judge_cost_debit_usd
@@ -1475,7 +1494,7 @@ class AgenticController:
             )
             for trial in self._run_trials(run.id)
         )
-        return max(0.0, maximum - inference_cost - judge_cost)
+        return max(0.0, maximum - judge_cost)
 
     async def _execute_contract_verifiers(
         self,
@@ -2294,19 +2313,7 @@ def _agent_policy_stop_cause(
         return TerminationCause.TOKEN_LIMIT
     if (
         policy.max_cost_usd is not None
-        and sum(
-            (
-                (
-                    trial.performance.inference_cost_usd
-                    if trial.performance is not None
-                    and trial.performance.inference_cost_usd is not None
-                    else 0
-                )
-                + trial.judge_cost_debit_usd
-            )
-            for trial in trials
-        )
-        >= policy.max_cost_usd
+        and sum(trial.judge_cost_debit_usd for trial in trials) >= policy.max_cost_usd
     ):
         return TerminationCause.COST_LIMIT
     if any(trial.termination_cause is TerminationCause.COST_LIMIT for trial in trials):

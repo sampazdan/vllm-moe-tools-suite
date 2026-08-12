@@ -18,6 +18,7 @@ function job(status: JobStatus, overrides: Partial<JobRecord> = {}): JobRecord {
     progress_total: 3,
     result_id: status === "completed" ? "run-1" : null,
     error: null,
+    phase_history: [],
     created_at: "2026-08-11T00:00:00Z",
     started_at: null,
     completed_at: null,

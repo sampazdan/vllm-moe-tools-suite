@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import App from "../App";
 import { activeJobFromConflict, api, setCsrfToken } from "../api";
 import { AppLink } from "../AppShell";
+import { ProfileStudioPage } from "../CommandCenter";
 import { navigate } from "../router";
 import type {
   JobRecord,
@@ -14,10 +15,13 @@ import type {
 } from "../types";
 import { useDurableJob } from "../useDurableJob";
 import {
+  cancelJob,
   getActiveExpertContext,
   listExperiments,
+  listModels,
   listProfiles,
   loadModel,
+  retryModelLoad,
 } from "./data";
 import {
   CreateExperimentPage,
@@ -63,7 +67,7 @@ function V2Workspace({ route }: { route: Exclude<V2Route, { name: "legacy" }> })
     queryKey: ["runtime-status"],
     queryFn: () => api<RuntimeStatus>("/api/runtime/status"),
     enabled: authenticated,
-    refetchInterval: (query) => query.state.data?.managed && !query.state.data?.model_id ? 2_000 : false,
+    refetchInterval: (query) => query.state.data?.managed ? 2_000 : false,
   });
   const currentSession = useQuery({
     queryKey: ["model-session-current"],
@@ -85,6 +89,11 @@ function V2Workspace({ route }: { route: Exclude<V2Route, { name: "legacy" }> })
     queryKey: ["profiles"],
     queryFn: listProfiles,
     enabled: authenticated,
+  });
+  const studioModels = useQuery({
+    queryKey: ["v2-models"],
+    queryFn: listModels,
+    enabled: authenticated && route.name === "profileStudio",
   });
   const experiments = useQuery({
     queryKey: ["v2-experiments"],
@@ -123,6 +132,8 @@ function V2Workspace({ route }: { route: Exclude<V2Route, { name: "legacy" }> })
         queryClient.invalidateQueries({ queryKey: ["model-session-current"] }),
         queryClient.invalidateQueries({ queryKey: ["v2-active-context"] }),
         queryClient.invalidateQueries({ queryKey: ["v2-models"] }),
+        queryClient.invalidateQueries({ queryKey: ["v2-model-loads"] }),
+        queryClient.invalidateQueries({ queryKey: ["model-sessions"] }),
       ]);
       return;
     }
@@ -136,6 +147,27 @@ function V2Workspace({ route }: { route: Exclude<V2Route, { name: "legacy" }> })
     let submitted: JobRecord;
     try {
       submitted = await loadModel(modelId);
+    } catch (error) {
+      const existing = activeJobFromConflict(error);
+      if (!existing) throw error;
+      durableJob.adoptJob(existing);
+      return;
+    }
+    queryClient.setQueryData(["active-job"], submitted);
+    await durableJob.watchJob(submitted);
+    await refreshAfterJob(submitted);
+  }
+
+  async function cancelActiveJob(jobId: string) {
+    const job = await cancelJob(jobId);
+    await queryClient.invalidateQueries({ queryKey: ["v2-model-loads"] });
+    if (job.status === "cancelled") durableJob.retryRecovery();
+  }
+
+  async function retryAndWatchModel(jobId: string) {
+    let submitted: JobRecord;
+    try {
+      submitted = await retryModelLoad(jobId);
     } catch (error) {
       const existing = activeJobFromConflict(error);
       if (!existing) throw error;
@@ -187,13 +219,27 @@ function V2Workspace({ route }: { route: Exclude<V2Route, { name: "legacy" }> })
       {route.name === "experiment" && <ExperimentDetailPage experimentId={route.experimentId} />}
       {route.name === "workloads" && <WorkloadLibraryPage />}
       {route.name === "profiles" && <ProfilesPage activeProfileId={activeProfileId} currentSession={currentSession.data ?? null} />}
+      {route.name === "profileStudio" && (
+        <ProfileStudioPage
+          model={
+            studioModels.data?.find(
+              (model) => model.id === currentSession.data?.model_id,
+            ) ?? studioModels.data?.[0] ?? null
+          }
+          route={route}
+        />
+      )}
       {route.name === "profile" && <ProfileDetailPage activeProfileId={activeProfileId} currentSession={currentSession.data ?? null} profileId={route.profileId} />}
       {route.name === "models" && (
         <ModelsPage
           activeJob={durableJob.activeJob}
           activeProfileId={activeProfileId}
+          connectionIssue={durableJob.connectionIssue}
           currentSession={currentSession.data ?? null}
+          onCancelJob={cancelActiveJob}
           onLoadModel={loadAndWatchModel}
+          onRetryModelLoad={retryAndWatchModel}
+          runtime={runtime.data ?? null}
           status={status.data ?? null}
         />
       )}

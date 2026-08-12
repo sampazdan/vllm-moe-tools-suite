@@ -147,6 +147,9 @@ class ApiClient:
     def post(self, path: str, payload: object | None = None) -> Any:
         return self._request("POST", path, payload=payload)
 
+    def patch(self, path: str, payload: object) -> Any:
+        return self._request("PATCH", path, payload=payload)
+
     def login(self) -> dict[str, Any]:
         session = _mapping(self.get("/api/session"), "session status")
         if not _boolean(session, "auth_required"):

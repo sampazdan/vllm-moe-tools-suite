@@ -32,6 +32,12 @@ export interface DriftRoutingSummary {
   checkpoint: number;
   selectionOverlap: number | null;
   routingMassJsDivergence: number | null;
+  baselineSelectionCount: number | null;
+  candidateSelectionCount: number | null;
+  selectionCountDelta: number | null;
+  baselineRoutingMass: number | null;
+  candidateRoutingMass: number | null;
+  routingMassDelta: number | null;
   firstDivergence: boolean;
   shifts: Array<{
     layer: number;
@@ -102,6 +108,12 @@ export function driftRoutingSummaries(unit: ExperimentUnit): DriftRoutingSummary
         checkpoint: checkpoint.index,
         selectionOverlap: comparison.selection_overlap,
         routingMassJsDivergence: comparison.routing_mass_js_divergence,
+        baselineSelectionCount: comparison.baseline_selection_count ?? null,
+        candidateSelectionCount: comparison.candidate_selection_count ?? null,
+        selectionCountDelta: comparison.selection_count_delta ?? null,
+        baselineRoutingMass: comparison.baseline_routing_mass ?? null,
+        candidateRoutingMass: comparison.candidate_routing_mass ?? null,
+        routingMassDelta: comparison.routing_mass_delta ?? null,
         firstDivergence: comparison.at_candidate_first_divergence,
         shifts: comparison.largest_selection_shifts.map((shift) => ({
           layer: shift.layer,
@@ -137,7 +149,22 @@ export function liveProgress(
   const total = !laneRole && laneTotal === 0
     ? experiment.progress_total
     : laneTotal;
-  const performance = lanes[0]?.performance;
+  const elapsedValues = lanes
+    .map((lane) => lane.performance.elapsed_ms)
+    .filter((value): value is number => value !== null);
+  const elapsedMs = elapsedValues.length ? Math.max(...elapsedValues) : null;
+  const etaMs = completed > 0 && total > completed && elapsedMs !== null
+    ? (elapsedMs / completed) * (total - completed)
+    : null;
+  const currentValues = lanes
+    .map((lane) => lane.performance.current_tps)
+    .filter((value): value is number => value !== null);
+  const meanWeights = lanes
+    .filter((lane) => lane.performance.mean_tps !== null && lane.progress_current > 0);
+  const meanWeightTotal = meanWeights.reduce(
+    (sum, lane) => sum + lane.progress_current,
+    0,
+  );
   return {
     phase: latest?.phase ?? experiment.phase,
     currentUnit: latest?.unit_id ?? experiment.active_unit_id,
@@ -160,10 +187,17 @@ export function liveProgress(
       (sum, lane) => sum + lane.performance.completion_tokens,
       0,
     ),
-    currentTps: performance?.current_tps ?? null,
-    meanTps: performance?.mean_tps ?? null,
-    elapsedMs: performance?.elapsed_ms ?? null,
-    etaMs: performance?.eta_ms ?? null,
+    currentTps: currentValues.length
+      ? currentValues.reduce((sum, value) => sum + value, 0)
+      : null,
+    meanTps: meanWeightTotal > 0
+      ? meanWeights.reduce(
+        (sum, lane) => sum + (lane.performance.mean_tps ?? 0) * lane.progress_current,
+        0,
+      ) / meanWeightTotal
+      : null,
+    elapsedMs,
+    etaMs,
   };
 }
 

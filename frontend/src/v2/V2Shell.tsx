@@ -25,7 +25,7 @@ const navigation = [
     label: "Profiles",
     shortLabel: "Profiles",
     glyph: "⌁",
-    routes: ["profiles", "profile"],
+    routes: ["profiles", "profile", "profileStudio"],
   },
   {
     href: "/models",
@@ -233,7 +233,7 @@ function activeWorkHref(job: JobRecord) {
   if (job.result_id && job.kind === "benchmark_run") {
     return `/runs/${encodeURIComponent(job.result_id)}`;
   }
-  return job.kind === "model_load" ? "/models" : "/experiments";
+  return job.kind === "model_load" ? "/models#active-model-load" : "/experiments";
 }
 
 function jobLabel(job: JobRecord) {

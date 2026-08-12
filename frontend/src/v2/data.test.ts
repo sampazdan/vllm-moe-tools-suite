@@ -14,6 +14,37 @@ test("V2 create payload enables answer and coding without drift placeholders", (
     agentId: "bash-json-v1",
     candidateProfileId: null,
     conditions: ["chained"],
+    evaluationContract: {
+      name: "Pinned deterministic evaluator",
+      criteria: [{
+        id: "workload-correctness",
+        kind: "benchmark_default" as const,
+        label: "Workload correctness",
+        visibility: "public" as const,
+        required: true,
+        weight: 1,
+        case_sensitive: true,
+        strip_whitespace: true,
+      }],
+      aggregation: "all_required" as const,
+      pass_threshold: 1,
+      judge: null,
+      judge_weight: 0,
+      judge_can_override_deterministic_failure: false,
+    },
+    executionPolicy: {
+      attempts: 1,
+      concurrency: 1,
+      max_tokens: 32768,
+      timeout_seconds: 300,
+      per_item_timeout_seconds: 300,
+    },
+    generation: {
+      temperature: 0,
+      max_tokens: 512,
+      seed: 3,
+      enable_thinking: false,
+    },
     horizon: 8,
     modelId: "model-1",
     name: "Ready task",
@@ -31,13 +62,30 @@ test("V2 create payload enables answer and coding without drift placeholders", (
     kind: "coding",
     workloadId: "coding:pack:task-1",
   });
+  const drift = buildExperimentCreateRequest({
+    ...base,
+    kind: "state_drift",
+    workloadId: "state-drift-v1",
+    driftParameters: {
+      dependency_span: 3,
+      branch_count: 4,
+      rollback_depth: 2,
+      distractor_ratio: .25,
+      tool_error_rate: .1,
+      state_size: 12,
+    },
+  });
 
   assert.equal(answer.scenario_ids, undefined);
   assert.equal(answer.agent_id, undefined);
+  assert.deepEqual(answer.workload_unit_ids, ["task-1"]);
   assert.equal(coding.scenario_ids, undefined);
   assert.equal(coding.agent_id, "bash-json-v1");
   assert.equal(coding.sandbox_provider_id, "fake");
+  assert.deepEqual(coding.workload_unit_ids, ["task-1"]);
   assert.deepEqual(coding.seeds, [3]);
+  assert.equal(drift.drift_parameters?.rollback_depth, 2);
+  assert.deepEqual(drift.scenario_ids, ["task-1"]);
 });
 
 test("model normalization preserves an undiscovered topology as null", () => {
@@ -51,6 +99,23 @@ test("model normalization preserves an undiscovered topology as null", () => {
   });
 
   assert.equal(model.topology, null);
+});
+
+test("legacy experiments keep missing contracts explicitly unknown", () => {
+  const legacy = normalizeExperiment({
+    id: "legacy-run",
+    name: "Imported run",
+    model_id: "model-1",
+    workload_kind: "answer",
+    status: "completed",
+    lanes: [],
+    created_at: "2026-08-12T00:00:00Z",
+  });
+
+  assert.equal(legacy.contract_provenance, "legacy_unknown");
+  assert.equal(legacy.evaluation_contract, null);
+  assert.equal(legacy.execution_policy, null);
+  assert.equal(legacy.generation, null);
 });
 
 test("task-level workload DTO preserves readiness evidence", () => {
@@ -134,6 +199,14 @@ test("ExperimentDetail DTO aligns per-lane run units and drift checkpoints", () 
         { id: "lane-c", role: "candidate", label: "Named mask", context: context(true), status: "completed" },
       ],
       comparison: { excess_compounding_penalty: .2 },
+      drift_parameters: {
+        dependency_span: 2,
+        branch_count: 2,
+        rollback_depth: 1,
+        distractor_ratio: .25,
+        tool_error_rate: .1,
+        state_size: 12,
+      },
       created_at: "2026-08-12T00:00:00Z",
     },
     workload_runs: [
@@ -182,6 +255,7 @@ test("ExperimentDetail DTO aligns per-lane run units and drift checkpoints", () 
   assert.equal(detail.lanes[1].progress_current, 1);
   assert.equal(detail.drift_metrics.candidate?.area_under_fidelity_curve, .5);
   assert.equal(detail.drift_metrics.candidate?.excess_mask_drift, .2);
+  assert.equal(detail.drift_parameters?.state_size, 12);
 });
 
 test("answer ExperimentDetail exposes nested prompt, output, and scorer truth", () => {
@@ -228,6 +302,76 @@ test("answer ExperimentDetail exposes nested prompt, output, and scorer truth", 
   assert.equal(detail.units[0].baseline?.output, "Four");
   assert.equal(detail.units[0].baseline?.passed, null);
   assert.equal(detail.units[0].baseline?.criteria[0].label, "Evaluation contract");
+});
+
+test("active cohort progress uses wall time for elapsed and measured ETA", () => {
+  const startedAt = new Date(Date.now() - 10_000).toISOString();
+  const detail = normalizeExperiment({
+    experiment: {
+      id: "active-cohort",
+      name: "Active cohort",
+      model_id: "model-1",
+      workload: {
+        id: "answer:fixture",
+        kind: "answer",
+        name: "Fixture cohort",
+        ready: true,
+        unit_ids: ["one", "two", "three"],
+      },
+      status: "running",
+      completed_units: 1,
+      passed_units: 1,
+      total_units: 3,
+      lanes: [{ id: "lane-b", role: "baseline", label: "Baseline", context: {}, status: "running" }],
+      created_at: startedAt,
+    },
+    workload_runs: [{
+      lane_id: "lane-b",
+      status: "running",
+      started_at: startedAt,
+      completed_units: 1,
+      passed_units: 1,
+      total_units: 3,
+    }],
+    units: [
+      {
+        id: "one",
+        lane_id: "lane-b",
+        unit_key: "one:s0:baseline",
+        workload_unit_id: "one",
+        status: "passed",
+        performance: { total_tokens: 20, latency_ms: 1000, tokens_per_second: 10 },
+      },
+      {
+        id: "two",
+        lane_id: "lane-b",
+        unit_key: "two:s0:baseline",
+        workload_unit_id: "two",
+        status: "running",
+        started_at: new Date(Date.now() - 1000).toISOString(),
+        performance: {
+          prompt_tokens: 5,
+          completion_tokens: 2,
+          total_tokens: 7,
+          latency_ms: 1000,
+          tokens_per_second: 2,
+        },
+      },
+      {
+        id: "three",
+        lane_id: "lane-b",
+        unit_key: "three:s0:baseline",
+        workload_unit_id: "three",
+        status: "queued",
+      },
+    ],
+  });
+
+  const performance = detail.lanes[0].performance;
+  assert.ok((performance.elapsed_ms ?? 0) >= 9_000);
+  assert.ok((performance.eta_ms ?? 0) >= 18_000);
+  assert.equal(performance.current_tps, 2);
+  assert.equal(performance.mean_tps, 10);
 });
 
 test("answer result normalization accepts flattened truth and preserves UNSCORED criteria", () => {
@@ -295,6 +439,12 @@ test("drift detail preserves routing arrays and aligns checkpoint comparison evi
       checkpoint: 2,
       selection_overlap: .72,
       routing_mass_js_divergence: .18,
+      baseline_selection_count: 128,
+      candidate_selection_count: 120,
+      selection_count_delta: -8,
+      baseline_routing_mass: 64,
+      candidate_routing_mass: 60,
+      routing_mass_delta: -4,
       at_candidate_first_divergence: true,
       largest_selection_shifts: [{
         layer: 4,
@@ -347,6 +497,8 @@ test("drift detail preserves routing arrays and aligns checkpoint comparison evi
   const aligned = detail.units[0].candidate?.checkpoints[0].routing_comparison;
   assert.equal(aligned?.selection_overlap, .72);
   assert.equal(aligned?.at_candidate_first_divergence, true);
+  assert.equal(aligned?.candidate_selection_count, 120);
+  assert.equal(aligned?.routing_mass_delta, -4);
   assert.equal(aligned?.largest_selection_shifts[0].expert, 17);
 });
 

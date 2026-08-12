@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../api";
 import { AppLink } from "../AppShell";
 import { navigate } from "../router";
-import type { ModelSession } from "../types";
+import type { EvaluationContract, ModelSession } from "../types";
 import {
   buildExperimentCreateRequest,
   cancelExperiment,
@@ -25,6 +25,15 @@ import {
   mergeRunEvents,
   stateDifferences,
 } from "./progress";
+import {
+  defaultWorkloadUnitSelection,
+  MAX_RENDERED_WORKLOAD_UNITS,
+  MAX_SELECTED_WORKLOAD_UNITS,
+  orderedWorkloadUnitSelection,
+  plannedExperimentUnits,
+  selectAllWorkloadUnits,
+  uniqueWorkloadUnitIds,
+} from "./cohortSelection";
 import { v2Href } from "./router";
 import type {
   DriftCheckpoint,
@@ -46,6 +55,7 @@ import {
   V2PageHeader,
   V2Status,
 } from "./V2Shell";
+import { InlineProfileName } from "./Profiles";
 
 const activeStatuses = new Set(["queued", "preparing", "running", "cancelling"]);
 
@@ -174,6 +184,10 @@ export function CreateExperimentPage({
 }) {
   const [kind, setKind] = useState<WorkloadKind>("answer");
   const [selectedWorkloadId, setSelectedWorkloadId] = useState(workloadId ?? "");
+  const [selectedWorkloadUnitIds, setSelectedWorkloadUnitIds] = useState(
+    new Set<string>(),
+  );
+  const selectionWorkloadKey = useRef<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const modelTouched = useRef(false);
   const [candidateProfileId, setCandidateProfileId] = useState("");
@@ -183,6 +197,18 @@ export function CreateExperimentPage({
   const [horizon, setHorizon] = useState(8);
   const [conditions, setConditions] = useState(new Set(["oracle_reset", "chained", "state_anchored"]));
   const [seed, setSeed] = useState(0);
+  const [evaluationMode, setEvaluationMode] = useState<"deterministic" | "record_only">("deterministic");
+  const [generationMaxTokens, setGenerationMaxTokens] = useState(512);
+  const [totalTokenBudget, setTotalTokenBudget] = useState(32768);
+  const [perUnitTimeoutSeconds, setPerUnitTimeoutSeconds] = useState(300);
+  const [maxTurns, setMaxTurns] = useState(8);
+  const [maxCommands, setMaxCommands] = useState(8);
+  const [dependencySpan, setDependencySpan] = useState(2);
+  const [branchCount, setBranchCount] = useState(2);
+  const [rollbackDepth, setRollbackDepth] = useState(2);
+  const [distractorRatio, setDistractorRatio] = useState(0.25);
+  const [toolErrorRate, setToolErrorRate] = useState(0.1);
+  const [stateSize, setStateSize] = useState(12);
   const [agentId, setAgentId] = useState("");
   const [sandboxProviderId, setSandboxProviderId] = useState("");
   const workloads = useQuery({ queryKey: ["v2-workloads"], queryFn: listWorkloads });
@@ -202,6 +228,18 @@ export function CreateExperimentPage({
   });
   const candidates = (workloads.data ?? []).filter((item) => item.kind === kind);
   const selectedWorkload = candidates.find((item) => item.id === selectedWorkloadId) ?? null;
+  const orderedSelectedUnitIds = selectedWorkload
+    ? orderedWorkloadUnitSelection(
+        selectedWorkload.unit_ids,
+        selectedWorkloadUnitIds,
+      )
+    : [];
+  const plannedUnits = plannedExperimentUnits({
+    conditionCount: conditions.size,
+    kind,
+    paired,
+    selectedUnitCount: orderedSelectedUnitIds.length,
+  });
 
   useEffect(() => {
     if (!models.data?.length) return;
@@ -254,6 +292,23 @@ export function CreateExperimentPage({
   }, [candidates, selectedWorkloadId, workloadId, workloads.data]);
 
   useEffect(() => {
+    const unitIds = selectedWorkload?.unit_ids ?? [];
+    const selectionKey = selectedWorkload
+      ? [
+          selectedWorkload.id,
+          unitIds.length,
+          unitIds[0] ?? "",
+          unitIds.at(-1) ?? "",
+        ].join(":")
+      : null;
+    if (selectionWorkloadKey.current === selectionKey) return;
+    selectionWorkloadKey.current = selectionKey;
+    setSelectedWorkloadUnitIds(
+      new Set(defaultWorkloadUnitSelection(unitIds)),
+    );
+  }, [selectedWorkload]);
+
+  useEffect(() => {
     if (nameTouched.current || !selectedWorkload) return;
     setName(`${selectedWorkload.title} · ${paired ? "baseline vs profile" : "baseline"}`);
   }, [paired, selectedWorkload]);
@@ -265,18 +320,68 @@ export function CreateExperimentPage({
 
   function submit() {
     if (!selectedWorkload || !selectedModelId) return;
+    const criterionKind = evaluationMode === "record_only" ? "ungraded" : "benchmark_default";
+    const evaluationContract = {
+      version: 1 as const,
+      name: evaluationMode === "record_only" ? "Record-only evaluation" : kind === "state_drift" ? "Exact canonical state" : kind === "coding" ? "Trusted sandbox verifier" : "Pinned dataset scorer",
+      description: evaluationMode === "record_only" ? "Persist outputs, performance, and routing without assigning pass/fail." : "Use the workload adapter's pinned deterministic evaluator.",
+      criteria: [{
+        id: "workload-correctness",
+        kind: criterionKind,
+        label: evaluationMode === "record_only" ? "Recorded outcome" : "Workload correctness",
+        visibility: "public" as const,
+        required: evaluationMode !== "record_only",
+        weight: 1,
+        case_sensitive: true,
+        strip_whitespace: true,
+      }],
+      aggregation: "all_required" as const,
+      pass_threshold: 1,
+      judge: null,
+      judge_weight: 0,
+      judge_can_override_deterministic_failure: false,
+    } satisfies EvaluationContract;
     create.mutate(buildExperimentCreateRequest({
       name: name.trim(),
       modelId: selectedModelId,
       workloadId: selectedWorkload.id,
-      workloadUnitIds: selectedWorkload.unit_ids,
+      workloadUnitIds: orderedSelectedUnitIds,
       kind,
       candidateProfileId: paired ? candidateProfileId || null : null,
       agentId,
       sandboxProviderId,
       conditions: [...conditions],
+      driftParameters: {
+        dependency_span: dependencySpan,
+        branch_count: branchCount,
+        rollback_depth: rollbackDepth,
+        distractor_ratio: distractorRatio,
+        tool_error_rate: toolErrorRate,
+        state_size: stateSize,
+      },
       horizon,
       seed,
+      generation: {
+        temperature: 0,
+        max_tokens: generationMaxTokens,
+        seed,
+        enable_thinking: false,
+      },
+      evaluationContract,
+      executionPolicy: {
+        attempts: 1,
+        concurrency: 1,
+        timeout_seconds: Math.min(
+          86_400,
+          Math.max(perUnitTimeoutSeconds, perUnitTimeoutSeconds * plannedUnits),
+        ),
+        per_item_timeout_seconds: perUnitTimeoutSeconds,
+        max_turns: kind === "coding" || kind === "state_drift" ? Math.max(maxTurns, kind === "state_drift" ? horizon : 1) : null,
+        max_commands: kind === "coding" ? maxCommands : null,
+        max_tokens: totalTokenBudget,
+        max_cost_usd: null,
+        fail_fast: false,
+      },
     }));
   }
 
@@ -293,9 +398,23 @@ export function CreateExperimentPage({
     selectedModelId &&
     residentModelReady &&
     selectedWorkload?.readiness === "ready" &&
+    orderedSelectedUnitIds.length > 0 &&
+    orderedSelectedUnitIds.length <= MAX_SELECTED_WORKLOAD_UNITS &&
     (!paired || candidateProfileId) &&
     (kind !== "state_drift" || conditions.size > 0) &&
     codingExecutorReady &&
+    generationMaxTokens >= 1 &&
+    totalTokenBudget >= generationMaxTokens &&
+    perUnitTimeoutSeconds >= 1 &&
+    maxTurns >= 1 &&
+    maxCommands >= 1 &&
+    (kind !== "state_drift" || (
+      dependencySpan < stateSize &&
+      branchCount <= stateSize &&
+      rollbackDepth + 2 <= horizon &&
+      distractorRatio >= 0 && distractorRatio <= .9 &&
+      toolErrorRate >= 0 && toolErrorRate <= .9
+    )) &&
     Number.isInteger(seed),
   );
 
@@ -340,7 +459,12 @@ export function CreateExperimentPage({
                   type="button"
                   key={value}
                   className={kind === value ? "selected" : ""}
-                  onClick={() => { setKind(value); setSelectedWorkloadId(""); }}
+                  onClick={() => {
+                    selectionWorkloadKey.current = null;
+                    setKind(value);
+                    setSelectedWorkloadId("");
+                    setSelectedWorkloadUnitIds(new Set());
+                  }}
                 >
                   <strong>{kindLabel(value)}</strong>
                   <small>{kindDescription(value)}</small>
@@ -349,7 +473,14 @@ export function CreateExperimentPage({
             </div>
             <label>
               Task or cohort
-              <select value={selectedWorkloadId} onChange={(event) => setSelectedWorkloadId(event.target.value)}>
+              <select
+                value={selectedWorkloadId}
+                onChange={(event) => {
+                  selectionWorkloadKey.current = null;
+                  setSelectedWorkloadId(event.target.value);
+                  setSelectedWorkloadUnitIds(new Set());
+                }}
+              >
                 {candidates.map((workload) => (
                   <option key={workload.id} value={workload.id} disabled={workload.readiness !== "ready"}>
                     {workload.title}{workload.readiness === "ready" ? "" : ` · ${humanize(workload.readiness)}`}
@@ -358,6 +489,13 @@ export function CreateExperimentPage({
               </select>
             </label>
             {selectedWorkload && <WorkloadSelectionSummary workload={selectedWorkload} />}
+            {selectedWorkload && (
+              <WorkloadUnitSelection
+                onChange={setSelectedWorkloadUnitIds}
+                selected={selectedWorkloadUnitIds}
+                workload={selectedWorkload}
+              />
+            )}
             {kind === "state_drift" && (
               <div className="v2-drift-config">
                 <label>Horizon<select value={horizon} onChange={(event) => setHorizon(Number(event.target.value))}>{[2, 4, 8, 12, 16, 24].map((value) => <option key={value}>{value}</option>)}</select></label>
@@ -366,6 +504,15 @@ export function CreateExperimentPage({
                   {["oracle_reset", "chained", "state_anchored"].map((condition) => (
                     <label key={condition}><input type="checkbox" checked={conditions.has(condition)} onChange={() => setConditions(toggleSet(conditions, condition))} />{humanize(condition)}</label>
                   ))}
+                </div>
+                <div className="v2-drift-dimensions">
+                  <span>Scenario dimensions</span>
+                  <label>State size<input type="number" min="3" max="128" value={stateSize} onChange={(event) => setStateSize(Number(event.target.value))} /></label>
+                  <label>Dependency span<input type="number" min="1" max="32" value={dependencySpan} onChange={(event) => setDependencySpan(Number(event.target.value))} /></label>
+                  <label>Branches<input type="number" min="1" max="16" value={branchCount} onChange={(event) => setBranchCount(Number(event.target.value))} /></label>
+                  <label>Rollback depth<input type="number" min="0" max="16" value={rollbackDepth} onChange={(event) => setRollbackDepth(Number(event.target.value))} /></label>
+                  <label>Distractor ratio<input type="number" min="0" max="0.9" step="0.05" value={distractorRatio} onChange={(event) => setDistractorRatio(Number(event.target.value))} /></label>
+                  <label>Tool-error rate<input type="number" min="0" max="0.9" step="0.05" value={toolErrorRate} onChange={(event) => setToolErrorRate(Number(event.target.value))} /></label>
                 </div>
               </div>
             )}
@@ -428,7 +575,14 @@ export function CreateExperimentPage({
           </section>
           <section>
             <span className="v2-section-label">Evaluation contract</span>
-            <strong>{kind === "state_drift" ? "Exact canonical state" : kind === "coding" ? "Trusted sandbox verifier" : "Dataset scorer"}</strong>
+            <label>
+              Verdict policy
+              <select value={evaluationMode} onChange={(event) => setEvaluationMode(event.target.value as "deterministic" | "record_only")}>
+                <option value="deterministic">Pinned deterministic evaluator</option>
+                <option value="record_only">Record only · no pass/fail</option>
+              </select>
+            </label>
+            <strong>{evaluationMode === "record_only" ? "Outputs remain unscored" : kind === "state_drift" ? "Exact canonical state" : kind === "coding" ? "Trusted sandbox verifier" : "Dataset scorer"}</strong>
             <p>{selectedWorkload?.public_success_criteria[0] ?? "The workload adapter owns observable success criteria."}</p>
             <small>Evaluation is workload-owned and persisted with the experiment result.</small>
           </section>
@@ -436,15 +590,22 @@ export function CreateExperimentPage({
             <span className="v2-section-label">Deterministic dimensions</span>
             <div className="v2-compact-fields">
               <label>Seed<input type="number" value={seed} onChange={(event) => setSeed(Number(event.target.value))} /></label>
-              <label>Temperature<input disabled value="0 · fixed" /></label>
+              <label>Response tokens<input type="number" min="1" max="4096" value={generationMaxTokens} onChange={(event) => setGenerationMaxTokens(Number(event.target.value))} /></label>
             </div>
-            <p>Fixed sampling keeps baseline and candidate lanes aligned.</p>
+            <p>Temperature stays at 0 so baseline and candidate lanes remain aligned.</p>
           </section>
           <section>
             <span className="v2-section-label">Execution budget</span>
+            <div className="v2-compact-fields">
+              <label>Tokens / lane<input type="number" min="1" max="10000000" value={totalTokenBudget} onChange={(event) => setTotalTokenBudget(Number(event.target.value))} /></label>
+              <label>Seconds / unit<input type="number" min="1" max="7200" value={perUnitTimeoutSeconds} onChange={(event) => setPerUnitTimeoutSeconds(Number(event.target.value))} /></label>
+              {(kind === "coding" || kind === "state_drift") && <label>Max turns<input type="number" min="1" max="1024" value={maxTurns} onChange={(event) => setMaxTurns(Number(event.target.value))} /></label>}
+              {kind === "coding" && <label>Max commands<input type="number" min="1" max="4096" value={maxCommands} onChange={(event) => setMaxCommands(Number(event.target.value))} /></label>}
+            </div>
             <dl className="v2-create-budget-summary">
               <div><dt>Runtime</dt><dd>{selectedWorkload?.runtime?.label ?? "Warm model engine"}</dd></div>
-              <div><dt>Units</dt><dd>{kind === "state_drift" ? `${selectedWorkload?.unit_count ?? 0} scenarios × ${conditions.size} conditions × 1 horizon` : selectedWorkload?.unit_count ?? "—"}</dd></div>
+              <div><dt>Units</dt><dd>{kind === "state_drift" ? `${orderedSelectedUnitIds.length} selected scenarios × ${conditions.size} conditions × 1 horizon` : `${orderedSelectedUnitIds.length} selected`}</dd></div>
+              <div><dt>Lane units</dt><dd>{plannedUnits || "—"}</dd></div>
               <div><dt>Cancellation</dt><dd>Safe unit boundaries</dd></div>
               <div><dt>Lanes</dt><dd>{paired ? "Baseline + candidate" : "Baseline"}</dd></div>
             </dl>
@@ -467,6 +628,114 @@ function WorkloadSelectionSummary({ workload }: { workload: WorkloadDescriptor }
   );
 }
 
+function WorkloadUnitSelection({
+  onChange,
+  selected,
+  workload,
+}: {
+  onChange: (selected: Set<string>) => void;
+  selected: ReadonlySet<string>;
+  workload: WorkloadDescriptor;
+}) {
+  const [search, setSearch] = useState("");
+  const unitIds = uniqueWorkloadUnitIds(workload.unit_ids);
+  const selectedIds = orderedWorkloadUnitSelection(unitIds, selected);
+  const query = search.trim().toLowerCase();
+  const matchingIds = query
+    ? unitIds.filter((unitId) => unitId.toLowerCase().includes(query))
+    : unitIds;
+  const visibleIds = matchingIds.slice(0, MAX_RENDERED_WORKLOAD_UNITS);
+  const atLimit = selectedIds.length >= MAX_SELECTED_WORKLOAD_UNITS;
+
+  useEffect(() => setSearch(""), [workload.id]);
+
+  function toggle(unitId: string) {
+    const next = new Set(selectedIds);
+    if (next.has(unitId)) {
+      next.delete(unitId);
+    } else if (!atLimit) {
+      next.add(unitId);
+    }
+    onChange(next);
+  }
+
+  return (
+    <section className="v2-unit-picker" aria-labelledby="v2-unit-picker-title">
+      <header>
+        <div>
+          <span className="v2-section-label" id="v2-unit-picker-title">
+            {workload.kind === "state_drift" ? "Scenario subset" : "Task subset"}
+          </span>
+          <strong>{selectedIds.length} of {unitIds.length} selected</strong>
+        </div>
+        <div>
+          <button
+            disabled={unitIds.length === 0}
+            onClick={() => onChange(new Set(selectAllWorkloadUnits(unitIds)))}
+            type="button"
+          >
+            {unitIds.length > MAX_SELECTED_WORKLOAD_UNITS
+              ? `Select first ${MAX_SELECTED_WORKLOAD_UNITS.toLocaleString()}`
+              : "Select all"}
+          </button>
+          <button
+            disabled={selectedIds.length === 0}
+            onClick={() => onChange(new Set())}
+            type="button"
+          >
+            Clear
+          </button>
+        </div>
+      </header>
+      {unitIds.length > 12 && (
+        <input
+          aria-label="Filter workload units"
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Filter task or scenario IDs"
+          type="search"
+          value={search}
+        />
+      )}
+      <div className="v2-unit-picker-list">
+        {visibleIds.map((unitId) => (
+          <label key={unitId}>
+            <input
+              checked={selected.has(unitId)}
+              disabled={atLimit && !selected.has(unitId)}
+              onChange={() => toggle(unitId)}
+              type="checkbox"
+            />
+            <code>{unitId}</code>
+          </label>
+        ))}
+      </div>
+      {unitIds.length === 0 && (
+        <small className="v2-form-warning" role="alert">
+          This backend did not publish stable unit IDs, so the workload cannot be
+          submitted through the V2 experiment contract.
+        </small>
+      )}
+      {unitIds.length > MAX_SELECTED_WORKLOAD_UNITS && (
+        <small className="v2-form-warning" role="status">
+          The request contract allows at most {MAX_SELECTED_WORKLOAD_UNITS.toLocaleString()} units.
+          Large cohorts are intentionally bounded and never submitted in full.
+        </small>
+      )}
+      {matchingIds.length > visibleIds.length && (
+        <small>
+          Showing the first {visibleIds.length.toLocaleString()} matching IDs. Use
+          search to reach another unit; selection still covers all checked IDs.
+        </small>
+      )}
+      {selectedIds.length === 0 && unitIds.length > 0 && (
+        <small className="v2-form-warning" role="status">
+          Select at least one {workload.kind === "state_drift" ? "scenario" : "task"}.
+        </small>
+      )}
+    </section>
+  );
+}
+
 export function ExperimentDetailPage({ experimentId }: { experimentId: string }) {
   const queryClient = useQueryClient();
   const [events, setEvents] = useState<RunEvent[]>([]);
@@ -480,6 +749,10 @@ export function ExperimentDetailPage({ experimentId }: { experimentId: string })
     queryFn: () => getExperiment(experimentId),
     refetchInterval: (query) => activeStatuses.has(query.state.data?.status ?? "") ? 1_000 : false,
     retry: false,
+  });
+  const profiles = useQuery({
+    queryKey: ["profiles"],
+    queryFn: listProfiles,
   });
   const eventPage = useQuery({
     queryKey: ["v2-experiment-events", experimentId, cursor],
@@ -510,7 +783,26 @@ export function ExperimentDetailPage({ experimentId }: { experimentId: string })
 
   if (experiment.isPending) return <div className="v2-page"><V2Loading label="Opening experiment command center…" /></div>;
   if (experiment.error || !experiment.data) return <div className="v2-page"><V2Error error={experiment.error ?? new Error("Experiment not found")} /></div>;
-  const record = experiment.data;
+  const profileById = new Map(
+    (profiles.data ?? []).map((profile) => [profile.id, profile]),
+  );
+  const record = {
+    ...experiment.data,
+    lanes: experiment.data.lanes.map((lane) => {
+      const currentProfile = lane.intervention.profile_id
+        ? profileById.get(lane.intervention.profile_id)
+        : null;
+      if (!currentProfile) return lane;
+      return {
+        ...lane,
+        label: lane.role === "candidate" ? currentProfile.name : lane.label,
+        intervention: {
+          ...lane.intervention,
+          name: currentProfile.name,
+        },
+      };
+    }),
+  };
   const selected = record.units.find((unit) => unit.id === selectedUnitId) ?? record.units[0] ?? null;
   const progress = liveProgress(record, events);
   const latestEvent = events.at(-1);
@@ -531,7 +823,7 @@ export function ExperimentDetailPage({ experimentId }: { experimentId: string })
         <div className="v2-live-phase"><span className={activeStatuses.has(record.status) ? "v2-live-dot" : ""} /><strong>{humanize(progress.phase || record.status)}</strong><small>{latestEvent?.message ?? (record.error || "Durable experiment state is synchronized.")}</small></div>
         <div className="v2-live-progress"><span>{progress.completed}/{progress.total || "—"} lane units</span><progress max={Math.max(progress.total, 1)} value={progress.completed} /><small>{formatOutcomeCounts(progress.passed, progress.failed, progress.unscored)}</small></div>
         <V2Metric label="Elapsed" value={formatDuration(progress.elapsedMs)} detail={progress.etaMs == null ? "ETA measuring" : `${formatDuration(progress.etaMs)} remaining`} />
-        <V2Metric label="Tokens" value={formatCompact(progress.promptTokens + progress.completionTokens)} detail={`${formatRate(progress.currentTps)} current`} />
+        <V2Metric label="Tokens" value={formatCompact(progress.promptTokens + progress.completionTokens)} detail={progress.currentTps == null ? `${formatRate(progress.meanTps)} completed mean` : `${formatRate(progress.currentTps)} current`} />
       </section>
 
       <div className="v2-mobile-command-tabs" role="tablist" aria-label="Experiment panels">
@@ -644,6 +936,7 @@ function DriftStage({ experiment, unit }: { experiment: ExperimentRecord; unit: 
   return (
     <div className="v2-drift-stage">
       <DriftMetricsStrip experiment={experiment} />
+      <DriftResearchMetrics experiment={experiment} />
       <section className="v2-drift-timeline">
         <header><span className="v2-section-label">Checkpoint fidelity</span><small>Exact state is authoritative</small></header>
         <div className="v2-fidelity-chart" aria-label="State fidelity by checkpoint">
@@ -671,8 +964,36 @@ function DriftMetricsStrip({ experiment }: { experiment: ExperimentRecord }) {
   return <div className="v2-drift-metrics"><V2Metric label="Baseline AUC" value={formatPercent(baseline?.area_under_fidelity_curve)} /><V2Metric label="Candidate AUC" value={formatPercent(candidate?.area_under_fidelity_curve)} /><V2Metric label="First divergence" value={candidate?.first_divergence_checkpoint == null ? "—" : `Step ${candidate.first_divergence_checkpoint}`} /><V2Metric label="Excess mask drift" value={formatSigned(candidate?.excess_mask_drift)} tone={(candidate?.excess_mask_drift ?? 0) > 0 ? "negative" : "neutral"} /></div>;
 }
 
+function DriftResearchMetrics({ experiment }: { experiment: ExperimentRecord }) {
+  const baseline = experiment.drift_metrics.baseline;
+  const candidate = experiment.drift_metrics.candidate;
+  const parameters = experiment.drift_parameters;
+  return (
+    <section className="v2-drift-research">
+      <header><span className="v2-section-label">Drift decomposition</span><small>Exact-state metrics · descriptive</small></header>
+      <div className="v2-drift-research-grid">
+        <V2Metric label="Final success" value={formatPercent(candidate?.final_success)} detail={`baseline ${formatPercent(baseline?.final_success)}`} />
+        <V2Metric label="Transition accuracy" value={formatPercent(candidate?.transition_accuracy)} detail={`baseline ${formatPercent(baseline?.transition_accuracy)}`} />
+        <V2Metric label="Local competence" value={formatPercent(candidate?.local_competence)} detail={`Δ ${formatSigned(candidate?.local_capability_delta)}`} />
+        <V2Metric label="Chained fidelity" value={formatPercent(candidate?.chained_fidelity)} />
+        <V2Metric label="Compounding penalty" value={formatSigned(candidate?.compounding_penalty)} />
+        <V2Metric label="Paired drift Δ" value={formatSigned(candidate?.paired_drift_delta)} />
+        <V2Metric label="Recovery rate" value={formatPercent(candidate?.recovery_rate)} detail={`baseline ${formatPercent(baseline?.recovery_rate)}`} />
+        <V2Metric label="Rollback exact" value={formatPercent(candidate?.rollback_correctness)} />
+        <V2Metric label="Growth slope" value={formatDecimal(candidate?.divergence_growth_slope)} />
+        <V2Metric label="Reliable horizon" value={candidate?.horizon_at_80 == null ? "—" : String(candidate.horizon_at_80)} detail={`50%: ${candidate?.horizon_at_50 ?? "—"}`} />
+        <V2Metric label="Invariant violations" value={formatOptionalCompact(candidate?.invariant_violations)} />
+        <V2Metric label="Invalid calls" value={formatOptionalCompact(candidate?.invalid_tool_calls)} />
+        <V2Metric label="Collateral mutations" value={formatOptionalCompact(candidate?.collateral_mutations)} />
+        <V2Metric label="Survival at horizon" value={formatPercent(candidate?.survival_curve.at(-1))} />
+      </div>
+      {parameters && <footer>{Object.entries(parameters).map(([key, value]) => <span key={key}>{humanize(key)} <strong>{typeof value === "number" && value < 1 ? `${Math.round(value * 100)}%` : value}</strong></span>)}</footer>}
+    </section>
+  );
+}
+
 function CheckpointCard({ label, checkpoint }: { label: string; checkpoint: DriftCheckpoint | null }) {
-  return <article><header><span><strong>{label}</strong><small>{checkpoint?.label ?? "Checkpoint pending"}</small></span>{checkpoint && <V2Status value={checkpoint.status} />}</header><dl><div><dt>Fidelity</dt><dd>{formatPercent(checkpoint?.state_fidelity)}</dd></div><div><dt>Distance</dt><dd>{checkpoint?.state_distance ?? "—"}</dd></div><div><dt>Invalid tools</dt><dd>{checkpoint?.invalid_tool_calls ?? "—"}</dd></div><div><dt>Routing delta</dt><dd>{formatSigned(checkpoint?.routing_delta)}</dd></div></dl>{checkpoint?.invariant_violations.length ? <div className="v2-invariant-list"><span>Invariant violations</span>{checkpoint.invariant_violations.map((item) => <p key={item}>{item}</p>)}</div> : <small>No invariant violation recorded.</small>}</article>;
+  return <article><header><span><strong>{label}</strong><small>{checkpoint?.label ?? "Checkpoint pending"}</small></span>{checkpoint && <V2Status value={checkpoint.status} />}</header><dl><div><dt>Fidelity</dt><dd>{formatPercent(checkpoint?.state_fidelity)}</dd></div><div><dt>Distance</dt><dd>{checkpoint?.state_distance ?? "—"}</dd></div><div><dt>Invalid tools</dt><dd>{checkpoint?.invalid_tool_calls ?? "—"}</dd></div><div><dt>Tool error</dt><dd>{checkpoint?.tool_error_injected ? "Injected · retry expected" : "None"}</dd></div><div><dt>Routing delta</dt><dd>{formatSigned(checkpoint?.routing_delta)}</dd></div></dl>{checkpoint?.invariant_violations.length ? <div className="v2-invariant-list"><span>Invariant violations</span>{checkpoint.invariant_violations.map((item) => <p key={item}>{item}</p>)}</div> : <small>No invariant violation recorded.</small>}</article>;
 }
 
 function StateDiff({ checkpoint }: { checkpoint: DriftCheckpoint | null }) {
@@ -683,10 +1004,43 @@ function StateDiff({ checkpoint }: { checkpoint: DriftCheckpoint | null }) {
 
 function ExperimentInspector({ experiment, unit, events, tab }: { experiment: ExperimentRecord; unit: ExperimentUnit | null; events: RunEvent[]; tab: "performance" | "evaluation" | "experts" | "contract" | "events" }) {
   if (tab === "events") return <EventInspector events={events} />;
-  if (tab === "contract") return <div className="v2-inspector-body"><span className="v2-section-label">Immutable contract</span><h3>Execution and evaluation</h3><pre className="v2-json-panel">{JSON.stringify({ evaluation: experiment.evaluation_contract, policy: experiment.execution_policy, generation: experiment.generation, executor: experiment.execution_config }, null, 2)}</pre></div>;
+  if (tab === "contract") return <ContractInspector experiment={experiment} />;
   if (tab === "experts") return <ExpertInspector experiment={experiment} unit={unit} />;
   if (tab === "evaluation") return <div className="v2-inspector-body"><span className="v2-section-label">Evaluation</span><h3>Observable outcomes</h3>{experiment.lanes.map((lane) => { const result = lane.role === "baseline" ? unit?.baseline : unit?.candidate; return <article className="v2-evaluation-summary" key={lane.id}><header><strong>{lane.label}</strong><ResultBadge result={result ?? null} /></header><p>{result?.status === "unscored" ? "Completed without a scored verdict" : result?.criteria.length ? `${result.criteria.filter((item) => item.passed).length}/${result.criteria.length} criteria passed` : "Evaluation pending"}</p></article>; })}</div>;
   return <div className="v2-inspector-body"><span className="v2-section-label">Performance</span><h3>Lane budgets and speed</h3>{experiment.lanes.map((lane) => <LanePerformanceCard key={lane.id} lane={lane} />)}</div>;
+}
+
+function ContractInspector({ experiment }: { experiment: ExperimentRecord }) {
+  if (experiment.contract_provenance === "legacy_unknown") {
+    return (
+      <div className="v2-inspector-body v2-legacy-contract">
+        <span className="v2-section-label">Legacy contract provenance</span>
+        <h3>Evaluation and execution contract unknown</h3>
+        <p>
+          This archived run predates immutable contract persistence. Missing
+          values are unknown; they are not V2 defaults and must not be treated
+          as reproducible evidence.
+        </p>
+        <details>
+          <summary>Observed legacy executor metadata</summary>
+          <pre className="v2-json-panel">{JSON.stringify(experiment.execution_config, null, 2)}</pre>
+        </details>
+      </div>
+    );
+  }
+  return (
+    <div className="v2-inspector-body">
+      <span className="v2-section-label">Immutable contract</span>
+      <h3>Execution and evaluation</h3>
+      <pre className="v2-json-panel">{JSON.stringify({
+        evaluation: experiment.evaluation_contract,
+        policy: experiment.execution_policy,
+        generation: experiment.generation,
+        drift_parameters: experiment.drift_parameters,
+        executor: experiment.execution_config,
+      }, null, 2)}</pre>
+    </div>
+  );
 }
 
 function ExpertInspector({
@@ -696,19 +1050,36 @@ function ExpertInspector({
   experiment: ExperimentRecord;
   unit: ExperimentUnit | null;
 }) {
+  const profiles = useQuery({ queryKey: ["profiles"], queryFn: listProfiles });
   const routing = unit ? driftRoutingSummaries(unit) : [];
   const highlighted = routing[0] ?? null;
   return (
     <div className="v2-inspector-body">
       <span className="v2-section-label">Routing context</span>
       <h3>Active expert provenance</h3>
-      {experiment.lanes.map((lane) => (
-        <article className="v2-context-inspector" key={lane.id}>
-          <header><strong>{lane.label}</strong><V2Status value={lane.intervention.active ? "ready" : lane.status} /></header>
-          <p>{lane.intervention.name}</p>
-          <dl><div><dt>Profile</dt><dd>{lane.intervention.profile_fingerprint?.slice(0, 12) ?? "Baseline"}</dd></div><div><dt>Context</dt><dd>{lane.intervention.context_fingerprint?.slice(0, 12) ?? "Pending"}</dd></div></dl>
-        </article>
-      ))}
+      {experiment.lanes.map((lane) => {
+        const profile = lane.intervention.profile_id
+          ? profiles.data?.find((item) => item.id === lane.intervention.profile_id)
+          : null;
+        return (
+          <article className="v2-context-inspector" key={lane.id}>
+            <header><strong>{lane.label}</strong><V2Status value={lane.intervention.active ? "ready" : lane.status} /></header>
+            <div className="v2-run-profile-name">
+              {profile
+                ? <InlineProfileName profile={profile} />
+                : <strong>{lane.intervention.name}</strong>}
+              <small>
+                {profile
+                  ? "Editable display name · fingerprint remains immutable"
+                  : lane.role === "baseline"
+                    ? "Built-in baseline context"
+                    : "Archived profile name · current profile record unavailable"}
+              </small>
+            </div>
+            <dl><div><dt>Profile fingerprint</dt><dd>{lane.intervention.profile_fingerprint?.slice(0, 12) ?? "Baseline"}</dd></div><div><dt>Context</dt><dd>{lane.intervention.context_fingerprint?.slice(0, 12) ?? "Pending"}</dd></div></dl>
+          </article>
+        );
+      })}
       {highlighted && (
         <section className="v2-routing-comparison">
           <header>
@@ -718,6 +1089,8 @@ function ExpertInspector({
           <div className="v2-routing-metrics">
             <V2Metric label="Selection overlap" value={formatPercent(highlighted.selectionOverlap)} />
             <V2Metric label="Routing mass JSD" value={formatDecimal(highlighted.routingMassJsDivergence)} />
+            <V2Metric label="Selection slots" value={formatOptionalCompact(highlighted.candidateSelectionCount)} detail={`baseline ${formatOptionalCompact(highlighted.baselineSelectionCount)} · Δ ${formatSigned(highlighted.selectionCountDelta)}`} />
+            <V2Metric label="Routing mass" value={formatDecimal(highlighted.candidateRoutingMass)} detail={`baseline ${formatDecimal(highlighted.baselineRoutingMass)} · Δ ${formatSigned(highlighted.routingMassDelta)}`} />
           </div>
           <div className="v2-routing-shifts">
             <span className="v2-section-label">Largest selection-share shifts</span>
@@ -820,6 +1193,10 @@ function formatDuration(value: number | null | undefined) {
 
 function formatCompact(value: number) {
   return new Intl.NumberFormat(undefined, { notation: value >= 10_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
+}
+
+function formatOptionalCompact(value: number | null | undefined) {
+  return value == null ? "—" : formatCompact(value);
 }
 
 function formatOutcomeCounts(

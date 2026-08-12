@@ -28,6 +28,26 @@ live Runpod coordinates are added only after the corresponding commits complete
 the release gates. Nothing in a manifest or mock run is represented as live model
 qualification.
 
+V2 is currently **local-only**. It has not been pushed as a release branch, built
+as an attested V2 image, installed as a V2 Runpod template, or exercised against a
+real GPU or Daytona sandbox. No V2 resource-cleanup claim is made because no
+V2-owned external resource was created. The remaining release gates are:
+
+- publish the exact application and fork commits and record the resulting OCI
+  digest and provenance attestation;
+- run the authenticated V2 acceptance driver on a real warm Qwen engine and
+  capture switch P50/P95, stable PID and memory, no weight reread, rollback,
+  routing, cold/hot equivalence, tensor-parallel/cache, eager, and CUDA evidence;
+- run model-authored coding in a real Daytona sandbox and verify provider-wide
+  cleanup;
+- qualify or precisely block one additional MoE model; and
+- record final Runpod/Daytona inventories, spend, and teardown state.
+
+Local mock evidence and screenshots are indexed in
+[`docs/evidence/v2-local/README.md`](docs/evidence/v2-local/README.md). The V2 live
+driver writes its own machine-readable result; no hand-authored JSON is treated as
+acceptance evidence.
+
 `0.3.0-rc.1` remains the last published and bounded live-accepted V1 release. Its
 exact application/fork commits, attested `linux/amd64` image, and Runpod/Daytona/
 Anthropic evidence are retained below as historical provenance. V2 does not
@@ -85,6 +105,42 @@ schema. Event sequences are monotonic per experiment; terminal records survive a
 refresh, and interrupted active records are reconciled honestly after restart.
 Legacy records retain unknown provenance where it was never captured.
 
+### Model-load lifecycle semantics
+
+Model loading is a durable job with an ordered phase history. Application-owned
+phases such as queueing, model resolution, runtime configuration, process launch,
+readiness polling, context verification, and ready state are observed directly.
+The managed runtime may additionally emit authenticated loopback signals for cache
+checks, download byte/file progress, weight loading, distributed-worker startup,
+compilation, graph capture, and warming. If it does not emit a complete structured
+signal, the phase is persisted as **unavailable** with no fabricated timing or
+counter. Old rows use `legacy_unknown` rather than acquiring invented provenance.
+
+Cancellation keeps cleanup visible. Failures preserve a redacted diagnostic tail,
+a stable failure code, and a recovery action. Retry first verifies that the model
+revision, topology, and runtime recipe still match the immutable load plan, rejects
+manifest drift, and remains disabled when cleanup safety is uncertain.
+
+### Cohorts, evaluation, and budgets
+
+Answer and coding workload descriptors publish stable unit IDs. V2 creates real
+cohorts by persisting the ordered selected IDs and expanding each ID across seeds
+and baseline/candidate lanes. The UI defaults large workloads to a bounded subset,
+supports search and explicit selection, and caps one submission at 10,000 units;
+it never silently submits all 12,032 MMLU-Pro test items. Drift expands selected
+scenarios across conditions, horizons, seeds, and lanes.
+
+The cohort fingerprint binds workload content, exact ordered unit/scenario
+selection, seeds, generation settings, evaluation-contract fingerprint,
+execution-policy fingerprint, and Drift parameter fingerprint. V2 currently keeps
+paired work serialized with one attempt so context switches remain aligned.
+Evaluation may use the workload-owned deterministic contract or explicit
+record-only mode. Time, per-item time, token, turn, command, and optional paid-judge
+cost caps terminate work without fabricating a pass; exhausted units are retained
+as unscored. A V2 judge contract requires an explicit priced `max_cost_usd` policy.
+Archived experiments whose contracts were never captured remain visibly unknown
+and cannot be resumed under invented defaults.
+
 ### State Drift Bench
 
 The first-party state-drift adapter uses typed deterministic state, reducers,
@@ -96,6 +152,17 @@ collateral failures, rollback correctness, divergence slope, and reliability
 horizons. Formula configuration is fingerprinted; no LLM judge replaces exact
 state validation.
 
+Each Drift experiment also persists a fingerprinted parameter set: dependency
+span, branch count, rollback depth, distractor ratio, deterministic tool-error
+rate, and state size. The command center renders final success, transition
+accuracy, survival and fidelity over time, recovery, violations, invalid calls,
+collateral mutations, rollback correctness, growth slope, 80%/50% reliability
+horizons, local competence, chained fidelity, paired drift, local-capability delta,
+compounding penalties, and checkpoint-aligned routing overlap/divergence. When
+routing exists, absolute baseline/candidate selection slots and routing mass remain
+visible alongside normalized deltas; the mock runtime correctly leaves them
+unknown.
+
 The design is informed by stateful-evaluation ideas from
 [LongDS-Bench](https://arxiv.org/abs/2605.30434),
 [τ²-bench](https://github.com/sierra-research/tau2-bench),
@@ -105,29 +172,22 @@ are not described as official scores from those projects.
 
 ## What is in the application
 
-The warm, editorial interface is organized as full-screen research command centers
-that also collapse cleanly onto a phone:
+The warm, editorial V2 interface is organized as full-screen research command
+centers that also collapse cleanly onto a phone:
 
-- **Home** owns model load/reload state, topology, runtime facts, startup logs, a
-  compact chat, and the active durable job.
-- **Bench** browses datasets, opens individual problems and their public success
-  criteria, creates immutable cohorts, edits evaluation and execution contracts,
-  follows progress, and opens complete run records.
-- **Agents** selects a pinned coding pack and task attempts, configures the native
-  controller and remote sandbox, follows every trial, and opens its full
-  trajectory, verifier, artifact, routing, and performance record.
-- **Profiles** combines regular benchmark runs and agentic trials, assigns explicit
-  source weights, explores routing, edits expert eligibility, and saves immutable
-  profile revisions.
-- **Compare** contains strict paired views for both regular benchmarks and agentic
-  runs, including scores/rewards, outcome transitions, routing, budgets, and
-  performance. Benchmark comparisons are persisted. Agent comparisons are
-  deterministic views recomputed from their two durable runs; they are not stored
-  as independent archive records.
-- **Archive** persists benchmark runs, agent runs, profiles, and benchmark
-  comparisons.
-  Benchmark summaries and item histories are paginated; JSON/CSV exports stream so
-  large cohorts do not need a second full in-memory response.
+- **Experiments** creates and reopens answer, coding, and Drift lanes through one
+  command center, with durable progress, evaluation, performance, routing, and
+  event replay.
+- **Workload Library** exposes cohort/task readiness, stable unit IDs, provenance,
+  public problem statements, and blockers.
+- **Profiles** names and renames immutable masks, preserves lineage and fingerprint
+  identity, and links to the existing Profile Studio for expert selection.
+- **Models** owns the expensive weight lifecycle, structured phase history,
+  diagnostics, cancellation/retry, topology, and current intervention context.
+- **Settings** explains runtime security and readiness without presenting disabled
+  integrations as available.
+- **Legacy workflows** preserve the V1 Bench, Agents, Compare, and Archive routes
+  and their historical records; they are not rewritten as V2 experiments.
 
 Browser polling survives transient Runpod proxy failures, reconnects, and hard
 reloads. Model loads, dataset preparation, benchmark runs, and agent runs are
@@ -138,8 +198,9 @@ mutex until the worker has acknowledged termination. Startup reconciliation repa
 interrupted records and retries owned process or sandbox cleanup.
 
 There is no public “stop model” action in this candidate. The managed process is
-stopped internally when a model/profile reload replaces it or when the application
-shuts down; stopping paid idle compute remains a Runpod Pod operation.
+stopped internally when a different model load replaces it or when the application
+shuts down. A V2 baseline/profile activation does not stop or restart the process;
+stopping paid idle compute remains a Runpod Pod operation.
 
 ## Benchmark catalog
 
@@ -326,8 +387,12 @@ are not complete. A pinned manifest is provenance, not permission to claim a sco
 
 ### Daytona provider
 
-The fake provider is deterministic and never invokes a host subprocess. Real coding
-trials use private ephemeral Daytona sandboxes through the exact
+The fake provider is deterministic and never invokes a host subprocess. It
+substitutes pinned oracle actions after model calls so the controller, persistence,
+trajectory, verifier, and UI contracts can be tested locally. A fake-provider pass
+is **diagnostic-only** and is not evidence of model-authored coding behavior or a
+release-qualifying coding result. Real coding trials use private ephemeral Daytona
+sandboxes through the exact
 [`daytona==0.192.0`](https://pypi.org/project/daytona/0.192.0/) SDK pin. Provider
 listing is side-effect free; the explicit preflight is a bounded read-only list
 request and creates no sandbox.
@@ -439,9 +504,10 @@ docker buildx build \
   .
 ```
 
-`.github/workflows/publish-container.yml` publishes version and application-commit
-tags to `ghcr.io/sampazdan/vllm-moe-tools-suite`, creates a provenance attestation,
-and requires the exact fork SHA as a manual input. RC1 was published from:
+`.github/workflows/publish-container.yml` can publish version and
+application-commit tags to `ghcr.io/sampazdan/vllm-moe-tools-suite`, create a
+provenance attestation, and require the exact fork SHA as a manual input. The
+following coordinates belong only to the published V1 RC1:
 
 - application `0c8c8ffcbcd72f1cf9b664a1d4cf7813f701c345`;
 - vLLM fork `28a44cf4291c05af070c7d8398c462459b9992d1`;
@@ -458,7 +524,9 @@ which resolved to the verified child image above. Keep the full SHA plus resolve
 digest in experiment records; the full-SHA tag was the proven Runpod launch
 coordinate for this build.
 
-V2 publishes independently as `0.4.0-rc.1`. Its workflow requires both the
+V2 will publish independently as `0.4.0-rc.1` after its external gates are
+authorized and run. No V2 OCI digest or attestation exists in this local handoff.
+Its workflow requires both the
 application commit (from the checked-out GitHub SHA) and a manually supplied
 full fork commit, pins every third-party action by commit, records both OCI
 labels, and has no tag-triggered V1 fallback. Use
@@ -497,12 +565,38 @@ it accepts only a complete lowercase `sha256` digest. The script also rejects
 `latest`, malformed digests, and invalid modes. The generated
 template configures port 8080, a 50 GB container disk, and `/workspace` for
 application state and the model cache. Runpod templates do not select a GPU: choose
-a compatible 96 GB RTX PRO 6000 Blackwell offering when the Pod is deployed. RC1
-acceptance used the **Workstation Edition**, not the Server Edition. Attach a
+a compatible 96 GB RTX PRO 6000 Blackwell offering when the Pod is deployed.
+Historical V1 RC1 acceptance used the **Workstation Edition**, not the Server
+Edition. Attach a
 network volume at `/workspace` if records and weights must outlive the Pod. A
 volume is tied to one Runpod data center and continues billing after the Pod stops.
 
-### RC1 live-acceptance driver
+### V2 live-acceptance driver — not yet executed on a GPU
+
+The V2 driver loads one model, creates and repeatedly activates three named
+profiles, rejects an invalid activation, verifies rename identity, follows and
+reconnects to a true multi-item answer cohort, and runs paired coding and Drift
+experiments. It writes a machine-readable record and keeps provider-wide inventory,
+failure injection, memory/equivalence, additional-model, browser, spend, and
+teardown gates explicitly false until separate evidence is supplied.
+
+The default fake coding provider is intentionally diagnostic-only and makes the
+driver exit nonzero. `--allow-missing-routing` is also diagnostic-only. A
+release-qualifying invocation requires real routing plus an explicitly authorized
+Daytona run:
+
+```bash
+MOE_TOOLS_CANARY_BASE_URL=https://POD_ID-8080.proxy.runpod.net \
+MOE_TOOLS_CANARY_TOKEN="..." \
+uv run python scripts/v2_live_acceptance.py \
+  --coding-provider daytona \
+  --output artifacts/v2-live-acceptance.json
+```
+
+The output is evidence for the in-appliance checks only. It does not by itself
+prove the external gates or authorize paid infrastructure.
+
+### Historical V1 RC1 live-acceptance driver
 
 The public API canary covers the bounded baseline-to-mask path. Daytona and
 Anthropic are opt-in because they create paid work:
@@ -513,7 +607,7 @@ MOE_TOOLS_CANARY_TOKEN="..." \
 uv run python scripts/acceptance_canary.py --daytona --anthropic-judge
 ```
 
-### RC1 acceptance record — observed 2026-08-11
+### Historical V1 RC1 acceptance record — observed 2026-08-11
 
 The immutable application/fork/image coordinates are recorded in
 [Reproducible image](#reproducible-image). Template `w2wkhbveg2`

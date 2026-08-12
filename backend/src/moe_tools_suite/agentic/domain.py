@@ -894,6 +894,8 @@ class TrajectoryStepView(AgenticModel):
     content: str
     tool_name: str | None = None
     command: str | None = None
+    tool_call_id: str | None = None
+    source_call_id: str | None = None
     exit_code: int | None = None
     duration_ms: Annotated[float, Field(ge=0)] | None = None
     truncated: bool = False

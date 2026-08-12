@@ -224,6 +224,7 @@ class JobRow(Base):
     progress_total: Mapped[int] = mapped_column(Integer, nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     result_id: Mapped[str | None] = mapped_column(String)
+    retry_of_job_id: Mapped[str | None] = mapped_column(String)
     error: Mapped[str | None] = mapped_column(Text)
     phase_history_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
@@ -478,7 +479,10 @@ class SqliteStore:
                 "topology_json": "TEXT",
                 "runtime_recipe_json": "TEXT",
             },
-            "jobs": {"phase_history_json": "TEXT"},
+            "jobs": {
+                "phase_history_json": "TEXT",
+                "retry_of_job_id": "VARCHAR",
+            },
             "experiments": {"latest_event_sequence": "INTEGER NOT NULL DEFAULT 0"},
         }
         with self.engine.begin() as connection:
@@ -618,6 +622,7 @@ class SqliteStore:
                     progress_total=job.progress_total,
                     payload_json=json.dumps(payload, separators=(",", ":")),
                     result_id=job.result_id,
+                    retry_of_job_id=job.retry_of_job_id,
                     error=job.error,
                     phase_history_json=json.dumps(
                         [phase.model_dump(mode="json") for phase in job.phase_history],
@@ -677,9 +682,16 @@ class SqliteStore:
                         JobPhaseRecord(
                             phase=ModelLoadPhase.FAILED,
                             status="failed",
+                            source="application",
                             started_at=now,
                             completed_at=now,
                             detail=row.error,
+                            failure_code="application_restarted",
+                            recovery_action=(
+                                "Confirm no model load is active, then retry the "
+                                "same pinned model."
+                            ),
+                            diagnostics=row.error,
                         )
                     )
                     row.phase_history_json = json.dumps(
@@ -850,6 +862,7 @@ class SqliteStore:
                     progress_total=job.progress_total,
                     payload_json=json.dumps(payload, separators=(",", ":")),
                     result_id=job.result_id,
+                    retry_of_job_id=job.retry_of_job_id,
                     error=job.error,
                     phase_history_json=json.dumps(
                         [phase.model_dump(mode="json") for phase in job.phase_history],
@@ -889,6 +902,7 @@ class SqliteStore:
                     progress_current=row.progress_current,
                     progress_total=row.progress_total,
                     result_id=row.result_id,
+                    retry_of_job_id=row.retry_of_job_id,
                     error=row.error,
                     phase_history=(
                         [

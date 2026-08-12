@@ -6,7 +6,9 @@ import type {
   EvaluationContract,
   ExecutionPolicy,
   GenerationConfig,
+  JobRecord,
   ModelRegistryEntry,
+  ModelSession,
   SandboxProvider,
   SavedExpertProfile,
 } from "../types";
@@ -14,6 +16,7 @@ import type {
   ContextActivationResult,
   DriftCheckpoint,
   DriftMetrics,
+  DriftParameters,
   ExperimentCreateRequest,
   ExperimentEventPage,
   ExperimentLane,
@@ -78,6 +81,10 @@ export function buildExperimentCreateRequest({
   agentId,
   candidateProfileId,
   conditions,
+  driftParameters,
+  evaluationContract,
+  executionPolicy,
+  generation,
   horizon,
   kind,
   modelId,
@@ -90,6 +97,10 @@ export function buildExperimentCreateRequest({
   agentId: string;
   candidateProfileId: string | null;
   conditions: string[];
+  driftParameters?: DriftParameters;
+  evaluationContract: EvaluationContract;
+  executionPolicy: ExecutionPolicy;
+  generation: GenerationConfig;
   horizon: number;
   kind: WorkloadKind;
   modelId: string;
@@ -105,12 +116,16 @@ export function buildExperimentCreateRequest({
     workload_id: workloadId,
     candidate_profile_id: candidateProfileId,
     seeds: [seed],
+    generation,
+    evaluation_contract: evaluationContract,
+    execution_policy: executionPolicy,
   };
   if (kind === "coding") {
     return {
       ...request,
       agent_id: agentId,
       sandbox_provider_id: sandboxProviderId,
+      workload_unit_ids: workloadUnitIds,
     };
   }
   if (kind === "state_drift") {
@@ -119,9 +134,20 @@ export function buildExperimentCreateRequest({
       scenario_ids: workloadUnitIds,
       conditions,
       horizons: [horizon],
+      drift_parameters: driftParameters ?? {
+        dependency_span: 1,
+        branch_count: 1,
+        rollback_depth: 0,
+        distractor_ratio: 0,
+        tool_error_rate: 0,
+        state_size: 3,
+      },
     };
   }
-  return request;
+  return {
+    ...request,
+    workload_unit_ids: workloadUnitIds,
+  };
 }
 
 export async function cancelExperiment(id: string) {
@@ -223,9 +249,30 @@ export async function getActiveExpertContext() {
 }
 
 export function loadModel(modelId: string) {
-  return api<import("../types").JobRecord>("/api/model-sessions", {
+  return api<JobRecord>("/api/model-sessions", {
     method: "POST",
     body: JSON.stringify({ model_id: modelId }),
+  });
+}
+
+export async function listModelLoadJobs(): Promise<JobRecord[]> {
+  const jobs = await api<JobRecord[]>("/api/jobs");
+  return jobs.filter((job) => job.kind === "model_load");
+}
+
+export function listModelSessions(): Promise<ModelSession[]> {
+  return api<ModelSession[]>("/api/model-sessions");
+}
+
+export function cancelJob(jobId: string): Promise<JobRecord> {
+  return api<JobRecord>(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+  });
+}
+
+export function retryModelLoad(jobId: string): Promise<JobRecord> {
+  return api<JobRecord>(`/api/jobs/${encodeURIComponent(jobId)}/retry`, {
+    method: "POST",
   });
 }
 
@@ -271,6 +318,9 @@ export function normalizeExperiment(value: unknown): ExperimentRecord {
     )];
   })) as Partial<Record<LaneRole, DriftMetrics | null>>;
   const modelId = stringValue(record.model_id ?? model?.id, "unknown-model");
+  const contractProvenance = record.contract_provenance === "known"
+    ? "known"
+    : "legacy_unknown";
   return {
     id: stringValue(record.id, "unknown-experiment"),
     name: stringValue(record.name, `${humanize(kind)} experiment`),
@@ -302,9 +352,17 @@ export function normalizeExperiment(value: unknown): ExperimentRecord {
     unscored,
     lanes,
     units: normalizeExperimentUnits(rawUnits, lanes, kind, workload, comparison),
-    evaluation_contract: nullableTyped<EvaluationContract>(record.evaluation_contract),
-    execution_policy: nullableTyped<ExecutionPolicy>(record.execution_policy),
-    generation: nullableTyped<GenerationConfig>(record.generation),
+    contract_provenance: contractProvenance,
+    evaluation_contract: contractProvenance === "known"
+      ? nullableTyped<EvaluationContract>(record.evaluation_contract)
+      : null,
+    execution_policy: contractProvenance === "known"
+      ? nullableTyped<ExecutionPolicy>(record.execution_policy)
+      : null,
+    generation: contractProvenance === "known"
+      ? nullableTyped<GenerationConfig>(record.generation)
+      : null,
+    drift_parameters: nullableTyped<DriftParameters>(record.drift_parameters),
     drift_metrics: {
       baseline: laneMetrics.baseline ?? normalizeDriftMetrics(
         asRecord(record.drift_metrics)?.baseline ?? record.baseline_drift_metrics,
@@ -471,7 +529,16 @@ function normalizeLane(
     score: nullableNumber(
       record.score ?? record.mean_reward ?? aggregate?.mean_state_fidelity_auc,
     ),
-    performance: aggregateLanePerformance(unitValues),
+    performance: aggregateLanePerformance(
+      unitValues,
+      nullableString(run.started_at ?? record.started_at),
+      nullableString(run.completed_at ?? record.completed_at),
+      numberValue(
+        run.total_units ?? record.progress_total ?? record.total_units,
+        unitValues.length,
+      ),
+      completed,
+    ),
   };
 }
 
@@ -535,7 +602,7 @@ function normalizeExperimentUnits(
       },
       index: grouped.size + 1,
       title: stringValue(
-        record.scenario_id ?? workload?.name ?? workload?.title,
+        record.workload_unit_id ?? record.scenario_id ?? workload?.name ?? workload?.title,
         humanize(alignment.split(":")[0] ?? alignment),
       ),
       subtitle: [
@@ -554,6 +621,7 @@ function normalizeExperimentUnits(
 
 function unitAlignment(record: Record<string, unknown>) {
   return [
+    record.workload_unit_id,
     record.scenario_id,
     record.condition,
     record.horizon == null ? null : `h${String(record.horizon)}`,
@@ -682,6 +750,7 @@ function normalizeCheckpoint(
       record.invalid_tool_calls,
       record.valid_tool_call === false ? 1 : 0,
     ),
+    tool_error_injected: record.tool_error_injected === true,
     routing_delta: nullableNumber(record.routing_delta),
     routing_evidence: routingRecords.find(
       (candidate) => nullableNumber(candidate.checkpoint) === checkpoint,
@@ -732,18 +801,51 @@ function normalizeDriftMetrics(
         ? comparison?.baseline_median_first_divergence
         : comparison?.candidate_median_first_divergence),
     ),
-    recovery_rate: nullableNumber(record.recovery_rate),
+    recovery_rate: nullableNumber(record.recovery_rate ?? record.mean_recovery_rate),
+    survival_curve: numberArray(record.survival_curve ?? record.mean_survival_curve),
+    state_fidelity_curve: numberArray(
+      record.state_fidelity ?? record.mean_state_fidelity_curve,
+    ),
+    invariant_violations: nullableNumber(
+      record.invariant_violations ?? record.mean_invariant_violations,
+    ),
+    invalid_tool_calls: nullableNumber(
+      record.invalid_tool_calls ?? record.mean_invalid_tool_calls,
+    ),
+    collateral_mutations: nullableNumber(
+      record.collateral_mutations ?? record.mean_collateral_mutations,
+    ),
+    rollback_correctness: nullableNumber(
+      record.rollback_correctness ?? record.mean_rollback_correctness,
+    ),
+    divergence_growth_slope: nullableNumber(
+      record.divergence_growth_slope ?? record.mean_divergence_growth_slope,
+    ),
     horizon_at_80: nullableNumber(
       record.horizon_at_80 ?? record.horizon_at_80_percent_reliability,
     ),
     horizon_at_50: nullableNumber(
       record.horizon_at_50 ?? record.horizon_at_50_percent_reliability,
     ),
+    local_competence: nullableNumber(
+      role === "baseline"
+        ? comparison?.baseline_local_competence
+        : comparison?.candidate_local_competence,
+    ),
+    chained_fidelity: nullableNumber(
+      role === "baseline"
+        ? comparison?.baseline_chained_fidelity
+        : comparison?.candidate_chained_fidelity,
+    ),
+    local_capability_delta: nullableNumber(comparison?.local_capability_delta),
     compounding_penalty: nullableNumber(
       record.compounding_penalty ??
       (role === "baseline"
         ? comparison?.baseline_compounding_penalty
         : comparison?.candidate_compounding_penalty),
+    ),
+    paired_drift_delta: nullableNumber(
+      comparison?.baseline_to_mask_paired_drift_delta,
     ),
     excess_mask_drift: nullableNumber(
       record.excess_mask_drift ?? comparison?.excess_compounding_penalty ??
@@ -776,24 +878,43 @@ export function normalizeEvent(
   };
 }
 
-function aggregateLanePerformance(values: unknown[]): LanePerformance {
+function aggregateLanePerformance(
+  values: unknown[],
+  startedAt: string | null = null,
+  completedAt: string | null = null,
+  totalUnits: number = values.length,
+  completedUnits: number = values.length,
+): LanePerformance {
   const snapshots = values
     .map((value) => asRecord(asRecord(value)?.performance))
     .filter((value): value is Record<string, unknown> => value !== null);
-  if (!snapshots.length) return { ...emptyPerformance };
   const prompt = snapshots.reduce((total, item) => total + numberValue(item.prompt_tokens, 0), 0);
   const completion = snapshots.reduce((total, item) => total + numberValue(item.completion_tokens, 0), 0);
   const reasoningValues = snapshots.map((item) => nullableNumber(item.reasoning_tokens));
-  const elapsed = snapshots.reduce(
+  const measuredLatency = snapshots.reduce(
     (total, item) => total + numberValue(item.elapsed_ms ?? item.latency_ms, 0),
     0,
   );
-  const tpsValues = snapshots
-    .map((item) => nullableNumber(item.tokens_per_second))
+  const startedMs = startedAt == null ? Number.NaN : Date.parse(startedAt);
+  const completedMs = completedAt == null ? Date.now() : Date.parse(completedAt);
+  const wallElapsed = Number.isFinite(startedMs) && Number.isFinite(completedMs)
+    ? Math.max(0, completedMs - startedMs)
+    : null;
+  const elapsed = wallElapsed ?? (measuredLatency || null);
+  const eta = completedAt == null && elapsed !== null && completedUnits > 0 && totalUnits > completedUnits
+    ? (elapsed / completedUnits) * (totalUnits - completedUnits)
+    : null;
+  const tpsValues = values
+    .filter((value) => terminalUnitStatus(asRecord(value)?.status))
+    .map((value) => nullableNumber(asRecord(asRecord(value)?.performance)?.tokens_per_second))
     .filter((value): value is number => value !== null);
+  const runningSnapshot = values
+    .map((value) => asRecord(value))
+    .find((value) => value?.status === "running")?.performance;
+  const currentTps = nullableNumber(asRecord(runningSnapshot)?.tokens_per_second);
   return {
-    elapsed_ms: elapsed || null,
-    eta_ms: null,
+    elapsed_ms: elapsed,
+    eta_ms: eta,
     prompt_tokens: prompt,
     reasoning_tokens: reasoningValues.some((value) => value !== null)
       ? reasoningValues.reduce<number>((total, value) => total + (value ?? 0), 0)
@@ -803,7 +924,7 @@ function aggregateLanePerformance(values: unknown[]): LanePerformance {
       (total, item) => total + numberValue(item.total_tokens, 0),
       0,
     ),
-    current_tps: tpsValues.at(-1) ?? null,
+    current_tps: currentTps,
     mean_tps: tpsValues.length
       ? tpsValues.reduce((total, value) => total + value, 0) / tpsValues.length
       : null,
@@ -956,6 +1077,12 @@ function routingComparisonFor(
   return {
     selection_overlap: nullableNumber(pair.selection_overlap),
     routing_mass_js_divergence: nullableNumber(pair.routing_mass_js_divergence),
+    baseline_selection_count: nullableNumber(pair.baseline_selection_count),
+    candidate_selection_count: nullableNumber(pair.candidate_selection_count),
+    selection_count_delta: nullableNumber(pair.selection_count_delta),
+    baseline_routing_mass: nullableNumber(pair.baseline_routing_mass),
+    candidate_routing_mass: nullableNumber(pair.candidate_routing_mass),
+    routing_mass_delta: nullableNumber(pair.routing_mass_delta),
     at_candidate_first_divergence: pair.at_candidate_first_divergence === true,
     largest_selection_shifts: arrayValue(pair.largest_selection_shifts)
       .map((value) => asRecord(value))
@@ -1194,6 +1321,12 @@ function arrayValue(value: unknown): unknown[] {
 
 function stringArray(value: unknown): string[] {
   return arrayValue(value).map((item) => stringValue(item, "")).filter(Boolean);
+}
+
+function numberArray(value: unknown): number[] {
+  return arrayValue(value).filter(
+    (item): item is number => typeof item === "number" && Number.isFinite(item),
+  );
 }
 
 function stringValue(value: unknown, fallback: string): string {

@@ -113,6 +113,7 @@ export interface DriftCheckpoint {
   state_distance: number | null;
   invariant_violations: string[];
   invalid_tool_calls: number;
+  tool_error_injected?: boolean;
   routing_delta: number | null;
   routing_evidence: Record<string, unknown> | null;
   routing_comparison: RoutingCheckpointComparison | null;
@@ -129,6 +130,12 @@ export interface RoutingSelectionShift {
 export interface RoutingCheckpointComparison {
   selection_overlap: number | null;
   routing_mass_js_divergence: number | null;
+  baseline_selection_count?: number | null;
+  candidate_selection_count?: number | null;
+  selection_count_delta?: number | null;
+  baseline_routing_mass?: number | null;
+  candidate_routing_mass?: number | null;
+  routing_mass_delta?: number | null;
   at_candidate_first_divergence: boolean;
   largest_selection_shifts: RoutingSelectionShift[];
 }
@@ -185,10 +192,30 @@ export interface DriftMetrics {
   area_under_fidelity_curve: number | null;
   first_divergence_checkpoint: number | null;
   recovery_rate: number | null;
+  survival_curve: number[];
+  state_fidelity_curve: number[];
+  invariant_violations: number | null;
+  invalid_tool_calls: number | null;
+  collateral_mutations: number | null;
+  rollback_correctness: number | null;
+  divergence_growth_slope: number | null;
   horizon_at_80: number | null;
   horizon_at_50: number | null;
+  local_competence: number | null;
+  chained_fidelity: number | null;
+  local_capability_delta: number | null;
   compounding_penalty: number | null;
+  paired_drift_delta: number | null;
   excess_mask_drift: number | null;
+}
+
+export interface DriftParameters {
+  dependency_span: number;
+  branch_count: number;
+  rollback_depth: number;
+  distractor_ratio: number;
+  tool_error_rate: number;
+  state_size: number;
 }
 
 export interface ExperimentRecord {
@@ -215,9 +242,11 @@ export interface ExperimentRecord {
   unscored: number;
   lanes: ExperimentLane[];
   units: ExperimentUnit[];
+  contract_provenance: "known" | "legacy_unknown";
   evaluation_contract: EvaluationContract | null;
   execution_policy: ExecutionPolicy | null;
   generation: GenerationConfig | null;
+  drift_parameters: DriftParameters | null;
   drift_metrics: Record<LaneRole, DriftMetrics | null>;
   comparison: Record<string, unknown> | null;
   error: string | null;
@@ -242,6 +271,7 @@ export interface ExperimentCreateRequest {
   name: string;
   model_id: string;
   workload_id: string;
+  workload_unit_ids?: string[];
   candidate_profile_id: string | null;
   agent_id?: string;
   sandbox_provider_id?: string;
@@ -249,6 +279,10 @@ export interface ExperimentCreateRequest {
   conditions?: string[];
   horizons?: number[];
   seeds: number[];
+  generation: GenerationConfig;
+  evaluation_contract?: EvaluationContract;
+  execution_policy: ExecutionPolicy;
+  drift_parameters?: DriftParameters;
 }
 
 export interface ExperimentPage {

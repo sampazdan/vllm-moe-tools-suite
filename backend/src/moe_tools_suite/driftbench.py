@@ -8,7 +8,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .v2_domain import DriftCondition, canonical_fingerprint
+from .v2_domain import DriftCondition, DriftParameters, canonical_fingerprint
 
 DRIFT_FORMULAS = {
     "version": "state-drift-v1",
@@ -16,6 +16,10 @@ DRIFT_FORMULAS = {
         "unequal_leaf_paths / max(union_of_leaf_paths, 1); missing paths differ"
     ),
     "state_fidelity": "1 - state_distance",
+    "final_success": "whether the final checkpoint state is exact",
+    "transition_accuracy": "exact checkpoints / all checkpoints",
+    "first_divergence": "lowest checkpoint index whose state is not exact",
+    "survival_curve": "at t, 1 only when every checkpoint through t is exact",
     "auc": "arithmetic mean of post-transition state fidelity",
     "recovery_rate": (
         "divergent checkpoints followed immediately by an exact checkpoint / "
@@ -24,8 +28,22 @@ DRIFT_FORMULAS = {
     "divergence_growth_slope": (
         "ordinary-least-squares slope of (1 - fidelity) over checkpoint index"
     ),
+    "invariant_violations": "sum of invariant violations over checkpoints",
+    "invalid_tool_calls": "count of reducer-rejected tool calls",
+    "collateral_mutations": (
+        "sum of actual changed leaf paths absent from expected changed paths"
+    ),
+    "rollback_correctness": "exact rollback checkpoints / rollback checkpoints",
     "horizon_reliability": (
         "largest tested horizon whose paired final-success mean meets threshold"
+    ),
+    "local_competence": "mean fidelity AUC in oracle-reset condition",
+    "chained_fidelity": "mean fidelity AUC in chained condition",
+    "compounding_penalty": "local competence - chained fidelity",
+    "local_capability_delta": "candidate local competence - baseline local competence",
+    "paired_drift_delta": "mean(candidate fidelity AUC - baseline fidelity AUC)",
+    "excess_compounding_penalty": (
+        "candidate compounding penalty - baseline compounding penalty"
     ),
     "routing_selection_overlap": (
         "histogram intersection of normalized baseline and candidate per-expert "
@@ -34,6 +52,13 @@ DRIFT_FORMULAS = {
     "routing_mass_js_divergence": (
         "base-2 Jensen-Shannon divergence between normalized baseline and "
         "candidate per-expert routing-mass distributions"
+    ),
+    "parameter_fingerprint": (
+        "sha256 of drift-parameters-v1 plus the canonical scenario dimensions"
+    ),
+    "tool_error_injection": (
+        "sha256(seed, checkpoint index, parameter fingerprint) normalized to "
+        "[0, 1] and compared with tool_error_rate"
     ),
 }
 DRIFT_FORMULA_FINGERPRINT = canonical_fingerprint(DRIFT_FORMULAS)
@@ -51,6 +76,7 @@ class DriftPlannedTurn(BaseModel):
 
     instruction: str
     canonical_call: DriftToolCall
+    inject_tool_error: bool = False
 
 
 class DriftTurnInput(BaseModel):
@@ -82,6 +108,7 @@ class DriftTransition(BaseModel):
     collateral_mutations: list[str] = Field(default_factory=list)
     rollback: bool = False
     rollback_correct: bool | None = None
+    tool_error_injected: bool = False
 
 
 class DriftMetrics(BaseModel):
@@ -107,6 +134,10 @@ class DriftRunResult(BaseModel):
     seed: int
     condition: DriftCondition
     horizon: int
+    parameters: DriftParameters = Field(default_factory=DriftParameters)
+    parameter_fingerprint: str = Field(
+        default_factory=lambda: DriftParameters().fingerprint
+    )
     initial_state: dict[str, Any]
     final_expected_state: dict[str, Any]
     final_actual_state: dict[str, Any]
@@ -650,6 +681,185 @@ class RecordWorkflowScenario:
         }
 
 
+@dataclass(frozen=True)
+class ParameterizedDriftScenario:
+    """Applies reproducible workload dimensions without changing domain reducers."""
+
+    base: DriftScenario
+    parameters: DriftParameters
+
+    @property
+    def id(self) -> str:
+        return self.base.id
+
+    @property
+    def revision(self) -> str:
+        return f"{self.base.revision}+params.{self.parameters.fingerprint[:12]}"
+
+    @property
+    def name(self) -> str:
+        return self.base.name
+
+    @property
+    def description(self) -> str:
+        return self.base.description
+
+    def initial_state(self, seed: int) -> dict[str, Any]:
+        state = self.base.initial_state(seed)
+        state["_drift_parameter_context"] = _parameter_context(seed, self.parameters)
+        return state
+
+    def plan(self, seed: int, horizon: int) -> list[DriftPlannedTurn]:
+        raw = self._rollback_plan(seed, horizon * 2)
+        planned: list[DriftPlannedTurn] = []
+        for index, turn in enumerate(raw):
+            if len(planned) >= horizon:
+                break
+            inject = (
+                turn.canonical_call.tool not in {"snapshot", "rollback"}
+                and len(planned) + 1 < horizon
+                and _inject_tool_error(
+                    seed,
+                    index,
+                    self.parameters.tool_error_rate,
+                    self.parameters.fingerprint,
+                )
+            )
+            if inject:
+                planned.append(turn.model_copy(update={"inject_tool_error": True}))
+                planned.append(
+                    turn.model_copy(
+                        update={
+                            "instruction": (
+                                "The previous tool attempt returned a deterministic "
+                                f"transient error. Retry now: {turn.instruction}"
+                            )
+                        }
+                    )
+                )
+            else:
+                planned.append(turn)
+        return planned[:horizon]
+
+    def _rollback_plan(self, seed: int, length: int) -> list[DriftPlannedTurn]:
+        depth = self.parameters.rollback_depth
+        base_plan = self.base.plan(seed, max(length, 1))
+        if depth == 0:
+            return base_plan
+        planned: list[DriftPlannedTurn] = []
+        cursor = 0
+        cycle = 0
+        while len(planned) < length:
+            remaining = length - len(planned)
+            if remaining < depth + 2:
+                planned.extend(base_plan[cursor : cursor + remaining])
+                break
+            snapshot = f"parameter-rollback-{cycle}"
+            segment = base_plan[cursor : cursor + depth]
+            planned.append(
+                DriftPlannedTurn(
+                    instruction=f"Snapshot the current state as {snapshot}.",
+                    canonical_call=DriftToolCall(
+                        tool="snapshot", arguments={"name": snapshot}
+                    ),
+                )
+            )
+            planned.extend(segment)
+            planned.append(
+                DriftPlannedTurn(
+                    instruction=(
+                        f"Roll back {depth} intervening update"
+                        f"{'s' if depth != 1 else ''} to {snapshot}."
+                    ),
+                    canonical_call=DriftToolCall(
+                        tool="rollback", arguments={"name": snapshot}
+                    ),
+                )
+            )
+            planned.extend(segment)
+            cursor += depth
+            cycle += 1
+        return planned[:length]
+
+    def apply(
+        self, state: dict[str, Any], call: DriftToolCall
+    ) -> tuple[dict[str, Any], bool]:
+        return self.base.apply(state, call)
+
+    def invariant_violations(self, state: dict[str, Any]) -> list[str]:
+        violations = self.base.invariant_violations(state)
+        context = state.get("_drift_parameter_context")
+        if not isinstance(context, dict) or context.get("fingerprint") != (
+            self.parameters.fingerprint
+        ):
+            violations.append("parameterized context must remain intact")
+        return violations
+
+    def compact_summary(self, state: dict[str, Any]) -> str:
+        return json.dumps(
+            self.public_state(state), sort_keys=True, separators=(",", ":")
+        )
+
+    def public_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        public = self.base.public_state(state)
+        public["parameter_context"] = copy.deepcopy(state["_drift_parameter_context"])
+        return public
+
+
+def parameterize_scenario(
+    scenario: DriftScenario, parameters: DriftParameters
+) -> ParameterizedDriftScenario:
+    return ParameterizedDriftScenario(base=scenario, parameters=parameters)
+
+
+def _parameter_context(seed: int, parameters: DriftParameters) -> dict[str, Any]:
+    distractor_count = round(parameters.state_size * parameters.distractor_ratio)
+    records = {}
+    for index in range(parameters.state_size):
+        record_id = f"context-{index + 1:03d}"
+        first_dependency = max(0, index - parameters.dependency_span)
+        distractor = index >= parameters.state_size - distractor_count
+        records[record_id] = {
+            "branch": f"branch-{index % parameters.branch_count + 1}",
+            "dependencies": [
+                f"context-{dependency + 1:03d}"
+                for dependency in range(first_dependency, index)
+            ],
+            "status": "open" if (seed + index) % 3 else "reviewed",
+            "value": (seed * 17 + index * 13) % 101,
+            "role": "distractor" if distractor else "dependency_context",
+            "note": (f"reference-{(seed + index) % 11}" if distractor else None),
+        }
+    return {
+        "fingerprint": parameters.fingerprint,
+        "dependency_span": parameters.dependency_span,
+        "branch_count": parameters.branch_count,
+        "rollback_depth": parameters.rollback_depth,
+        "distractor_ratio": parameters.distractor_ratio,
+        "tool_error_rate": parameters.tool_error_rate,
+        "state_size": parameters.state_size,
+        "records": records,
+    }
+
+
+def _inject_tool_error(
+    seed: int,
+    index: int,
+    rate: float,
+    parameter_fingerprint: str,
+) -> bool:
+    if rate <= 0:
+        return False
+    fingerprint = canonical_fingerprint(
+        {
+            "seed": seed,
+            "index": index,
+            "parameters": parameter_fingerprint,
+        }
+    )
+    return int(fingerprint[:8], 16) / 0xFFFFFFFF < rate
+
+
 SCENARIOS: dict[str, DriftScenario] = {
     scenario.id: scenario
     for scenario in (
@@ -721,12 +931,16 @@ async def run_drift_scenario(
     canonical_state = copy.deepcopy(initial)
     actual_state = copy.deepcopy(initial)
     transitions: list[DriftTransition] = []
+    parameters = getattr(scenario, "parameters", DriftParameters())
 
     for checkpoint, planned in enumerate(plan, start=1):
         canonical_before = copy.deepcopy(canonical_state)
-        canonical_state, canonical_valid = scenario.apply(
-            canonical_state, planned.canonical_call
-        )
+        if planned.inject_tool_error:
+            canonical_valid = True
+        else:
+            canonical_state, canonical_valid = scenario.apply(
+                canonical_state, planned.canonical_call
+            )
         if not canonical_valid or scenario.invariant_violations(canonical_state):
             raise RuntimeError(
                 f"scenario {scenario.id} contains an invalid canonical transition"
@@ -748,7 +962,10 @@ async def run_drift_scenario(
         )
         actual_before = copy.deepcopy(actual_state)
         actual_call = await action_provider(turn)
-        actual_state, actual_valid = scenario.apply(actual_state, actual_call)
+        if planned.inject_tool_error:
+            _, actual_valid = scenario.apply(actual_state, actual_call)
+        else:
+            actual_state, actual_valid = scenario.apply(actual_state, actual_call)
         violations = scenario.invariant_violations(actual_state)
         expected_public = scenario.public_state(canonical_state)
         actual_public = scenario.public_state(actual_state)
@@ -760,6 +977,9 @@ async def run_drift_scenario(
             scenario.public_state(actual_before), actual_public
         )
         rollback = planned.canonical_call.tool == "rollback"
+        exact = distance == 0 and (
+            not planned.inject_tool_error or actual_call == planned.canonical_call
+        )
         transition = DriftTransition(
             checkpoint=checkpoint,
             instruction=planned.instruction,
@@ -771,12 +991,13 @@ async def run_drift_scenario(
             actual_state_fingerprint=canonical_fingerprint(actual_public),
             state_distance=distance,
             state_fidelity=1.0 - distance,
-            exact=distance == 0,
+            exact=exact,
             valid_tool_call=actual_valid,
             invariant_violations=violations,
             collateral_mutations=sorted(actual_changed - expected_changed),
             rollback=rollback,
-            rollback_correct=(distance == 0 if rollback else None),
+            rollback_correct=(exact if rollback else None),
+            tool_error_injected=planned.inject_tool_error,
         )
         transitions.append(transition)
         if on_checkpoint is not None:
@@ -789,6 +1010,8 @@ async def run_drift_scenario(
         seed=seed,
         condition=condition,
         horizon=horizon,
+        parameters=parameters,
+        parameter_fingerprint=parameters.fingerprint,
         initial_state=scenario.public_state(initial),
         final_expected_state=scenario.public_state(canonical_state),
         final_actual_state=scenario.public_state(actual_state),

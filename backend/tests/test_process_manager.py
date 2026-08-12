@@ -5,10 +5,17 @@ import signal
 from pathlib import Path
 
 import httpx
+import moe_tools_suite.process_manager as process_manager
 import pytest
-from moe_tools_suite.domain import ExpertProfile, ModelRuntimeRecipe, ProfileLayer
+from moe_tools_suite.domain import (
+    ExpertProfile,
+    ModelLoadPhase,
+    ModelRuntimeRecipe,
+    ProfileLayer,
+)
 from moe_tools_suite.process_manager import (
     ManagedVllmServer,
+    ModelLoadPhaseUpdate,
     _vllm_child_environment,
 )
 
@@ -80,6 +87,389 @@ def _mock_owned_process_group(
         "_process_group_exists",
         lambda pid: pid == process.pid and process.returncode is None,
     )
+
+
+@pytest.mark.asyncio
+async def test_model_load_progress_receiver_rejects_wrong_token() -> None:
+    updates: list[ModelLoadPhaseUpdate] = []
+    receiver = process_manager._ModelLoadProgressReceiver(
+        session_id="session-a",
+        on_update=updates.append,
+    )
+    payload = json.dumps(
+        {
+            "version": 1,
+            "event_id": "event-a",
+            "session_id": "session-a",
+            "phase": "loading_weights",
+            "status": "completed",
+            "detail": "Weights loaded",
+            "process_id": 5000,
+            "rank": 0,
+            "world_size": 1,
+        }
+    ).encode()
+
+    class MemoryWriter:
+        def __init__(self) -> None:
+            self.response = bytearray()
+
+        def get_extra_info(self, name: str):
+            return ("127.0.0.1", 5000) if name == "peername" else None
+
+        def write(self, data: bytes) -> None:
+            self.response.extend(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    def request(token: str) -> asyncio.StreamReader:
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            (
+                f"POST {receiver.path} HTTP/1.1\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(payload)}\r\n"
+                f"X-vLLM-Model-Load-Token: {token}\r\n\r\n"
+            ).encode()
+            + payload
+        )
+        reader.feed_eof()
+        return reader
+
+    rejected_writer = MemoryWriter()
+    await receiver._handle_connection(request("x" * 43), rejected_writer)  # type: ignore[arg-type]
+    assert bytes(rejected_writer.response).startswith(b"HTTP/1.1 403")
+    assert updates == []
+
+    accepted_writer = MemoryWriter()
+    await receiver._handle_connection(request(receiver.token), accepted_writer)  # type: ignore[arg-type]
+    assert bytes(accepted_writer.response).startswith(b"HTTP/1.1 204")
+    assert [update.status for update in updates] == ["started", "completed"]
+
+
+def test_progress_receiver_locks_worker_cardinality_and_requires_all_tp_ranks() -> None:
+    def event(
+        event_id: str,
+        *,
+        rank: int,
+        world_size: int,
+    ) -> process_manager._RuntimeModelLoadEvent:
+        return process_manager._RuntimeModelLoadEvent(
+            version=1,
+            event_id=event_id,
+            session_id="session-a",
+            phase="loading_weights",
+            status="completed",
+            detail="Weights loaded",
+            process_id=5000 + rank,
+            rank=rank,
+            world_size=world_size,
+        )
+
+    rank_zero_updates: list[ModelLoadPhaseUpdate] = []
+    rank_zero_only = process_manager._ModelLoadProgressReceiver(
+        session_id="session-a",
+        on_update=rank_zero_updates.append,
+    )
+    rank_zero_only._accept_event(event("rank-zero", rank=0, world_size=2))
+    rank_zero_only.finalize()
+    assert [update.status for update in rank_zero_updates] == [
+        "started",
+        "unavailable",
+    ]
+
+    updates: list[ModelLoadPhaseUpdate] = []
+    receiver = process_manager._ModelLoadProgressReceiver(
+        session_id="session-a",
+        on_update=updates.append,
+        expected_worker_world_size=2,
+    )
+    receiver._accept_event(event("wrong-world", rank=1, world_size=3))
+    assert updates == []
+    assert receiver._worker_world_size == 2
+    receiver._accept_event(event("rank-zero", rank=0, world_size=2))
+    assert [update.status for update in updates] == ["started"]
+    assert receiver._phases[ModelLoadPhase.LOADING_WEIGHTS].world_size == 2
+
+    receiver._accept_event(event("rank-one", rank=1, world_size=2))
+    assert [update.status for update in updates] == ["started", "completed"]
+
+
+def test_progress_receiver_requires_single_rank_coordinator_events() -> None:
+    with pytest.raises(ValueError, match="coordinator phases require"):
+        process_manager._RuntimeModelLoadEvent(
+            version=1,
+            event_id="bad-coordinator",
+            session_id="session-a",
+            phase="downloading",
+            status="completed",
+            detail="Snapshot resolved",
+            process_id=5000,
+            rank=0,
+            world_size=2,
+        )
+
+    updates: list[ModelLoadPhaseUpdate] = []
+    receiver = process_manager._ModelLoadProgressReceiver(
+        session_id="session-a",
+        on_update=updates.append,
+    )
+    receiver._accept_event(
+        process_manager._RuntimeModelLoadEvent(
+            version=1,
+            event_id="coordinator",
+            session_id="session-a",
+            phase="downloading",
+            status="completed",
+            detail="Snapshot resolved",
+            process_id=5000,
+            rank=0,
+            world_size=1,
+        )
+    )
+    assert [update.status for update in updates] == ["started", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_managed_start_aggregates_structured_runtime_phase_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeProcess()
+    invocation: dict[str, object] = {}
+    events_sent = asyncio.Event()
+    poster: asyncio.Task[None] | None = None
+    receivers: list[process_manager._ModelLoadProgressReceiver] = []
+
+    class InMemoryReceiver(process_manager._ModelLoadProgressReceiver):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            receivers.append(self)
+
+        async def start(self) -> None:
+            self.endpoint = f"http://127.0.0.1:4321{self.path}"
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        process_manager,
+        "_ModelLoadProgressReceiver",
+        InMemoryReceiver,
+    )
+
+    async def post_events(environment: dict[str, str]) -> None:
+        session_id = environment["VLLM_MOE_MODEL_LOAD_PROGRESS_SESSION_ID"]
+        phases = [
+            "initializing_distributed_workers",
+            "checking_cache",
+            "downloading",
+            "loading_weights",
+            "compiling",
+            "capturing_graphs",
+            "warming",
+        ]
+        assert len(receivers) == 1
+        receiver = receivers[0]
+        leaked_detail = (
+            f"progress={receiver.token} context="
+            f"{environment['VLLM_MOE_EXPERT_CONTEXT_CONTROL_TOKEN']}"
+        )
+        for phase in phases:
+            coordinator_phase = phase in {"checking_cache", "downloading"}
+            ranks = range(1) if coordinator_phase else range(2)
+            world_size = 1 if coordinator_phase else 2
+            for status in ("started", "completed"):
+                for rank in ranks:
+                    receiver._accept_event(
+                        process_manager._RuntimeModelLoadEvent(
+                            version=1,
+                            event_id=f"{phase}-{status}-{rank}",
+                            session_id=session_id,
+                            phase=phase,
+                            status=status,
+                            detail=f"{phase} {status} {leaked_detail}",
+                            process_id=5000 + rank,
+                            rank=rank,
+                            world_size=world_size,
+                            bytes_current=(
+                                4096
+                                if phase == "downloading" and status == "completed"
+                                else None
+                            ),
+                            bytes_total=(
+                                4096
+                                if phase == "downloading" and status == "completed"
+                                else None
+                            ),
+                            files_current=(
+                                4
+                                if phase == "downloading" and status == "completed"
+                                else None
+                            ),
+                            files_total=(
+                                4
+                                if phase == "downloading" and status == "completed"
+                                else None
+                            ),
+                        )
+                    )
+        events_sent.set()
+
+    async def create_subprocess(*args, **kwargs):
+        nonlocal poster
+        del args
+        invocation.update(kwargs)
+        kwargs["stdout"].write(
+            (
+                "progress token "
+                f"{kwargs['env']['VLLM_MOE_MODEL_LOAD_PROGRESS_TOKEN']}\n"
+            ).encode()
+        )
+        poster = asyncio.create_task(post_events(kwargs["env"]))
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+
+    def readiness(request: httpx.Request) -> httpx.Response:
+        if events_sent.is_set():
+            return httpx.Response(
+                200,
+                json={"data": [{"id": MODEL_ID}]},
+                request=request,
+            )
+        return httpx.Response(503, request=request)
+
+    updates: list[ModelLoadPhaseUpdate] = []
+    ordinary: list[tuple[ModelLoadPhase, str]] = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(readiness)) as client:
+        manager = _manager(tmp_path, _launcher(tmp_path), client)
+        _mock_owned_process_group(manager, process, monkeypatch)
+
+        await manager.start(
+            profile=None,
+            session_id="structured-progress",
+            model_revision="a" * 40,
+            runtime_recipe=ModelRuntimeRecipe(
+                revision="a" * 40,
+                tensor_parallel_size=2,
+            ),
+            on_phase=lambda phase, _detail, observability: ordinary.append(
+                (phase, observability)
+            ),
+            on_phase_update=updates.append,
+        )
+
+        assert poster is not None
+        await poster
+        environment = invocation["env"]
+        assert isinstance(environment, dict)
+        assert receivers[0]._worker_world_size == 2
+        assert len(environment["VLLM_MOE_MODEL_LOAD_PROGRESS_TOKEN"]) >= 32
+        assert (
+            environment["VLLM_MOE_MODEL_LOAD_PROGRESS_TOKEN"]
+            != environment["VLLM_MOE_EXPERT_CONTEXT_CONTROL_TOKEN"]
+        )
+        assert environment["VLLM_MOE_MODEL_LOAD_PROGRESS_TOKEN"] not in (
+            manager.read_log_tail()
+        )
+        assert "[REDACTED]" in manager.read_log_tail()
+        serialized_updates = repr(updates)
+        assert environment["VLLM_MOE_MODEL_LOAD_PROGRESS_TOKEN"] not in (
+            serialized_updates
+        )
+        assert environment["VLLM_MOE_EXPERT_CONTEXT_CONTROL_TOKEN"] not in (
+            serialized_updates
+        )
+        assert "[REDACTED]" in serialized_updates
+        assert all(observability == "observed" for _, observability in ordinary)
+        assert [phase for phase, _ in ordinary] == [
+            ModelLoadPhase.LAUNCHING_PROCESS,
+            ModelLoadPhase.WAITING_FOR_READINESS,
+        ]
+        for phase in (
+            ModelLoadPhase.INITIALIZING_DISTRIBUTED_WORKERS,
+            ModelLoadPhase.CHECKING_CACHE,
+            ModelLoadPhase.DOWNLOADING,
+            ModelLoadPhase.LOADING_WEIGHTS,
+            ModelLoadPhase.COMPILING,
+            ModelLoadPhase.CAPTURING_GRAPHS,
+            ModelLoadPhase.WARMING,
+        ):
+            phase_updates = [update for update in updates if update.phase is phase]
+            assert [update.status for update in phase_updates] == [
+                "started",
+                "completed",
+            ]
+        download = next(
+            update
+            for update in updates
+            if update.phase is ModelLoadPhase.DOWNLOADING
+            and update.status == "completed"
+        )
+        assert download.bytes_current == 4096
+        assert download.files_current == 4
+
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_managed_start_keeps_missing_runtime_phases_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeProcess()
+
+    async def create_subprocess(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    unavailable: list[ModelLoadPhase] = []
+
+    def record_phase(
+        phase: ModelLoadPhase,
+        _detail: str,
+        observability: str,
+    ) -> None:
+        if observability == "unavailable":
+            unavailable.append(phase)
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{"id": MODEL_ID}]},
+            request=request,
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        manager = _manager(tmp_path, _launcher(tmp_path), client)
+        _mock_owned_process_group(manager, process, monkeypatch)
+
+        await manager.start(
+            profile=None,
+            session_id="missing-progress",
+            on_phase=record_phase,
+            on_phase_update=lambda _update: None,
+        )
+
+        assert unavailable == [
+            ModelLoadPhase.CHECKING_CACHE,
+            ModelLoadPhase.DOWNLOADING,
+            ModelLoadPhase.LOADING_WEIGHTS,
+            ModelLoadPhase.INITIALIZING_DISTRIBUTED_WORKERS,
+            ModelLoadPhase.COMPILING,
+            ModelLoadPhase.CAPTURING_GRAPHS,
+            ModelLoadPhase.WARMING,
+        ]
+        await manager.stop()
 
 
 def test_vllm_child_environment_has_explicit_allowlist_and_secret_filter(
@@ -410,9 +800,14 @@ async def test_expert_context_control_uses_internal_token_and_validates_receipt(
 async def test_startup_failure_includes_log_tail_and_cleans_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    secret = "hf_private_diagnostic_token"
+    monkeypatch.setenv("HF_TOKEN", secret)
+
     async def create_subprocess(*args, **kwargs):
         del args
-        kwargs["stdout"].write(b"CUDA initialization failed\n")
+        kwargs["stdout"].write(
+            f"CUDA initialization failed with token {secret}\n".encode()
+        )
         return FakeProcess(returncode=17)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
@@ -422,9 +817,11 @@ async def test_startup_failure_includes_log_tail_and_cleans_pid(
     async with httpx.AsyncClient(transport=transport) as client:
         manager = _manager(tmp_path, _launcher(tmp_path), client)
 
-        with pytest.raises(RuntimeError, match="CUDA initialization failed"):
+        with pytest.raises(RuntimeError, match="CUDA initialization failed") as raised:
             await manager.start(profile=None, session_id="failed-session")
 
+        assert secret not in str(raised.value)
+        assert "[REDACTED]" in str(raised.value)
         assert manager.pid is None
         assert not (manager.runtime_dir / "vllm.pid").exists()
 

@@ -13,9 +13,12 @@ from typing import Any
 from uuid import uuid4
 
 from .domain import (
-    EvaluationResult,
+    DeterministicScorerKind,
+    EvaluationContract,
+    EvaluationCriterion,
     ExpertProfile,
     GenerationConfig,
+    JudgeMode,
     ModelSession,
     ModelState,
     ModelTopology,
@@ -28,16 +31,19 @@ from .driftbench import (
     DriftRunResult,
     DriftToolCall,
     DriftTurnInput,
+    parameterize_scenario,
     reliability_horizon,
     run_drift_scenario,
 )
+from .evaluation import evaluate_output, validate_cost_policy_pricing
 from .persistence import SqliteStore
-from .runtime import CompletionResult, ModelRuntime
+from .runtime import CompletionProgress, CompletionResult, ModelRuntime
 from .telemetry import aggregate_routing
 from .v2_domain import (
     ContextActivationResult,
     CreateExperimentRequest,
     DriftCondition,
+    DriftParameters,
     EvaluationResultRecord,
     Experiment,
     ExperimentDetail,
@@ -60,6 +66,8 @@ from .v2_domain import (
 )
 
 STATE_DRIFT_WORKLOAD_ID = "state-drift-v1"
+MAX_SELECTED_WORKLOAD_UNITS = 10_000
+MAX_EXPERIMENT_RUN_UNITS = 10_000
 
 ActivateContext = Callable[[str | None], Awaitable[ContextActivationResult]]
 ContextBuilder = Callable[[SavedExpertProfile | None], InterventionContextRef]
@@ -75,6 +83,19 @@ class _ProviderTelemetry:
     routing: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class _TrajectoryEventState:
+    started_tool_call_ids: set[str] = field(default_factory=set)
+    completed_tool_call_ids: set[str] = field(default_factory=set)
+
+
+@dataclass
+class _InferenceProgressState:
+    last_elapsed_ms: float | None = None
+    last_completion_tokens: int = 0
+    emitted_current_rate: bool = False
+
+
 @dataclass(frozen=True)
 class ExperimentAdapterRequest:
     experiment: Experiment
@@ -83,8 +104,11 @@ class ExperimentAdapterRequest:
     unit: RunUnit
     profile: SavedExpertProfile | None
     context: InterventionContextRef
+    remaining_token_budget: int | None
+    remaining_cost_budget_usd: float | None
     should_cancel: Callable[[], bool]
     emit_trajectory: Callable[[dict[str, Any]], None]
+    emit_inference_progress: Callable[[CompletionProgress], None]
 
 
 @dataclass(frozen=True)
@@ -103,6 +127,10 @@ AdapterExecutor = Callable[
 
 class ExperimentCancellationRequested(RuntimeError):
     """A workload adapter observed a durable experiment cancellation."""
+
+
+class ExperimentTokenBudgetExhausted(RuntimeError):
+    """The remaining experiment token cap cannot admit another model request."""
 
 
 class ExperimentService:
@@ -193,6 +221,14 @@ class ExperimentService:
                 "horizons": [2, 4, 8, 12, 16, 24],
                 "formulas": DRIFT_FORMULAS,
                 "formula_fingerprint": DRIFT_FORMULA_FINGERPRINT,
+                "parameter_schema": {
+                    "dependency_span": {"minimum": 1, "maximum": 32},
+                    "branch_count": {"minimum": 1, "maximum": 16},
+                    "rollback_depth": {"minimum": 0, "maximum": 16},
+                    "distractor_ratio": {"minimum": 0, "maximum": 0.9},
+                    "tool_error_rate": {"minimum": 0, "maximum": 0.9},
+                    "state_size": {"minimum": 3, "maximum": 128},
+                },
                 "scenarios": [
                     {
                         "id": scenario.id,
@@ -209,7 +245,7 @@ class ExperimentService:
         self,
         request: CreateExperimentRequest,
         descriptor: WorkloadDescriptor,
-    ) -> None:
+    ) -> int:
         if request.model_id != self.model_id:
             raise ValueError(f"unsupported experiment model {request.model_id!r}")
         if descriptor.id != request.workload_id:
@@ -218,15 +254,67 @@ class ExperimentService:
             reason = descriptor.blocked_reason or "workload is not prepared"
             raise ValueError(f"workload is not executable: {reason}")
         if descriptor.kind is WorkloadKind.STATE_DRIFT:
+            if request.workload_unit_ids is not None:
+                raise ValueError(
+                    "state-drift scenarios are selected with scenario_ids, not "
+                    "workload_unit_ids"
+                )
             unknown = set(request.scenario_ids) - SCENARIOS.keys()
             if unknown:
                 raise ValueError(f"unknown state-drift scenarios: {sorted(unknown)}")
+            if (
+                request.execution_policy.max_turns is not None
+                and request.execution_policy.max_turns < max(request.horizons)
+            ):
+                raise ValueError(
+                    "state-drift max_turns must cover the longest selected horizon"
+                )
         elif descriptor.kind is WorkloadKind.ANSWER:
             if self._answer_executor is None:
                 raise ValueError("answer workload execution is unavailable")
         elif descriptor.kind is WorkloadKind.CODING:
             if self._coding_executor is None:
                 raise ValueError("coding workload execution is unavailable")
+        if descriptor.kind is not WorkloadKind.STATE_DRIFT:
+            _selected_workload_unit_ids(request, descriptor)
+        policy = request.execution_policy
+        if policy.attempts != 1 or policy.concurrency != 1:
+            raise ValueError(
+                "V2 experiments require one attempt and serialized execution so "
+                "paired context switches remain aligned"
+            )
+        if policy.fail_fast:
+            raise ValueError("V2 experiment fail_fast execution is not supported")
+        if request.generation.temperature != 0:
+            raise ValueError("paired V2 experiments require temperature=0")
+        contract = request.evaluation_contract or _default_experiment_contract(
+            descriptor
+        )
+        if contract.judge is not None and contract.judge.mode is JudgeMode.PAIRWISE:
+            raise ValueError("pairwise judges are not supported by V2 experiment lanes")
+        if contract.judge is not None:
+            if policy.max_cost_usd is None:
+                raise ValueError(
+                    "V2 judge contracts require an explicit max_cost_usd cap"
+                )
+            validate_cost_policy_pricing(contract, policy)
+        if descriptor.kind is WorkloadKind.ANSWER and any(
+            criterion.kind is DeterministicScorerKind.VERIFIER
+            for criterion in contract.criteria
+        ):
+            raise ValueError("answer experiments cannot execute verifier commands")
+        if descriptor.kind is WorkloadKind.STATE_DRIFT:
+            supported = {
+                DeterministicScorerKind.BENCHMARK_DEFAULT,
+                DeterministicScorerKind.UNGRADED,
+            }
+            if contract.judge is not None or any(
+                criterion.kind not in supported for criterion in contract.criteria
+            ):
+                raise ValueError(
+                    "state-drift evaluation supports exact canonical-state scoring "
+                    "or record-only execution"
+                )
         session = self._current_session()
         if session is None or session.state is not ModelState.READY:
             raise RuntimeError("load a model before starting an experiment")
@@ -238,6 +326,7 @@ class ExperimentService:
                 raise KeyError(request.candidate_profile_id)
             if profile.model_id != request.model_id:
                 raise ValueError("candidate profile belongs to a different model")
+        return _expanded_experiment_run_unit_count(request, descriptor)
 
     def create(
         self,
@@ -248,6 +337,7 @@ class ExperimentService:
         experiment_id: str | None = None,
     ) -> Experiment:
         self.validate_request(request, descriptor)
+        expanded_run_units = _expanded_experiment_run_unit_count(request, descriptor)
         experiment_id = experiment_id or str(uuid4())
         baseline_context = self._context_builder(None)
         candidate_profile = (
@@ -263,14 +353,21 @@ class ExperimentService:
                     self._context_builder(candidate_profile),
                 )
             )
+        selected_workload_units = (
+            []
+            if descriptor.kind is WorkloadKind.STATE_DRIFT
+            else _selected_workload_unit_ids(request, descriptor)
+        )
         units_per_lane = (
             len(request.scenario_ids)
             * len(request.conditions)
             * len(request.horizons)
             * len(request.seeds)
             if descriptor.kind is WorkloadKind.STATE_DRIFT
-            else len(request.seeds)
+            else len(selected_workload_units) * len(request.seeds)
         )
+        if units_per_lane * len(contexts) != expanded_run_units:
+            raise RuntimeError("experiment run-unit plan changed during construction")
         lanes: list[ExperimentLane] = []
         runs: list[WorkloadRun] = []
         for role, context in contexts:
@@ -304,20 +401,24 @@ class ExperimentService:
         ordinal = 0
         if descriptor.kind is WorkloadKind.STATE_DRIFT:
             dimensions = (
-                (scenario_id, condition, horizon, seed)
+                (None, scenario_id, condition, horizon, seed)
                 for scenario_id in request.scenario_ids
                 for condition in request.conditions
                 for horizon in request.horizons
                 for seed in request.seeds
             )
         else:
-            dimensions = ((None, None, None, seed) for seed in request.seeds)
-        for scenario_id, condition, horizon, seed in dimensions:
+            dimensions = (
+                (workload_unit_id, None, None, None, seed)
+                for workload_unit_id in selected_workload_units
+                for seed in request.seeds
+            )
+        for workload_unit_id, scenario_id, condition, horizon, seed in dimensions:
             for lane, run in zip(lanes, runs, strict=True):
                 unit_dimension = (
                     f"{scenario_id}:{condition.value}:h{horizon}:s{seed}"
                     if scenario_id is not None and condition is not None
-                    else f"{descriptor.task_id or descriptor.id}:s{seed}"
+                    else f"{workload_unit_id}:s{seed}"
                 )
                 units.append(
                     RunUnit(
@@ -327,6 +428,7 @@ class ExperimentService:
                         workload_run_id=run.id,
                         ordinal=ordinal,
                         unit_key=f"{unit_dimension}:{lane.role.value}",
+                        workload_unit_id=workload_unit_id,
                         scenario_id=scenario_id,
                         condition=condition,
                         horizon=horizon,
@@ -334,15 +436,64 @@ class ExperimentService:
                     )
                 )
                 ordinal += 1
+        if len(units) != expanded_run_units:
+            raise RuntimeError(
+                "experiment graph does not match the validated unit plan"
+            )
+        evaluation_contract = request.evaluation_contract or (
+            _default_experiment_contract(descriptor)
+        )
+        cohort_fingerprint = canonical_fingerprint(
+            {
+                "version": 1,
+                "workload_fingerprint": descriptor.content_fingerprint,
+                "workload_unit_ids": selected_workload_units,
+                "scenario_ids": (
+                    request.scenario_ids
+                    if descriptor.kind is WorkloadKind.STATE_DRIFT
+                    else []
+                ),
+                "conditions": (
+                    request.conditions
+                    if descriptor.kind is WorkloadKind.STATE_DRIFT
+                    else []
+                ),
+                "horizons": (
+                    request.horizons
+                    if descriptor.kind is WorkloadKind.STATE_DRIFT
+                    else []
+                ),
+                "seeds": request.seeds,
+                "generation": request.generation.model_dump(mode="json"),
+                "evaluation_contract_fingerprint": evaluation_contract.fingerprint,
+                "execution_policy_fingerprint": request.execution_policy.fingerprint,
+                "drift_parameter_fingerprint": (
+                    request.drift_parameters.fingerprint
+                    if descriptor.kind is WorkloadKind.STATE_DRIFT
+                    else None
+                ),
+            }
+        )
         experiment = Experiment(
             id=experiment_id,
             job_id=job_id,
             name=request.name or f"{descriptor.name} · {utc_now():%Y-%m-%d %H:%M}",
             model_id=request.model_id,
             workload=descriptor,
+            cohort_fingerprint=cohort_fingerprint,
+            contract_provenance="known",
+            generation=request.generation,
+            evaluation_contract=evaluation_contract,
+            execution_policy=request.execution_policy,
+            drift_parameters=(
+                request.drift_parameters
+                if descriptor.kind is WorkloadKind.STATE_DRIFT
+                else None
+            ),
             execution_config={
                 "agent_id": request.agent_id,
                 "sandbox_provider_id": request.sandbox_provider_id,
+                "token_budget_scope": "per_lane",
             },
             lanes=lanes,
             total_units=len(units),
@@ -354,7 +505,16 @@ class ExperimentService:
             kind=RunEventKind.QUEUED,
             phase="queued",
             message="Experiment graph persisted and queued",
-            data={"total_units": len(units), "lane_count": len(lanes)},
+            data={
+                "total_units": len(units),
+                "lane_count": len(lanes),
+                "cohort_fingerprint": cohort_fingerprint,
+                "workload_unit_count": (
+                    len(request.scenario_ids)
+                    if descriptor.kind is WorkloadKind.STATE_DRIFT
+                    else len(selected_workload_units)
+                ),
+            },
         )
         self.store.save_experiment_bundle(experiment, runs, units, initial_event)
         self.experiments[experiment.id] = experiment
@@ -453,6 +613,15 @@ class ExperimentService:
         should_cancel: Callable[[], bool],
     ) -> Experiment:
         experiment = self.experiments[experiment_id]
+        if (
+            experiment.contract_provenance != "known"
+            or experiment.generation is None
+            or experiment.evaluation_contract is None
+            or experiment.execution_policy is None
+        ):
+            raise RuntimeError(
+                "legacy experiment contracts are unknown and cannot be resumed"
+            )
         experiment.status = ExperimentStatus.RUNNING
         experiment.started_at = utc_now()
         for lane in experiment.lanes:
@@ -476,16 +645,30 @@ class ExperimentService:
             key=lambda unit: unit.ordinal,
         )
         active_unit: RunUnit | None = None
+        execution_started = time.monotonic()
         try:
             for unit in ordered_units:
                 if self._cancelled(experiment_id, should_cancel):
                     return self._finish_cancelled(experiment, ordered_units)
                 active_unit = unit
-                await self._execute_unit(
-                    experiment,
-                    unit,
-                    should_cancel=lambda: self._cancelled(experiment_id, should_cancel),
+                remaining_seconds = experiment.execution_policy.timeout_seconds - (
+                    time.monotonic() - execution_started
                 )
+                if remaining_seconds <= 0:
+                    raise TimeoutError("experiment execution budget expired")
+                async with asyncio.timeout(
+                    min(
+                        remaining_seconds,
+                        experiment.execution_policy.per_item_timeout_seconds,
+                    )
+                ):
+                    await self._execute_unit(
+                        experiment,
+                        unit,
+                        should_cancel=lambda: self._cancelled(
+                            experiment_id, should_cancel
+                        ),
+                    )
                 experiment.completed_units += 1
                 if unit.status is RunUnitStatus.PASSED:
                     experiment.passed_units += 1
@@ -493,6 +676,20 @@ class ExperimentService:
                 run.completed_units += 1
                 if unit.status is RunUnitStatus.PASSED:
                     run.passed_units += 1
+                self._save_with_event(
+                    experiment,
+                    RunEventKind.EVALUATING,
+                    phase="evaluating",
+                    message="Persisting workload evaluation",
+                    lane_id=unit.lane_id,
+                    workload_run_id=run.id,
+                    run_unit_id=unit.id,
+                    data={
+                        "evaluation_contract_fingerprint": (
+                            experiment.evaluation_contract.fingerprint
+                        )
+                    },
+                )
                 terminal_kind = (
                     RunEventKind.UNIT_PASSED
                     if unit.status is RunUnitStatus.PASSED
@@ -530,7 +727,11 @@ class ExperimentService:
             raise
         except Exception as error:
             experiment.status = ExperimentStatus.FAILED
-            experiment.error = str(error) or error.__class__.__name__
+            experiment.error = (
+                "experiment execution budget expired"
+                if isinstance(error, TimeoutError)
+                else str(error) or error.__class__.__name__
+            )
             experiment.completed_at = utc_now()
             for lane in experiment.lanes:
                 if lane.status is WorkloadRunStatus.RUNNING:
@@ -624,14 +825,73 @@ class ExperimentService:
             data={
                 "ordinal": unit.ordinal,
                 "total_units": experiment.total_units,
+                "workload_unit_id": unit.workload_unit_id,
                 "scenario_id": unit.scenario_id,
                 "condition": unit.condition.value if unit.condition else None,
                 "horizon": unit.horizon,
                 "seed": unit.seed,
             },
         )
+        remaining_token_budget = self._remaining_token_budget(experiment, unit)
+        remaining_cost_budget = self._remaining_cost_budget(experiment, unit)
+        if remaining_token_budget is not None and remaining_token_budget <= 0:
+            unit.result = {
+                "kind": experiment.workload.kind.value,
+                "termination_reason": "execution_policy_token_limit",
+                "error": (
+                    "inference skipped because the experiment token cap was reached"
+                ),
+            }
+            unit.evaluation = EvaluationResultRecord(
+                id=str(uuid4()),
+                workload_run_id=run.id,
+                run_unit_id=unit.id,
+                passed=None,
+                score=None,
+                metrics={"budget_exhausted": True},
+                formula_fingerprint=experiment.evaluation_contract.fingerprint,
+            )
+            unit.performance = PerformanceSnapshot(
+                id=str(uuid4()),
+                workload_run_id=run.id,
+                run_unit_id=unit.id,
+                context_activation_ms=max(receipt.duration_ms, activation_ms),
+            )
+            unit.status = RunUnitStatus.UNSCORED
+            unit.completed_at = utc_now()
+            self.store.save_run_unit(unit)
+            return
+        if remaining_cost_budget is not None and remaining_cost_budget <= 0:
+            unit.result = {
+                "kind": experiment.workload.kind.value,
+                "termination_reason": "execution_policy_cost_limit",
+                "error": (
+                    "inference skipped because the experiment cost cap was reached"
+                ),
+            }
+            unit.evaluation = EvaluationResultRecord(
+                id=str(uuid4()),
+                workload_run_id=run.id,
+                run_unit_id=unit.id,
+                passed=None,
+                score=None,
+                metrics={"cost_budget_exhausted": True},
+                formula_fingerprint=experiment.evaluation_contract.fingerprint,
+            )
+            unit.performance = PerformanceSnapshot(
+                id=str(uuid4()),
+                workload_run_id=run.id,
+                run_unit_id=unit.id,
+                context_activation_ms=max(receipt.duration_ms, activation_ms),
+            )
+            unit.status = RunUnitStatus.UNSCORED
+            unit.completed_at = utc_now()
+            self.store.save_run_unit(unit)
+            return
         profile = self.profiles.get(profile_id) if profile_id else None
         if experiment.workload.kind is not WorkloadKind.STATE_DRIFT:
+            trajectory_event_state = _TrajectoryEventState()
+            inference_progress_state = _InferenceProgressState()
             executor = (
                 self._answer_executor
                 if experiment.workload.kind is WorkloadKind.ANSWER
@@ -658,16 +918,26 @@ class ExperimentService:
                     unit=unit,
                     profile=profile,
                     context=active_context,
+                    remaining_token_budget=remaining_token_budget,
+                    remaining_cost_budget_usd=remaining_cost_budget,
                     should_cancel=should_cancel,
-                    emit_trajectory=lambda step: self._save_with_event(
-                        experiment,
-                        RunEventKind.TRAJECTORY_STEP,
-                        phase=str(step.get("phase") or "trajectory"),
-                        message=str(step.get("title") or "Agent trajectory update"),
-                        lane_id=lane.id,
-                        workload_run_id=run.id,
-                        run_unit_id=unit.id,
-                        data={"trajectory_step": step},
+                    emit_trajectory=lambda step: self._emit_trajectory_event(
+                        experiment=experiment,
+                        lane=lane,
+                        run=run,
+                        unit=unit,
+                        step=step,
+                        state=trajectory_event_state,
+                    ),
+                    emit_inference_progress=lambda progress: (
+                        self._emit_inference_progress(
+                            experiment=experiment,
+                            lane=lane,
+                            run=run,
+                            unit=unit,
+                            progress=progress,
+                            state=inference_progress_state,
+                        )
                     ),
                 )
             )
@@ -720,6 +990,8 @@ class ExperimentService:
             unit=unit,
             profile=profile.profile if profile else None,
             telemetry=telemetry,
+            generation=experiment.generation,
+            token_budget=remaining_token_budget,
             should_cancel=should_cancel,
         )
 
@@ -738,29 +1010,71 @@ class ExperimentService:
             )
 
         started = time.perf_counter()
-        result = await run_drift_scenario(
-            SCENARIOS[unit.scenario_id],
-            seed=unit.seed,
-            horizon=unit.horizon,
-            condition=unit.condition,
-            action_provider=provider,
-            on_checkpoint=checkpoint,
-        )
+        try:
+            result = await run_drift_scenario(
+                parameterize_scenario(
+                    SCENARIOS[unit.scenario_id],
+                    experiment.drift_parameters or DriftParameters(),
+                ),
+                seed=unit.seed,
+                horizon=unit.horizon,
+                condition=unit.condition,
+                action_provider=provider,
+                on_checkpoint=checkpoint,
+            )
+        except ExperimentTokenBudgetExhausted:
+            wall_ms = (time.perf_counter() - started) * 1000
+            total_tokens = telemetry.prompt_tokens + telemetry.completion_tokens
+            unit.result = {
+                "kind": WorkloadKind.STATE_DRIFT.value,
+                "termination_reason": "execution_policy_token_limit",
+                "error": "state-drift unit stopped at the experiment token cap",
+                "routing": telemetry.routing,
+            }
+            unit.evaluation = EvaluationResultRecord(
+                id=str(uuid4()),
+                workload_run_id=run.id,
+                run_unit_id=unit.id,
+                passed=None,
+                score=None,
+                metrics={"budget_exhausted": True},
+                formula_fingerprint=DRIFT_FORMULA_FINGERPRINT,
+            )
+            unit.performance = PerformanceSnapshot(
+                id=str(uuid4()),
+                workload_run_id=run.id,
+                run_unit_id=unit.id,
+                prompt_tokens=telemetry.prompt_tokens,
+                completion_tokens=telemetry.completion_tokens,
+                total_tokens=total_tokens,
+                latency_ms=wall_ms,
+                context_activation_ms=max(receipt.duration_ms, activation_ms),
+            )
+            unit.status = RunUnitStatus.UNSCORED
+            unit.completed_at = utc_now()
+            self.store.save_run_unit(unit)
+            return
         wall_ms = (time.perf_counter() - started) * 1000
         unit.result = result.model_dump(mode="json")
+        deterministic = evaluate_output(
+            experiment.evaluation_contract,
+            output="",
+            expected="",
+            benchmark_scorer=lambda _output: result.metrics.final_success,
+        )
         unit.evaluation = EvaluationResultRecord(
             id=str(uuid4()),
             workload_run_id=run.id,
             run_unit_id=unit.id,
-            passed=result.metrics.final_success,
-            score=result.metrics.area_under_state_fidelity_curve,
+            passed=deterministic.passed,
+            score=(
+                result.metrics.area_under_state_fidelity_curve
+                if deterministic.passed is not None
+                else None
+            ),
             metrics=_numeric_metrics(result),
             formula_fingerprint=DRIFT_FORMULA_FINGERPRINT,
-            deterministic=EvaluationResult(
-                deterministic_score=(result.metrics.area_under_state_fidelity_curve),
-                combined_score=result.metrics.area_under_state_fidelity_curve,
-                passed=result.metrics.final_success,
-            ),
+            deterministic=deterministic,
         )
         total_tokens = telemetry.prompt_tokens + telemetry.completion_tokens
         unit.performance = PerformanceSnapshot(
@@ -782,11 +1096,201 @@ class ExperimentService:
             unit.result["routing"] = telemetry.routing
         unit.status = (
             RunUnitStatus.PASSED
-            if result.metrics.final_success
-            else RunUnitStatus.FAILED
+            if deterministic.passed is True
+            else (
+                RunUnitStatus.FAILED
+                if deterministic.passed is False
+                else RunUnitStatus.UNSCORED
+            )
         )
         unit.completed_at = utc_now()
         self.store.save_run_unit(unit)
+
+    def _remaining_token_budget(
+        self,
+        experiment: Experiment,
+        current_unit: RunUnit,
+    ) -> int | None:
+        maximum = experiment.execution_policy.max_tokens
+        if maximum is None:
+            return None
+        prior_units = [
+            candidate
+            for candidate in self.units.values()
+            if candidate.experiment_id == experiment.id
+            and candidate.lane_id == current_unit.lane_id
+            and candidate.id != current_unit.id
+        ]
+        if any(
+            candidate.evaluation is not None
+            and candidate.evaluation.metrics.get("token_budget_exhausted") is True
+            for candidate in prior_units
+        ):
+            return 0
+        consumed = sum(
+            candidate.performance.total_tokens
+            for candidate in prior_units
+            if candidate.performance is not None
+        )
+        return maximum - consumed
+
+    def _remaining_cost_budget(
+        self,
+        experiment: Experiment,
+        current_unit: RunUnit,
+    ) -> float | None:
+        maximum = experiment.execution_policy.max_cost_usd
+        if maximum is None:
+            return None
+        prior_units = [
+            candidate
+            for candidate in self.units.values()
+            if candidate.experiment_id == experiment.id
+            and candidate.lane_id == current_unit.lane_id
+            and candidate.id != current_unit.id
+            and candidate.evaluation is not None
+        ]
+        if any(
+            candidate.evaluation is not None
+            and candidate.evaluation.metrics.get("cost_budget_exhausted") is True
+            for candidate in prior_units
+        ):
+            return 0
+        consumed = sum(
+            float(candidate.evaluation.metrics.get("budget_debit_usd") or 0)
+            for candidate in prior_units
+            if candidate.evaluation is not None
+        )
+        return max(0.0, maximum - consumed)
+
+    def _emit_trajectory_event(
+        self,
+        *,
+        experiment: Experiment,
+        lane: ExperimentLane,
+        run: WorkloadRun,
+        unit: RunUnit,
+        step: dict[str, Any],
+        state: _TrajectoryEventState,
+    ) -> None:
+        step_type = str(step.get("type") or "")
+        self._save_with_event(
+            experiment,
+            RunEventKind.TRAJECTORY_STEP,
+            phase=str(step.get("phase") or "trajectory"),
+            message=str(step.get("title") or "Agent trajectory update"),
+            lane_id=lane.id,
+            workload_run_id=run.id,
+            run_unit_id=unit.id,
+            data={"trajectory_step": step},
+        )
+        typed_kind: RunEventKind
+        typed_data: dict[str, object] = {"trajectory_step_type": step_type}
+        tool_call_id: str | None = None
+        if step_type == "tool_start":
+            candidate_id = step.get("tool_call_id")
+            if (
+                not isinstance(candidate_id, str)
+                or not candidate_id
+                or candidate_id in state.started_tool_call_ids
+            ):
+                return
+            tool_call_id = candidate_id
+            typed_kind = RunEventKind.TOOL_COMMAND_STARTED
+            typed_data["tool_call_id"] = tool_call_id
+        elif step_type == "observation":
+            candidate_id = step.get("source_call_id")
+            if (
+                not isinstance(candidate_id, str)
+                or not candidate_id
+                or candidate_id not in state.started_tool_call_ids
+                or candidate_id in state.completed_tool_call_ids
+            ):
+                return
+            tool_call_id = candidate_id
+            typed_kind = RunEventKind.TOOL_COMMAND_COMPLETED
+            typed_data.update(
+                {
+                    "tool_call_id": tool_call_id,
+                    "source_call_id": tool_call_id,
+                }
+            )
+        elif step_type == "verifier":
+            typed_kind = RunEventKind.EVALUATING
+        else:
+            return
+        self._save_with_event(
+            experiment,
+            typed_kind,
+            phase=str(step.get("phase") or "trajectory"),
+            message=str(step.get("title") or "Agent trajectory update"),
+            lane_id=lane.id,
+            workload_run_id=run.id,
+            run_unit_id=unit.id,
+            data=typed_data,
+        )
+        if typed_kind is RunEventKind.TOOL_COMMAND_STARTED:
+            assert tool_call_id is not None
+            state.started_tool_call_ids.add(tool_call_id)
+        elif typed_kind is RunEventKind.TOOL_COMMAND_COMPLETED:
+            assert tool_call_id is not None
+            state.completed_tool_call_ids.add(tool_call_id)
+
+    def _emit_inference_progress(
+        self,
+        *,
+        experiment: Experiment,
+        lane: ExperimentLane,
+        run: WorkloadRun,
+        unit: RunUnit,
+        progress: CompletionProgress,
+        state: _InferenceProgressState,
+    ) -> None:
+        if progress.completion_tokens < state.last_completion_tokens:
+            raise RuntimeError("inference progress completion tokens regressed")
+        first_current_rate = (
+            progress.current_tps is not None and not state.emitted_current_rate
+        )
+        interval_elapsed = (
+            state.last_elapsed_ms is None
+            or progress.elapsed_ms - state.last_elapsed_ms >= 250
+        )
+        if not first_current_rate and not interval_elapsed:
+            return
+        unit.performance = PerformanceSnapshot(
+            id=unit.performance.id if unit.performance is not None else str(uuid4()),
+            workload_run_id=run.id,
+            run_unit_id=unit.id,
+            prompt_tokens=progress.prompt_tokens,
+            completion_tokens=progress.completion_tokens,
+            total_tokens=progress.total_tokens,
+            latency_ms=progress.elapsed_ms,
+            tokens_per_second=progress.current_tps,
+        )
+        self.store.save_run_unit(unit)
+        self._save_with_event(
+            experiment,
+            RunEventKind.INFERENCE_PROGRESS,
+            phase="inference",
+            message=f"Generated {progress.completion_tokens} completion tokens",
+            lane_id=lane.id,
+            workload_run_id=run.id,
+            run_unit_id=unit.id,
+            data={
+                "workload_unit_id": unit.workload_unit_id,
+                "seed": unit.seed,
+                "prompt_tokens": progress.prompt_tokens,
+                "completion_tokens": progress.completion_tokens,
+                "total_tokens": progress.total_tokens,
+                "elapsed_ms": progress.elapsed_ms,
+                "current_tps": progress.current_tps,
+            },
+        )
+        state.last_elapsed_ms = progress.elapsed_ms
+        state.last_completion_tokens = progress.completion_tokens
+        state.emitted_current_rate = (
+            state.emitted_current_rate or progress.current_tps is not None
+        )
 
     def _action_provider(
         self,
@@ -795,9 +1299,15 @@ class ExperimentService:
         unit: RunUnit,
         profile: ExpertProfile | None,
         telemetry: _ProviderTelemetry,
+        generation: GenerationConfig,
+        token_budget: int | None,
         should_cancel: Callable[[], bool],
     ) -> Callable[[DriftTurnInput], Awaitable[DriftToolCall]]:
-        scenario = SCENARIOS[unit.scenario_id or ""]
+        experiment = self.experiments[unit.experiment_id]
+        scenario = parameterize_scenario(
+            SCENARIOS[unit.scenario_id or ""],
+            experiment.drift_parameters or DriftParameters(),
+        )
         plan = scenario.plan(unit.seed or 0, unit.horizon or 1)
         if self.mode == "mock":
 
@@ -829,17 +1339,27 @@ class ExperimentService:
                 run_unit_id=unit.id,
                 checkpoint=turn.checkpoint,
             )
+            messages = _drift_messages(turn)
+            max_tokens = generation.max_tokens
+            if token_budget is not None:
+                used_tokens = telemetry.prompt_tokens + telemetry.completion_tokens
+                prompt_reserve = _prompt_token_reserve(messages)
+                available_tokens = token_budget - used_tokens - prompt_reserve
+                if available_tokens <= 0:
+                    raise ExperimentTokenBudgetExhausted
+                max_tokens = min(max_tokens, available_tokens)
             completion = await self.runtime.complete_chat(
-                _drift_messages(turn),
+                messages,
                 request_key=(
                     f"drift:{unit.experiment_id}:{lane.id}:{unit.id}:{turn.checkpoint}"
                 ),
                 profile=profile,
-                generation=GenerationConfig(
-                    temperature=0,
-                    max_tokens=256,
-                    seed=(unit.seed or 0) + turn.checkpoint,
-                    enable_thinking=False,
+                generation=generation.model_copy(
+                    update={
+                        "temperature": 0,
+                        "max_tokens": max_tokens,
+                        "seed": (unit.seed or 0) + turn.checkpoint,
+                    }
                 ),
             )
             if should_cancel():
@@ -873,7 +1393,7 @@ class ExperimentService:
         self,
         experiment: Experiment,
         lane_id: str,
-    ) -> dict[str, str | float | int | bool | None]:
+    ) -> dict[str, str | float | int | bool | list[float] | None]:
         lane_units = [
             unit
             for unit in self.units.values()
@@ -898,10 +1418,11 @@ class ExperimentService:
                 "completed_units": len(lane_units),
                 "scored_units": len(scored),
             }
+        lane_units = [unit for unit in self.units.values() if unit.lane_id == lane_id]
         results = [
-            _drift_result(unit)
-            for unit in self.units.values()
-            if unit.lane_id == lane_id and unit.result is not None
+            result
+            for unit in lane_units
+            if (result := _drift_result_or_none(unit)) is not None
         ]
         by_horizon: dict[int, list[bool]] = defaultdict(list)
         for result in results:
@@ -916,8 +1437,35 @@ class ExperimentService:
             "final_success_rate": _mean_or_zero(
                 [float(result.metrics.final_success) for result in results]
             ),
+            "mean_recovery_rate": _mean_or_zero(
+                [result.metrics.recovery_rate for result in results]
+            ),
+            "mean_invariant_violations": _mean_or_zero(
+                [float(result.metrics.invariant_violations) for result in results]
+            ),
+            "mean_invalid_tool_calls": _mean_or_zero(
+                [float(result.metrics.invalid_tool_calls) for result in results]
+            ),
+            "mean_collateral_mutations": _mean_or_zero(
+                [float(result.metrics.collateral_mutations) for result in results]
+            ),
+            "mean_rollback_correctness": _mean_optional(
+                [result.metrics.rollback_correctness for result in results]
+            ),
+            "mean_divergence_growth_slope": _mean_or_zero(
+                [result.metrics.divergence_growth_slope for result in results]
+            ),
+            "mean_survival_curve": _mean_curve(
+                [result.metrics.survival_curve for result in results]
+            ),
+            "mean_state_fidelity_curve": _mean_curve(
+                [result.metrics.state_fidelity for result in results]
+            ),
             "horizon_at_80_percent_reliability": reliability_horizon(by_horizon, 0.8),
             "horizon_at_50_percent_reliability": reliability_horizon(by_horizon, 0.5),
+            "completed_units": len(lane_units),
+            "scored_units": len(results),
+            "incomplete_units": len(lane_units) - len(results),
             "formula_fingerprint": DRIFT_FORMULA_FINGERPRINT,
         }
 
@@ -936,18 +1484,20 @@ class ExperimentService:
         )
         if experiment.workload.kind is not WorkloadKind.STATE_DRIFT:
             baseline_units = {
-                unit.seed: unit
+                (unit.workload_unit_id, unit.seed): unit
                 for unit in self.units.values()
                 if unit.lane_id == baseline.id and unit.evaluation is not None
             }
             candidate_units = {
-                unit.seed: unit
+                (unit.workload_unit_id, unit.seed): unit
                 for unit in self.units.values()
                 if unit.lane_id == candidate.id and unit.evaluation is not None
             }
             if baseline_units.keys() != candidate_units.keys():
                 raise RuntimeError("paired experiment lanes are not aligned")
             score_deltas = []
+            scored_pairs = 0
+            unscored_pairs = 0
             pass_changes = {
                 "regressions": 0,
                 "recoveries": 0,
@@ -970,6 +1520,10 @@ class ExperimentService:
                     baseline_evaluation.passed,
                     candidate_evaluation.passed,
                 )
+                if None in pair:
+                    unscored_pairs += 1
+                    continue
+                scored_pairs += 1
                 if pair == (True, False):
                     pass_changes["regressions"] += 1
                 elif pair == (False, True):
@@ -979,14 +1533,15 @@ class ExperimentService:
                 elif pair == (False, False):
                     pass_changes["retained_failures"] += 1
             return {
-                "paired_observations": len(baseline_units),
+                "paired_observations": scored_pairs,
+                "aligned_pairs": len(baseline_units),
+                "unscored_pairs": unscored_pairs,
                 "mean_score_delta": (mean(score_deltas) if score_deltas else None),
                 **pass_changes,
             }
         baseline_units = self._results_by_alignment(baseline.id)
         candidate_units = self._results_by_alignment(candidate.id)
-        if baseline_units.keys() != candidate_units.keys():
-            raise RuntimeError("paired experiment lanes are not aligned")
+        aligned_keys = baseline_units.keys() & candidate_units.keys()
         baseline_local = _condition_mean(
             baseline_units.values(), DriftCondition.ORACLE_RESET
         )
@@ -1004,7 +1559,7 @@ class ExperimentService:
         paired_deltas = [
             candidate_units[key].metrics.area_under_state_fidelity_curve
             - baseline_units[key].metrics.area_under_state_fidelity_curve
-            for key in baseline_units
+            for key in aligned_keys
         ]
         baseline_divergence = [
             result.metrics.first_divergence_checkpoint
@@ -1027,6 +1582,12 @@ class ExperimentService:
         return {
             "formula_fingerprint": DRIFT_FORMULA_FINGERPRINT,
             "paired_observations": len(paired_deltas),
+            "incomplete_baseline_observations": len(
+                baseline_units.keys() - aligned_keys
+            ),
+            "incomplete_candidate_observations": len(
+                candidate_units.keys() - aligned_keys
+            ),
             "baseline_local_competence": baseline_local,
             "candidate_local_competence": candidate_local,
             "local_capability_delta": _optional_difference(
@@ -1088,6 +1649,14 @@ class ExperimentService:
                     baseline_record,
                     candidate_record,
                 )
+                baseline_counts = _flatten_numeric(
+                    baseline_record.get("selection_counts")
+                )
+                candidate_counts = _flatten_numeric(
+                    candidate_record.get("selection_counts")
+                )
+                baseline_mass = _flatten_numeric(baseline_record.get("routing_mass"))
+                candidate_mass = _flatten_numeric(candidate_record.get("routing_mass"))
                 pairs.append(
                     {
                         "scenario_id": alignment[0],
@@ -1100,6 +1669,16 @@ class ExperimentService:
                         ),
                         "selection_overlap": selection_overlap,
                         "routing_mass_js_divergence": mass_divergence,
+                        "baseline_selection_count": sum(baseline_counts),
+                        "candidate_selection_count": sum(candidate_counts),
+                        "selection_count_delta": (
+                            sum(candidate_counts) - sum(baseline_counts)
+                        ),
+                        "baseline_routing_mass": sum(baseline_mass),
+                        "candidate_routing_mass": sum(candidate_mass),
+                        "routing_mass_delta": (
+                            sum(candidate_mass) - sum(baseline_mass)
+                        ),
                         "largest_selection_shifts": _largest_routing_shifts(
                             baseline_record,
                             candidate_record,
@@ -1115,7 +1694,9 @@ class ExperimentService:
         for unit in self.units.values():
             if unit.lane_id != lane_id or unit.result is None:
                 continue
-            result = _drift_result(unit)
+            result = _drift_result_or_none(unit)
+            if result is None:
+                continue
             aligned[
                 (
                     result.scenario_id,
@@ -1138,6 +1719,7 @@ class ExperimentService:
                 or unit.condition is None
                 or unit.horizon is None
                 or unit.seed is None
+                or _drift_result_or_none(unit) is None
             ):
                 continue
             aligned[(unit.scenario_id, unit.condition, unit.horizon, unit.seed)] = unit
@@ -1247,6 +1829,89 @@ def _perturb_call(expected: DriftToolCall) -> DriftToolCall:
     return DriftToolCall(tool=expected.tool, arguments=arguments)
 
 
+def _selected_workload_unit_ids(
+    request: CreateExperimentRequest,
+    descriptor: WorkloadDescriptor,
+) -> list[str]:
+    available = descriptor.unit_ids
+    if not available:
+        raise ValueError("workload descriptor does not expose executable units")
+    selected = request.workload_unit_ids or available
+    if len(selected) > MAX_SELECTED_WORKLOAD_UNITS:
+        raise ValueError(
+            "workload selection exceeds the maximum of "
+            f"{MAX_SELECTED_WORKLOAD_UNITS:,} units"
+        )
+    unknown = set(selected) - set(available)
+    if unknown:
+        raise ValueError(f"unknown workload units: {sorted(unknown)}")
+    return list(selected)
+
+
+def _expanded_experiment_run_unit_count(
+    request: CreateExperimentRequest,
+    descriptor: WorkloadDescriptor,
+) -> int:
+    if descriptor.kind is WorkloadKind.STATE_DRIFT:
+        units_per_lane = (
+            len(request.scenario_ids)
+            * len(request.conditions)
+            * len(request.horizons)
+            * len(request.seeds)
+        )
+    else:
+        units_per_lane = len(_selected_workload_unit_ids(request, descriptor)) * len(
+            request.seeds
+        )
+    lane_count = 2 if request.candidate_profile_id is not None else 1
+    expanded_units = units_per_lane * lane_count
+    if expanded_units > MAX_EXPERIMENT_RUN_UNITS:
+        raise ValueError(
+            "expanded experiment exceeds the maximum of "
+            f"{MAX_EXPERIMENT_RUN_UNITS:,} run units "
+            f"({expanded_units:,} requested)"
+        )
+    return expanded_units
+
+
+def _default_experiment_contract(
+    descriptor: WorkloadDescriptor,
+) -> EvaluationContract:
+    if descriptor.kind is WorkloadKind.CODING:
+        name = "Trusted task-pack verifier"
+        description = (
+            "The protected task verifier runs inside the isolated sandbox and "
+            "determines success."
+        )
+        label = "Trusted task verifier"
+    elif descriptor.kind is WorkloadKind.STATE_DRIFT:
+        name = "Exact canonical state"
+        description = (
+            "Deterministic reducers compare every hidden canonical checkpoint with "
+            "the isolated lane state."
+        )
+        label = "Canonical state fidelity"
+    else:
+        name = "Pinned dataset scorer"
+        description = (
+            "Each selected item uses the benchmark adapter's immutable deterministic "
+            "scorer and reference data."
+        )
+        label = "Dataset correctness"
+    return EvaluationContract(
+        name=name,
+        description=description,
+        criteria=[
+            EvaluationCriterion(
+                id="workload-correctness",
+                label=label,
+                description=description,
+                kind=DeterministicScorerKind.BENCHMARK_DEFAULT,
+            )
+        ],
+    )
+
+
 def _drift_messages(turn: DriftTurnInput) -> list[dict[str, str]]:
     system = (
         "You operate a deterministic state store. Reply with exactly one JSON "
@@ -1265,6 +1930,11 @@ def _drift_messages(turn: DriftTurnInput) -> list[dict[str, str]]:
             "content": json.dumps(payload, sort_keys=True, separators=(",", ":")),
         },
     ]
+
+
+def _prompt_token_reserve(messages: list[dict[str, str]]) -> int:
+    serialized = json.dumps(messages, sort_keys=True, separators=(",", ":"))
+    return len(serialized) + 32
 
 
 def _parse_tool_call(content: str) -> DriftToolCall:
@@ -1468,6 +2138,15 @@ def _drift_result(unit: RunUnit) -> DriftRunResult:
     return DriftRunResult.model_validate(unit.result)
 
 
+def _drift_result_or_none(unit: RunUnit) -> DriftRunResult | None:
+    if not isinstance(unit.result, dict) or "metrics" not in unit.result:
+        return None
+    try:
+        return _drift_result(unit)
+    except (TypeError, ValueError):
+        return None
+
+
 def _condition_mean(results: Any, condition: DriftCondition) -> float | None:
     values = [
         result.metrics.area_under_state_fidelity_curve
@@ -1487,3 +2166,17 @@ def _optional_difference(
 
 def _mean_or_zero(values: list[float]) -> float:
     return mean(values) if values else 0.0
+
+
+def _mean_optional(values: list[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return mean(present) if present else None
+
+
+def _mean_curve(curves: list[list[float]]) -> list[float]:
+    if not curves:
+        return []
+    return [
+        mean(curve[index] for curve in curves if index < len(curve))
+        for index in range(max(len(curve) for curve in curves))
+    ]

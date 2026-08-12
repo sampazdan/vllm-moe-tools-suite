@@ -10,6 +10,7 @@ from moe_tools_suite.domain import (
     CreateExpertProfileRequest,
     CreateModelSessionRequest,
     ExpertProfile,
+    JobPhaseRecord,
     JobStatus,
     ModelLoadPhase,
     ModelRegistryEntry,
@@ -24,6 +25,7 @@ from moe_tools_suite.driftbench import (
     SCENARIOS,
     DriftToolCall,
     exact_state_distance,
+    parameterize_scenario,
     reliability_horizon,
     run_drift_scenario,
 )
@@ -40,14 +42,16 @@ from moe_tools_suite.profiles import (
     expert_profile_fingerprint,
     legacy_profile_fingerprint,
 )
-from moe_tools_suite.runtime import MockModelRuntime, VllmRuntime
+from moe_tools_suite.runtime import CompletionProgress, MockModelRuntime, VllmRuntime
 from moe_tools_suite.settings import Settings
 from moe_tools_suite.telemetry import encode_npy
 from moe_tools_suite.v2_domain import (
     ContextActivationResult,
     CreateExperimentRequest,
     DriftCondition,
+    DriftParameters,
     EvaluationResultRecord,
+    Experiment,
     ExperimentStatus,
     InterventionContextRef,
     InterventionKind,
@@ -298,13 +302,35 @@ def test_model_load_exposes_durable_app_observed_phases(tmp_path: Path) -> None:
 
     job = client.get(f"/api/jobs/{response.json()['id']}").json()
     assert job["status"] == "completed"
-    assert [record["phase"] for record in job["phase_history"]] == [
+    observed = [
+        record
+        for record in job["phase_history"]
+        if record["observability"] == "observed"
+    ]
+    assert [record["phase"] for record in observed] == [
         "queued",
         "resolving_model",
         "configuring_runtime",
         "ready",
     ]
-    assert all(record["status"] == "completed" for record in job["phase_history"])
+    assert all(record["status"] == "completed" for record in observed)
+    unavailable = [
+        record
+        for record in job["phase_history"]
+        if record["observability"] == "unavailable"
+    ]
+    assert [record["phase"] for record in unavailable] == [
+        "checking_cache",
+        "downloading",
+        "loading_weights",
+        "initializing_distributed_workers",
+        "compiling",
+        "capturing_graphs",
+        "warming",
+    ]
+    assert all(record["status"] == "unavailable" for record in unavailable)
+    assert all(record["bytes_current"] is None for record in unavailable)
+    assert all(record["files_current"] is None for record in unavailable)
     restarted = TestClient(create_app(settings))
     restored = restarted.get(f"/api/jobs/{job['id']}").json()
     assert restored["phase_history"] == job["phase_history"]
@@ -963,9 +989,15 @@ def test_workload_library_is_task_level_and_fail_closed(tmp_path: Path) -> None:
     assert workloads.status_code == 200
     records = workloads.json()
     coding = [record for record in records if record["kind"] == "coding"]
+    coding_tasks = [record for record in coding if record["task_id"] is not None]
+    coding_cohorts = [record for record in coding if record["task_id"] is None]
     drift = next(record for record in records if record["id"] == "state-drift-v1")
     assert coding
-    assert all(record["task_id"] for record in coding)
+    assert coding_tasks
+    assert coding_cohorts
+    assert all(record["task_id"] for record in coding_tasks)
+    assert all(record["unit_ids"] for record in coding_cohorts)
+    assert any(len(record["unit_ids"]) > 1 for record in coding_cohorts)
     assert all("tools" in record and "runtime" in record for record in coding)
     unsupported = next(
         record
@@ -1006,6 +1038,8 @@ def test_answer_workload_uses_common_paired_experiment_layer(tmp_path: Path) -> 
     assert detail["experiment"]["total_units"] == 2
     assert detail["experiment"]["comparison"] == {
         "paired_observations": 1,
+        "aligned_pairs": 1,
+        "unscored_pairs": 0,
         "mean_score_delta": 0.0,
         "regressions": 0,
         "recoveries": 0,
@@ -1031,6 +1065,500 @@ def test_answer_workload_uses_common_paired_experiment_layer(tmp_path: Path) -> 
     ]
     assert sum(event["kind"] == "context_switched" for event in events) == 2
     assert sum(event["kind"] == "model_request_completed" for event in events) == 2
+
+
+@pytest.mark.asyncio
+async def test_answer_inference_progress_is_durable_before_completion(
+    tmp_path: Path,
+) -> None:
+    class BlockingProgressRuntime:
+        def __init__(self, delegate: MockModelRuntime) -> None:
+            self.delegate = delegate
+            self.progressed = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def complete(self, *args, on_progress=None, **kwargs):
+            assert on_progress is not None
+            on_progress(
+                CompletionProgress(
+                    prompt_tokens=8,
+                    completion_tokens=2,
+                    total_tokens=10,
+                    elapsed_ms=125,
+                    current_tps=16,
+                )
+            )
+            self.progressed.set()
+            await self.release.wait()
+            return await self.delegate.complete(*args, **kwargs)
+
+        async def aclose(self) -> None:
+            return None
+
+    lab = ResearchLab(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
+    )
+    runtime: BlockingProgressRuntime | None = None
+    try:
+        await lab.create_model_session(CreateModelSessionRequest(model_id=MODEL_ID))
+        assert isinstance(lab.runtime, MockModelRuntime)
+        runtime = BlockingProgressRuntime(lab.runtime)
+        lab.runtime = runtime  # type: ignore[assignment]
+        experiment = lab.submit_experiment(
+            CreateExperimentRequest(
+                model_id=MODEL_ID,
+                workload_id="answer:fixture-arithmetic:arith-03",
+                seeds=[0],
+            )
+        )
+        execution = asyncio.create_task(lab.execute_job(experiment.job_id))
+        await asyncio.wait_for(runtime.progressed.wait(), timeout=1)
+
+        detail = lab.get_experiment(experiment.id)
+        running = detail.units[0]
+        assert running.status is RunUnitStatus.RUNNING
+        assert running.performance is not None
+        assert running.performance.prompt_tokens == 8
+        assert running.performance.completion_tokens == 2
+        assert running.performance.tokens_per_second == 16
+        persisted = lab.store.load_run_units()[running.id]
+        assert persisted.performance is not None
+        assert persisted.performance.tokens_per_second == 16
+        progress_events = [
+            event
+            for event in lab.get_experiment_events(experiment.id).events
+            if event.kind is RunEventKind.INFERENCE_PROGRESS
+        ]
+        assert len(progress_events) == 1
+        assert progress_events[0].data["current_tps"] == 16
+        assert progress_events[0].data["completion_tokens"] == 2
+        replay = lab.get_experiment_events(
+            experiment.id, after=progress_events[0].sequence - 1
+        )
+        assert replay.events[0].kind is RunEventKind.INFERENCE_PROGRESS
+        assert replay.events[0].data["current_tps"] == 16
+
+        runtime.release.set()
+        await execution
+        completed = lab.get_experiment(experiment.id).units[0]
+        assert completed.status is RunUnitStatus.PASSED
+        assert completed.result is not None
+        assert completed.result["output"] == "19"
+        assert completed.result["routing"]["total_routed_slots"] > 0
+    finally:
+        if runtime is not None:
+            runtime.release.set()
+        await lab.shutdown()
+
+
+def test_answer_cohort_persists_selected_units_and_contracts(tmp_path: Path) -> None:
+    client, _lab = _client(tmp_path)
+    _load_model(client)
+
+    created = client.post(
+        "/api/experiments",
+        json={
+            "name": "Selected answer cohort",
+            "model_id": MODEL_ID,
+            "workload_id": "answer:fixture-arithmetic",
+            "workload_unit_ids": ["arith-03", "arith-04"],
+            "seeds": [5],
+            "generation": {
+                "temperature": 0,
+                "max_tokens": 32,
+                "seed": 5,
+                "enable_thinking": False,
+            },
+            "execution_policy": {
+                "attempts": 1,
+                "concurrency": 1,
+                "timeout_seconds": 60,
+                "per_item_timeout_seconds": 10,
+                "max_tokens": 10000,
+            },
+        },
+    )
+
+    assert created.status_code == 202
+    detail = client.get(f"/api/experiments/{created.json()['id']}").json()
+    experiment = detail["experiment"]
+    assert experiment["status"] == "completed"
+    assert experiment["total_units"] == 2
+    assert len(experiment["cohort_fingerprint"]) == 64
+    assert experiment["generation"]["max_tokens"] == 32
+    assert experiment["execution_policy"]["max_tokens"] == 10000
+    assert len(experiment["evaluation_contract"]["fingerprint"]) == 64
+    assert [unit["workload_unit_id"] for unit in detail["units"]] == [
+        "arith-03",
+        "arith-04",
+    ]
+    assert [unit["result"]["output"] for unit in detail["units"]] == ["19", "23"]
+    assert all(
+        unit["result"]["evaluation_contract_fingerprint"]
+        == experiment["evaluation_contract"]["fingerprint"]
+        for unit in detail["units"]
+    )
+    events = client.get(f"/api/experiments/{experiment['id']}/events").json()["events"]
+    current = [event for event in events if event["kind"] == "current_unit"]
+    assert [event["data"]["workload_unit_id"] for event in current] == [
+        "arith-03",
+        "arith-04",
+    ]
+    assert sum(event["kind"] == "evaluating" for event in events) == 2
+
+
+def test_answer_cohort_rejects_unknown_or_nondeterministic_contracts(
+    tmp_path: Path,
+) -> None:
+    client, _lab = _client(tmp_path)
+    _load_model(client)
+    base = {
+        "model_id": MODEL_ID,
+        "workload_id": "answer:fixture-arithmetic",
+        "seeds": [0],
+    }
+
+    unknown = client.post(
+        "/api/experiments",
+        json={**base, "workload_unit_ids": ["not-an-item"]},
+    )
+    stochastic = client.post(
+        "/api/experiments",
+        json={
+            **base,
+            "generation": {
+                "temperature": 0.5,
+                "max_tokens": 32,
+                "seed": 0,
+                "enable_thinking": False,
+            },
+        },
+    )
+
+    assert unknown.status_code == 422
+    assert "unknown workload units" in unknown.text
+    assert stochastic.status_code == 422
+    assert "temperature=0" in stochastic.text
+
+
+def test_answer_cohort_rejects_oversized_descriptor_default_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, lab = _client(tmp_path)
+    _load_model(client)
+    descriptor = lab.get_workload_descriptor("answer:fixture-arithmetic").model_copy(
+        update={
+            "id": "answer:oversized-fixture",
+            "unit_ids": [f"oversized-{index}" for index in range(10_001)],
+        }
+    )
+    monkeypatch.setattr(lab, "get_workload_descriptor", lambda _workload_id: descriptor)
+    jobs_before = set(lab.jobs)
+
+    response = client.post(
+        "/api/experiments",
+        json={
+            "model_id": MODEL_ID,
+            "workload_id": descriptor.id,
+            "seeds": [0],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "maximum of 10,000 units" in response.text
+    assert set(lab.jobs) == jobs_before
+
+
+def test_expanded_answer_cohort_enforces_run_unit_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, lab = _client(tmp_path)
+    _load_model(client)
+    profile = _profile(lab)
+    unit_ids = [f"expanded-{index}" for index in range(251)]
+    descriptor = lab.get_workload_descriptor("answer:fixture-arithmetic").model_copy(
+        update={"id": "answer:expanded-fixture", "unit_ids": unit_ids}
+    )
+    monkeypatch.setattr(lab, "get_workload_descriptor", lambda _workload_id: descriptor)
+    boundary = CreateExperimentRequest(
+        model_id=MODEL_ID,
+        workload_id=descriptor.id,
+        workload_unit_ids=unit_ids[:250],
+        candidate_profile_id=profile.id,
+        seeds=list(range(20)),
+    )
+
+    assert lab.experiments.validate_request(boundary, descriptor) == 10_000
+
+    jobs_before = set(lab.jobs)
+    over_limit = boundary.model_copy(update={"workload_unit_ids": unit_ids})
+    with pytest.raises(ValueError, match="10,040 requested"):
+        lab.submit_experiment(over_limit)
+    assert set(lab.jobs) == jobs_before
+
+
+def test_expanded_drift_dimensions_fail_before_job_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, lab = _client(tmp_path)
+    _load_model(client)
+    profile = _profile(lab)
+    descriptor = lab.get_workload_descriptor("state-drift-v1")
+    scenario = next(iter(SCENARIOS.values()))
+    scenario_ids = [f"synthetic-drift-{index}" for index in range(20)]
+    for scenario_id in scenario_ids:
+        monkeypatch.setitem(SCENARIOS, scenario_id, scenario)
+    single_lane = CreateExperimentRequest(
+        model_id=MODEL_ID,
+        workload_id=descriptor.id,
+        scenario_ids=scenario_ids,
+        conditions=list(DriftCondition),
+        horizons=[2, 4, 8, 12, 16, 24],
+        seeds=list(range(20)),
+    )
+
+    assert lab.experiments.validate_request(single_lane, descriptor) == 7_200
+
+    jobs_before = set(lab.jobs)
+    over_limit = single_lane.model_copy(update={"candidate_profile_id": profile.id})
+    with pytest.raises(ValueError, match="14,400 requested"):
+        lab.submit_experiment(over_limit)
+    assert set(lab.jobs) == jobs_before
+
+
+def test_v2_judge_requires_and_honors_an_explicit_priced_cost_cap(
+    tmp_path: Path,
+) -> None:
+    client, _lab = _client(tmp_path)
+    _load_model(client)
+    contract = {
+        "name": "Capped qualitative judge",
+        "criteria": [{"id": "exact", "label": "Exact"}],
+        "judge": {
+            "provider": "fake",
+            "model": "deterministic-fake-judge-v1",
+            "rubric": "Judge correctness.",
+            "input_cost_per_million_usd": 1,
+            "output_cost_per_million_usd": 1,
+        },
+        "judge_weight": 0.5,
+    }
+    payload = {
+        "model_id": MODEL_ID,
+        "workload_id": "answer:fixture-arithmetic",
+        "workload_unit_ids": ["arith-03", "arith-04"],
+        "evaluation_contract": contract,
+        "seeds": [0],
+    }
+
+    uncapped = client.post("/api/experiments", json=payload)
+    capped = client.post(
+        "/api/experiments",
+        json={
+            **payload,
+            "execution_policy": {
+                "attempts": 1,
+                "concurrency": 1,
+                "timeout_seconds": 60,
+                "per_item_timeout_seconds": 10,
+                "max_cost_usd": 0.000000001,
+            },
+        },
+    )
+
+    assert uncapped.status_code == 422
+    assert "explicit max_cost_usd" in uncapped.text
+    assert capped.status_code == 202
+    detail = client.get(f"/api/experiments/{capped.json()['id']}").json()
+    assert {unit["status"] for unit in detail["units"]} == {"unscored"}
+    assert all(
+        unit["evaluation"]["metrics"]["cost_budget_exhausted"] is True
+        for unit in detail["units"]
+    )
+
+
+def test_record_only_contract_makes_answer_cohort_unscored(tmp_path: Path) -> None:
+    client, _lab = _client(tmp_path)
+    _load_model(client)
+    created = client.post(
+        "/api/experiments",
+        json={
+            "name": "Record-only answer",
+            "model_id": MODEL_ID,
+            "workload_id": "answer:fixture-arithmetic",
+            "workload_unit_ids": ["arith-03", "arith-04"],
+            "evaluation_contract": {
+                "name": "Record only",
+                "criteria": [
+                    {
+                        "id": "recorded-output",
+                        "label": "Recorded output",
+                        "kind": "ungraded",
+                        "required": False,
+                    }
+                ],
+            },
+            "seeds": [0],
+        },
+    )
+
+    assert created.status_code == 202
+    detail = client.get(f"/api/experiments/{created.json()['id']}").json()
+    assert detail["experiment"]["completed_units"] == 2
+    assert detail["experiment"]["passed_units"] == 0
+    assert {unit["status"] for unit in detail["units"]} == {"unscored"}
+    assert all(unit["evaluation"]["passed"] is None for unit in detail["units"])
+
+
+def test_answer_cohort_token_cap_stops_future_units_without_false_failure(
+    tmp_path: Path,
+) -> None:
+    client, _lab = _client(tmp_path)
+    _load_model(client)
+    created = client.post(
+        "/api/experiments",
+        json={
+            "name": "Token-capped answer",
+            "model_id": MODEL_ID,
+            "workload_id": "answer:fixture-arithmetic",
+            "workload_unit_ids": ["arith-03", "arith-04"],
+            "execution_policy": {
+                "attempts": 1,
+                "concurrency": 1,
+                "timeout_seconds": 60,
+                "per_item_timeout_seconds": 10,
+                "max_tokens": 1,
+            },
+            "seeds": [0],
+        },
+    )
+
+    assert created.status_code == 202
+    detail = client.get(f"/api/experiments/{created.json()['id']}").json()
+    assert detail["experiment"]["status"] == "completed"
+    assert detail["experiment"]["passed_units"] == 0
+    assert {unit["status"] for unit in detail["units"]} == {"unscored"}
+    assert all(
+        unit["evaluation"]["metrics"]["budget_exhausted"] is True
+        for unit in detail["units"]
+    )
+
+
+def test_paired_unscored_units_are_not_reported_as_observations(
+    tmp_path: Path,
+) -> None:
+    client, lab = _client(tmp_path)
+    _load_model(client)
+    profile = _profile(lab)
+    created = client.post(
+        "/api/experiments",
+        json={
+            "model_id": MODEL_ID,
+            "workload_id": "answer:fixture-arithmetic",
+            "workload_unit_ids": ["arith-03", "arith-04"],
+            "candidate_profile_id": profile.id,
+            "execution_policy": {
+                "attempts": 1,
+                "concurrency": 1,
+                "timeout_seconds": 60,
+                "per_item_timeout_seconds": 10,
+                "max_tokens": 1,
+            },
+            "seeds": [0],
+        },
+    )
+
+    assert created.status_code == 202
+    comparison = client.get(f"/api/experiments/{created.json()['id']}").json()[
+        "experiment"
+    ]["comparison"]
+    assert comparison["aligned_pairs"] == 2
+    assert comparison["paired_observations"] == 0
+    assert comparison["unscored_pairs"] == 2
+
+
+@pytest.mark.asyncio
+async def test_coding_prompt_starvation_is_unscored_and_skips_verifier(
+    tmp_path: Path,
+) -> None:
+    lab = ResearchLab(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
+    )
+    try:
+        await lab.create_model_session(CreateModelSessionRequest(model_id=MODEL_ID))
+        experiment = lab.submit_experiment(
+            CreateExperimentRequest(
+                model_id=MODEL_ID,
+                workload_id="coding:smoke-python-v1",
+                workload_unit_ids=["fix-subtract", "implement-slugify"],
+                sandbox_provider_id="fake",
+                execution_policy={
+                    "attempts": 1,
+                    "concurrency": 1,
+                    "timeout_seconds": 60,
+                    "per_item_timeout_seconds": 10,
+                    "max_tokens": 1,
+                    "max_turns": 2,
+                    "max_commands": 2,
+                },
+                seeds=[0],
+            )
+        )
+        await lab.execute_job(experiment.job_id)
+
+        detail = lab.get_experiment(experiment.id)
+        assert {unit.status for unit in detail.units} == {RunUnitStatus.UNSCORED}
+        first_trial = next(iter(lab.agentic.trials.values()))
+        assert first_trial.termination_cause == "token_limit"
+        assert first_trial.verifier is None
+        assert len(lab.agentic.trials) == 1
+    finally:
+        await lab.shutdown()
+
+
+def test_legacy_experiment_contract_and_phase_provenance_stay_unknown(
+    tmp_path: Path,
+) -> None:
+    client, lab = _client(tmp_path)
+    _load_model(client)
+    created = client.post(
+        "/api/experiments",
+        json={
+            "model_id": MODEL_ID,
+            "workload_id": "answer:fixture-arithmetic:arith-03",
+            "seeds": [0],
+        },
+    ).json()
+    current = lab.experiments.get(created["id"])
+    legacy_payload = current.model_dump(
+        mode="json",
+        exclude={
+            "contract_provenance",
+            "generation",
+            "evaluation_contract",
+            "execution_policy",
+        },
+    )
+
+    restored = Experiment.model_validate(legacy_payload)
+    legacy_phase = JobPhaseRecord.model_validate({"phase": "queued"})
+
+    assert restored.contract_provenance == "legacy_unknown"
+    assert restored.generation is None
+    assert restored.evaluation_contract is None
+    assert restored.execution_policy is None
+    assert legacy_phase.source == "legacy_unknown"
 
 
 def test_ungraded_answer_completes_without_counting_a_pass(tmp_path: Path) -> None:
@@ -1351,6 +1879,211 @@ async def test_coding_experiment_cancellation_cleans_active_sandbox(
         agent_run = next(iter(lab.agentic.runs.values()))
         assert agent_run.job_id == experiment.job_id
         assert agent_run.status == "cancelled"
+    finally:
+        await lab.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_coding_tool_events_are_ordered_correlated_and_truthfully_typed(
+    tmp_path: Path,
+) -> None:
+    class BlockingExecProvider(FakeSandboxProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.command_started = asyncio.Event()
+            self.release_command = asyncio.Event()
+
+        async def exec(self, *args, **kwargs):
+            self.command_started.set()
+            await self.release_command.wait()
+            result = await super().exec(*args, **kwargs)
+            return result.model_copy(update={"stderr": "correlated stderr"})
+
+    lab = ResearchLab(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
+    )
+    try:
+        await lab.create_model_session(CreateModelSessionRequest(model_id=MODEL_ID))
+        provider = BlockingExecProvider()
+        lab.agentic.providers["fake"] = provider
+        experiment = lab.submit_experiment(
+            CreateExperimentRequest(
+                model_id=MODEL_ID,
+                workload_id="coding:smoke-python-v1:fix-subtract",
+                sandbox_provider_id="fake",
+                seeds=[0],
+            )
+        )
+
+        execution = asyncio.create_task(lab.execute_job(experiment.job_id))
+        await asyncio.wait_for(provider.command_started.wait(), timeout=1)
+        events_while_running = lab.get_experiment_events(experiment.id).events
+        starts_while_running = [
+            event
+            for event in events_while_running
+            if event.kind is RunEventKind.TOOL_COMMAND_STARTED
+        ]
+        assert len(starts_while_running) == 1
+        tool_call_id = starts_while_running[0].data["tool_call_id"]
+        assert isinstance(tool_call_id, str) and tool_call_id
+        assert not any(
+            event.kind is RunEventKind.TOOL_COMMAND_COMPLETED
+            for event in events_while_running
+        )
+
+        provider.release_command.set()
+        await execution
+        events = lab.get_experiment_events(experiment.id).events
+        starts = [
+            event for event in events if event.kind is RunEventKind.TOOL_COMMAND_STARTED
+        ]
+        completions = [
+            event
+            for event in events
+            if event.kind is RunEventKind.TOOL_COMMAND_COMPLETED
+        ]
+        verifier_evaluations = [
+            event
+            for event in events
+            if event.kind is RunEventKind.EVALUATING
+            and event.data.get("trajectory_step_type") == "verifier"
+        ]
+        assert len(starts) == len(completions) == len(verifier_evaluations) == 1
+        assert starts[0].data == {
+            "trajectory_step_type": "tool_start",
+            "tool_call_id": tool_call_id,
+        }
+        assert completions[0].data == {
+            "trajectory_step_type": "observation",
+            "tool_call_id": tool_call_id,
+            "source_call_id": tool_call_id,
+        }
+        assert starts[0].sequence < completions[0].sequence
+        assert completions[0].sequence < verifier_evaluations[0].sequence
+        assert not any(
+            event.kind is RunEventKind.TOOL_COMMAND_COMPLETED
+            and event.data.get("trajectory_step_type") == "verifier"
+            for event in events
+        )
+
+        trajectory_steps = [
+            event.data["trajectory_step"]
+            for event in events
+            if event.kind is RunEventKind.TRAJECTORY_STEP
+        ]
+        tool_steps = [step for step in trajectory_steps if step["type"] == "tool"]
+        observations = [
+            step for step in trajectory_steps if step["type"] == "observation"
+        ]
+        assert {step["tool_call_id"] for step in tool_steps} == {tool_call_id}
+        assert {step["source_call_id"] for step in observations} == {tool_call_id}
+        assert len(observations) == 2
+    finally:
+        await lab.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_coding_cost_cap_debits_only_conservative_judge_cost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lab = ResearchLab(
+        Settings(
+            mode="mock",
+            data_dir=tmp_path / "data",
+            frontend_dist=tmp_path / "missing-frontend",
+        )
+    )
+    try:
+        await lab.create_model_session(CreateModelSessionRequest(model_id=MODEL_ID))
+        original_infer = lab.agentic.gateway.infer
+
+        async def priced_infer(**kwargs):
+            result = await original_infer(**kwargs)
+            return type(result)(
+                content=result.content,
+                reasoning=result.reasoning,
+                inference=result.inference.model_copy(
+                    update={"estimated_cost_usd": 10.0}
+                ),
+                routing=result.routing,
+                aggregated=result.aggregated,
+            )
+
+        monkeypatch.setattr(lab.agentic.gateway, "infer", priced_infer)
+        original_evaluate = lab.judges.evaluate
+        remaining_caps: list[float | None] = []
+        upper_bounds: list[float] = []
+
+        async def uncertain_judge(request, **kwargs):
+            remaining_caps.append(kwargs.get("max_incurred_cost_usd"))
+            result = await original_evaluate(request, **kwargs)
+            result = result.model_copy(
+                update={
+                    "usage": result.usage.model_copy(
+                        update={
+                            "input_tokens": None,
+                            "output_tokens": None,
+                            "total_tokens": None,
+                            "estimated_cost_usd": None,
+                            "incurred_cost_usd": None,
+                        }
+                    )
+                }
+            )
+            assert result.usage.cost_upper_bound_usd is not None
+            upper_bounds.append(result.usage.cost_upper_bound_usd)
+            return result
+
+        monkeypatch.setattr(lab.judges, "evaluate", uncertain_judge)
+        maximum_cost = 1.0
+        experiment = lab.submit_experiment(
+            CreateExperimentRequest(
+                model_id=MODEL_ID,
+                workload_id="coding:smoke-python-v1",
+                workload_unit_ids=["fix-subtract", "implement-slugify"],
+                sandbox_provider_id="fake",
+                evaluation_contract={
+                    "name": "Priced coding judge",
+                    "criteria": [
+                        {
+                            "id": "trusted_verifier",
+                            "label": "Trusted task verifier",
+                        }
+                    ],
+                    "judge": {
+                        "provider": "fake",
+                        "model": "deterministic-fake-judge-v1",
+                        "rubric": "Judge whether the requested fix is correct.",
+                        "input_cost_per_million_usd": 1,
+                        "output_cost_per_million_usd": 1,
+                    },
+                    "judge_weight": 0.5,
+                },
+                execution_policy={"max_cost_usd": maximum_cost},
+                seeds=[0],
+            )
+        )
+
+        await lab.execute_job(experiment.job_id)
+
+        detail = lab.get_experiment(experiment.id)
+        assert len(remaining_caps) == len(upper_bounds) == len(detail.units) == 2
+        assert remaining_caps[0] == pytest.approx(maximum_cost)
+        assert remaining_caps[1] == pytest.approx(maximum_cost - upper_bounds[0])
+        assert [
+            unit.evaluation.metrics["budget_debit_usd"] for unit in detail.units
+        ] == pytest.approx(upper_bounds)
+        assert all(
+            trial.performance is not None
+            and trial.performance.inference_cost_usd is not None
+            and trial.performance.inference_cost_usd > maximum_cost
+            for trial in lab.agentic.trials.values()
+        )
     finally:
         await lab.shutdown()
 
@@ -1759,6 +2492,114 @@ async def test_drift_formulas_detect_divergence_and_recovery() -> None:
     assert exact_state_distance({"a": 1}, {"a": 1}) == 0
     assert exact_state_distance({"a": 1}, {"a": 2}) == 1
     assert reliability_horizon({2: [True], 4: [True, False], 8: [False]}, 0.5) == 4
+
+
+@pytest.mark.asyncio
+async def test_drift_dimensions_are_applied_and_fingerprinted() -> None:
+    parameters = DriftParameters(
+        dependency_span=3,
+        branch_count=4,
+        rollback_depth=2,
+        distractor_ratio=0.25,
+        tool_error_rate=0.9,
+        state_size=12,
+    )
+    scenario = parameterize_scenario(SCENARIOS["ledger-reconciliation-v1"], parameters)
+    plan = scenario.plan(seed=7, horizon=8)
+
+    async def provider(turn):
+        return plan[turn.checkpoint - 1].canonical_call
+
+    result = await run_drift_scenario(
+        scenario,
+        seed=7,
+        horizon=8,
+        condition=DriftCondition.CHAINED,
+        action_provider=provider,
+    )
+
+    context = result.initial_state["parameter_context"]
+    assert result.parameters == parameters
+    assert result.parameter_fingerprint == parameters.fingerprint
+    assert len(context["records"]) == 12
+    assert {record["branch"] for record in context["records"].values()} == {
+        "branch-1",
+        "branch-2",
+        "branch-3",
+        "branch-4",
+    }
+    assert (
+        max(len(record["dependencies"]) for record in context["records"].values()) == 3
+    )
+    assert (
+        sum(record["role"] == "distractor" for record in context["records"].values())
+        == 3
+    )
+    assert (
+        sum(record["note"] is not None for record in context["records"].values()) == 3
+    )
+    assert any(transition.rollback for transition in result.transitions)
+    assert any(transition.tool_error_injected for transition in result.transitions)
+    assert result.metrics.final_success is True
+
+
+def test_drift_request_rejects_dimensions_that_do_not_fit_horizon() -> None:
+    with pytest.raises(ValueError, match="snapshot, rollback span, and rollback"):
+        CreateExperimentRequest(
+            model_id=MODEL_ID,
+            workload_id="state-drift-v1",
+            horizons=[4],
+            drift_parameters=DriftParameters(rollback_depth=3),
+        )
+
+
+@pytest.mark.asyncio
+async def test_drift_aggregate_reports_budget_partial_without_parsing_it(
+    tmp_path: Path,
+) -> None:
+    lab = ResearchLab(Settings(mode="mock", data_dir=tmp_path / "data"))
+    try:
+        await lab.create_model_session(CreateModelSessionRequest())
+        experiment = lab.submit_experiment(
+            CreateExperimentRequest(
+                model_id=MODEL_ID,
+                workload_id="state-drift-v1",
+                scenario_ids=["ledger-reconciliation-v1"],
+                conditions=[DriftCondition.CHAINED],
+                horizons=[2],
+                seeds=[0],
+            )
+        )
+        unit = next(
+            item
+            for item in lab.experiments.units.values()
+            if item.experiment_id == experiment.id
+        )
+        unit.result = {
+            "kind": "state_drift",
+            "termination_reason": "execution_policy_token_limit",
+            "error": "token cap reached",
+            "routing": [],
+        }
+        unit.evaluation = EvaluationResultRecord(
+            id="partial-evaluation",
+            workload_run_id=unit.workload_run_id,
+            run_unit_id=unit.id,
+            passed=None,
+            score=None,
+            metrics={"budget_exhausted": True},
+        )
+
+        aggregate = lab.experiments._aggregate_lane(
+            lab.experiments.experiments[experiment.id], unit.lane_id
+        )
+
+        assert aggregate["completed_units"] == 1
+        assert aggregate["scored_units"] == 0
+        assert aggregate["incomplete_units"] == 1
+        assert aggregate["mean_survival_curve"] == []
+    finally:
+        await lab.shutdown()
 
 
 def test_routing_comparison_quantifies_overlap_divergence_and_expert_shifts() -> None:

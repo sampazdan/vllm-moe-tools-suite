@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -6,6 +7,17 @@ import pytest
 from moe_tools_suite.domain import GenerationConfig, ModelTopology
 from moe_tools_suite.runtime import VllmRuntime
 from moe_tools_suite.telemetry import encode_npy
+
+
+class _DelayedSseStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[dict[str, object] | str]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            await asyncio.sleep(0.01)
+            data = chunk if isinstance(chunk, str) else json.dumps(chunk)
+            yield f"data: {data}\n\n".encode()
 
 
 @pytest.mark.asyncio
@@ -83,6 +95,187 @@ async def test_vllm_runtime_reads_custom_choice_telemetry() -> None:
     assert result.performance.mean_inter_token_latency_ms == 4.0
     assert result.performance.tokens_per_second == 125.0
     np.testing.assert_array_equal(result.routing.expert_ids, ids)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_vllm_runtime_streams_progress_without_changing_final_result() -> None:
+    topology = ModelTopology(
+        num_layers=2,
+        num_experts=4,
+        top_k=2,
+        routed_layer_ids=[0, 1],
+    )
+    ids = np.arange(16, dtype=np.uint8).reshape(4, 2, 2) % 4
+    weights = np.full(ids.shape, 0.5, dtype=np.float32)
+    context_fingerprint = "a" * 64
+    prompt_ids = [1, 2, 3]
+    completion_ids = [10, 11]
+    metrics = {
+        "time_to_first_token_ms": 10.0,
+        "generation_time_ms": 20.0,
+        "tokens_per_second": 100.0,
+    }
+    requests: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if payload.get("stream") is not True:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {"content": "19"},
+                            "finish_reason": "stop",
+                            "token_ids": completion_ids,
+                            "routed_experts": encode_npy(ids),
+                            "routed_expert_weights": encode_npy(weights),
+                            "expert_context_fingerprint": context_fingerprint,
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 2,
+                        "completion_tokens_details": {"reasoning_tokens": 1},
+                    },
+                    "prompt_token_ids": prompt_ids,
+                    "metrics": metrics,
+                    "expert_context_fingerprint": context_fingerprint,
+                },
+            )
+
+        def usage(completion: int) -> dict[str, object]:
+            payload: dict[str, object] = {
+                "prompt_tokens": 3,
+                "completion_tokens": completion,
+                "total_tokens": 3 + completion,
+            }
+            if completion == 2:
+                payload["completion_tokens_details"] = {"reasoning_tokens": 1}
+            return payload
+
+        chunks: list[dict[str, object] | str] = [
+            {
+                "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+                "prompt_token_ids": prompt_ids,
+                "usage": usage(0),
+                "expert_context_fingerprint": context_fingerprint,
+            },
+            {
+                "choices": [{"index": 0, "delta": {"content": "1"}, "token_ids": [10]}],
+                "usage": usage(1),
+                "expert_context_fingerprint": context_fingerprint,
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "9"},
+                        "token_ids": [11],
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage(2),
+                "expert_context_fingerprint": context_fingerprint,
+            },
+            {
+                "choices": [],
+                "usage": usage(2),
+                "metrics": metrics,
+                "routed_experts": encode_npy(ids),
+                "routed_expert_weights": encode_npy(weights),
+                "expert_context_fingerprint": context_fingerprint,
+            },
+            "[DONE]",
+        ]
+        return httpx.Response(200, stream=_DelayedSseStream(chunks))
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://vllm"
+    )
+    runtime = VllmRuntime("http://vllm", "model", topology, client=client)
+    non_streamed = await runtime.complete(
+        "12 + 7",
+        request_key="ordinary-nonstream",
+        profile=None,
+    )
+    progress = []
+    streamed = await runtime.complete(
+        "12 + 7",
+        request_key="ordinary-stream",
+        profile=None,
+        on_progress=progress.append,
+    )
+
+    assert requests[0].get("stream") is None
+    assert requests[1]["stream"] is True
+    assert requests[1]["return_token_ids"] is True
+    assert requests[1]["stream_options"] == {
+        "include_usage": True,
+        "continuous_usage_stats": True,
+    }
+    assert [item.completion_tokens for item in progress] == [0, 1, 2]
+    assert progress[1].elapsed_ms < 1000
+    assert progress[1].current_tps is not None
+    assert streamed.content == non_streamed.content == "19"
+    assert streamed.prompt_tokens == non_streamed.prompt_tokens == 3
+    assert streamed.completion_tokens == non_streamed.completion_tokens == 2
+    assert streamed.finish_reason == non_streamed.finish_reason == "stop"
+    assert streamed.reasoning_tokens == non_streamed.reasoning_tokens == 1
+    assert streamed.context_fingerprint == non_streamed.context_fingerprint
+    assert streamed.performance == non_streamed.performance
+    np.testing.assert_array_equal(
+        streamed.routing.expert_ids, non_streamed.routing.expert_ids
+    )
+    np.testing.assert_array_equal(
+        streamed.routing.expert_weights, non_streamed.routing.expert_weights
+    )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_usage", [None, {"prompt_tokens": 3}])
+async def test_vllm_runtime_rejects_missing_or_invalid_continuous_usage(
+    invalid_usage: dict[str, int] | None,
+) -> None:
+    topology = ModelTopology(
+        num_layers=1,
+        num_experts=2,
+        top_k=1,
+        routed_layer_ids=[0],
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        chunk: dict[str, object] = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "1"},
+                    "token_ids": [10],
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        if invalid_usage is not None:
+            chunk["usage"] = invalid_usage
+        return httpx.Response(
+            200,
+            stream=_DelayedSseStream([chunk, "[DONE]"]),
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://vllm"
+    )
+    runtime = VllmRuntime("http://vllm", "model", topology, client=client)
+    with pytest.raises(ValueError, match="usage"):
+        await runtime.complete(
+            "hello",
+            request_key="invalid-progress",
+            profile=None,
+            on_progress=lambda _progress: None,
+        )
     await client.aclose()
 
 

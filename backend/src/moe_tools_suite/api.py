@@ -946,6 +946,25 @@ def cancel_job(job_id: str, request: Request) -> JobRecord:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
+@router.post(
+    "/jobs/{job_id}/retry",
+    response_model=JobRecord,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_job(job_id: str, request: Request) -> JobRecord:
+    try:
+        lab = _lab(request)
+        job = lab.retry_model_load(job_id)
+        lab.start_job(job.id)
+        return job
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="job not found") from error
+    except ActiveJobConflict as error:
+        raise _job_conflict(error) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @router.post("/profiles/validate", response_model=ProfileValidation)
 def validate_expert_profile(
     payload: ExpertProfile, request: Request

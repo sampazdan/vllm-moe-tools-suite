@@ -170,9 +170,12 @@ export function useDurableJob({ enabled, onRecovered }: DurableJobOptions) {
   const discoveryError = activeJobQuery.error instanceof Error
     ? activeJobQuery.error.message
     : null;
+  const discoveredActiveJob = discoveredJob && isActiveJob(discoveredJob)
+    ? discoveredJob
+    : null;
 
   return {
-    activeJob,
+    activeJob: activeJob ?? discoveredActiveJob,
     connectionIssue,
     recoveryError,
     discoveryError,

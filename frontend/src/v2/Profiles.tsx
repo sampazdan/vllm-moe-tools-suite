@@ -249,7 +249,7 @@ export function ProfileDetailPage({
   );
 }
 
-function InlineProfileName({ profile, large = false }: { profile: SavedExpertProfile; large?: boolean }) {
+export function InlineProfileName({ profile, large = false }: { profile: SavedExpertProfile; large?: boolean }) {
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(profile.name);
@@ -280,7 +280,7 @@ function InlineProfileName({ profile, large = false }: { profile: SavedExpertPro
   }
   if (!editing) {
     return (
-      <button className={`v2-inline-name ${large ? "large" : ""}`} onClick={() => setEditing(true)} title="Rename profile">
+      <button className={`v2-inline-name ${large ? "large" : ""}`} onClick={() => setEditing(true)} title="Rename profile" type="button">
         <strong>{profile.name}</strong><span aria-hidden="true">✎</span>
       </button>
     );
@@ -300,8 +300,8 @@ function InlineProfileName({ profile, large = false }: { profile: SavedExpertPro
         }}
         value={draft}
       />
-      <button aria-label="Save profile name" disabled={rename.isPending || !draft.trim()} onClick={submit}>✓</button>
-      <button aria-label="Cancel rename" disabled={rename.isPending} onClick={() => { setDraft(profile.name); setEditing(false); }}>×</button>
+      <button aria-label="Save profile name" disabled={rename.isPending || !draft.trim()} onClick={submit} type="button">✓</button>
+      <button aria-label="Cancel rename" disabled={rename.isPending} onClick={() => { setDraft(profile.name); setEditing(false); }} type="button">×</button>
       {duplicate && <small className="v2-duplicate-warning">Another profile uses this name; fingerprints will still distinguish them.</small>}
       {rename.error && <small role="alert">{rename.error instanceof Error ? rename.error.message : "Rename failed"}</small>}
     </div>

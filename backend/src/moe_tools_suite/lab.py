@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import numpy as np
@@ -20,7 +20,7 @@ from .agentic.comparison import (
     compare_agent_runs,
 )
 from .agentic.controller import AgenticController
-from .agentic.domain import CreateAgentRunRequest
+from .agentic.domain import CreateAgentRunRequest, TerminationCause
 from .agentic.task_packs import load_external_task_pack_registry
 from .benchmarks import BenchmarkAdapter, BenchmarkCatalog
 from .domain import (
@@ -102,7 +102,11 @@ from .judges import (
 )
 from .model_registry import QUALIFIED_MODEL_ID, model_registry
 from .persistence import SqliteStore
-from .process_manager import ManagedVllmServer
+from .process_manager import (
+    ManagedVllmServer,
+    ModelLoadPhaseUpdate,
+    redact_runtime_secrets,
+)
 from .profiles import (
     EXPERT_PROFILE_FINGERPRINT_VERSION,
     calculate_observed_mass_retained,
@@ -112,7 +116,12 @@ from .profiles import (
     propose_fixed_budget_profile,
     validate_profile,
 )
-from .runtime import MockModelRuntime, ModelRuntime, VllmRuntime
+from .runtime import (
+    CompletionProgressCallback,
+    MockModelRuntime,
+    ModelRuntime,
+    VllmRuntime,
+)
 from .settings import Settings
 from .telemetry import AggregatedRouting, aggregate_routing
 from .v2_domain import (
@@ -135,6 +144,16 @@ from .v2_domain import (
 MODEL_ID = QUALIFIED_MODEL_ID
 FIXTURE_BENCHMARK_ID = "fixture-arithmetic"
 logger = logging.getLogger(__name__)
+
+_MODEL_LOAD_CHILD_PHASES = (
+    ModelLoadPhase.CHECKING_CACHE,
+    ModelLoadPhase.DOWNLOADING,
+    ModelLoadPhase.LOADING_WEIGHTS,
+    ModelLoadPhase.INITIALIZING_DISTRIBUTED_WORKERS,
+    ModelLoadPhase.COMPILING,
+    ModelLoadPhase.CAPTURING_GRAPHS,
+    ModelLoadPhase.WARMING,
+)
 
 
 class _ModelLoadCleanupError(RuntimeError):
@@ -288,6 +307,47 @@ class ResearchLab:
                     benchmark.model_dump(mode="json")
                 )
                 blocked_reason = str(error)
+            if items:
+                descriptors.append(
+                    WorkloadDescriptor(
+                        id=f"answer:{benchmark.id}",
+                        kind=WorkloadKind.ANSWER,
+                        name=f"{benchmark.name} cohort",
+                        description=benchmark.description,
+                        source=benchmark.source,
+                        revision=benchmark.revision,
+                        content_fingerprint=canonical_fingerprint(
+                            {
+                                "dataset": content_fingerprint,
+                                "item_ids": [item.id for item in items],
+                            }
+                        ),
+                        ready=benchmark.ready,
+                        blocked_reason=blocked_reason,
+                        unit_ids=[item.id for item in items],
+                        parent_id=benchmark.id,
+                        difficulty="mixed",
+                        expected_horizon=1,
+                        tools=[],
+                        runtime="model completion + deterministic scorer",
+                        preparation_status=(
+                            "validated" if benchmark.ready else "not_prepared"
+                        ),
+                        public_problem_statement=(
+                            f"Run the pinned {benchmark.name} item cohort."
+                        ),
+                        public_success_criteria=[
+                            "Score each item with the pinned "
+                            f"{benchmark.scoring.value} "
+                            "adapter contract."
+                        ],
+                        metadata={
+                            "benchmark_name": benchmark.name,
+                            "license": benchmark.license,
+                            "descriptor_scope": "cohort",
+                        },
+                    )
+                )
             for item in items:
                 descriptors.append(
                     WorkloadDescriptor(
@@ -328,7 +388,56 @@ class ResearchLab:
                 )
         packs = {pack.id: pack for pack in self.agentic.list_task_packs()}
         for pack_id, pack in packs.items():
-            for task in self.agentic.list_tasks(pack_id):
+            tasks = self.agentic.list_tasks(pack_id)
+            ready = pack.ready and pack.oracle_passed and pack.noop_failed
+            if tasks:
+                descriptors.append(
+                    WorkloadDescriptor(
+                        id=f"coding:{pack_id}",
+                        kind=WorkloadKind.CODING,
+                        name=f"{pack.name} cohort",
+                        description=pack.description,
+                        source=pack.source,
+                        revision=pack.revision,
+                        content_fingerprint=canonical_fingerprint(
+                            {
+                                "pack": pack.fingerprint,
+                                "task_ids": [task.id for task in tasks],
+                            }
+                        ),
+                        ready=ready,
+                        blocked_reason=(
+                            None
+                            if ready
+                            else "task pack has not passed oracle/no-op eligibility"
+                        ),
+                        unit_ids=[task.id for task in tasks],
+                        parent_id=pack_id,
+                        language=(
+                            tasks[0].language
+                            if len({task.language for task in tasks}) == 1
+                            else "mixed"
+                        ),
+                        difficulty="mixed",
+                        expected_horizon=max(
+                            _task_expected_horizon(task.tags) for task in tasks
+                        ),
+                        tools=["bash"],
+                        runtime="one isolated sandbox per selected task",
+                        preparation_status=("validated" if ready else "not_eligible"),
+                        public_problem_statement=(
+                            f"Run the pinned {pack.name} engineering task cohort."
+                        ),
+                        public_success_criteria=[
+                            "Each selected task must pass its protected verifier."
+                        ],
+                        metadata={
+                            "tags": pack.tags,
+                            "descriptor_scope": "cohort",
+                        },
+                    )
+                )
+            for task in tasks:
                 ready = pack.ready and pack.oracle_passed and pack.noop_failed
                 descriptors.append(
                     WorkloadDescriptor(
@@ -637,10 +746,17 @@ class ResearchLab:
                     model_id=model.id,
                     model_revision=model.revision,
                     runtime_recipe=model.runtime_recipe,
-                    on_phase=lambda phase, detail: self._set_model_load_phase(
-                        job_id,
-                        phase,
-                        detail=detail,
+                    on_phase=lambda phase, detail, observability="observed": (
+                        self._set_model_load_phase(
+                            job_id,
+                            phase,
+                            detail=detail,
+                            observability=observability,
+                            source="managed_runtime",
+                        )
+                    ),
+                    on_phase_update=lambda update: (
+                        self._update_managed_model_load_phase(job_id, update)
                     ),
                 )
                 if self.settings.mode == "vllm":
@@ -655,6 +771,18 @@ class ResearchLab:
                     context = await self._synchronize_server_context(
                         profile_id,
                         profile=request.profile,
+                    )
+            else:
+                for phase in _MODEL_LOAD_CHILD_PHASES:
+                    self._set_model_load_phase(
+                        job_id,
+                        phase,
+                        detail=(
+                            "Mock mode does not execute a managed runtime; "
+                            f"{phase.value.replace('_', ' ')} is unavailable."
+                        ),
+                        observability="unavailable",
+                        source="managed_runtime",
                     )
             if self.settings.mode != "vllm":
                 saved_profile = (
@@ -1181,7 +1309,12 @@ class ResearchLab:
             },
         )
 
-    def submit_model_session(self, request: CreateModelSessionRequest) -> JobRecord:
+    def submit_model_session(
+        self,
+        request: CreateModelSessionRequest,
+        *,
+        retry_of_job_id: str | None = None,
+    ) -> JobRecord:
         request = self._resolve_model_session_request(request)
         assert request.model_id is not None
         model = self._resolve_manifest_model(request.model_id)
@@ -1219,9 +1352,11 @@ class ResearchLab:
                 status=JobStatus.QUEUED,
                 progress_total=1,
                 result_id=model_session.id,
+                retry_of_job_id=retry_of_job_id,
                 phase_history=[
                     JobPhaseRecord(
                         phase=ModelLoadPhase.QUEUED,
+                        source="application",
                         detail="Model-load request persisted and queued",
                     )
                 ],
@@ -1230,6 +1365,44 @@ class ResearchLab:
             self.model_sessions[model_session.id] = model_session
             self.jobs[job.id] = JobArtifacts(record=job, payload=payload)
             return job.model_copy(deep=True)
+
+    def retry_model_load(self, job_id: str) -> JobRecord:
+        with self._job_guard:
+            artifacts = self.jobs.get(job_id)
+            if artifacts is None:
+                raise KeyError(job_id)
+            job = artifacts.record
+            if job.kind is not JobKind.MODEL_LOAD:
+                raise ValueError("only model-load jobs can be retried here")
+            if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
+                raise ValueError("only failed or cancelled model loads can be retried")
+            terminal_phase = job.phase_history[-1] if job.phase_history else None
+            if terminal_phase is not None and (
+                terminal_phase.failure_code == "cleanup_failed"
+            ):
+                raise ValueError(
+                    "restart the deployment before retrying because runtime cleanup "
+                    "could not be proven"
+                )
+            request = CreateModelSessionRequest.model_validate(artifacts.payload)
+            planned_session = (
+                self.model_sessions.get(job.result_id)
+                if job.result_id is not None
+                else None
+            )
+            if planned_session is None:
+                raise ValueError("the failed model load has no immutable load plan")
+            manifest = self._resolve_manifest_model(request.model_id)
+            if (
+                planned_session.model_revision != manifest.revision
+                or planned_session.topology != manifest.topology
+                or planned_session.runtime_recipe != manifest.runtime_recipe
+            ):
+                raise ValueError(
+                    "the model manifest changed since this load was planned; submit "
+                    "a new model load instead of retrying different artifacts"
+                )
+        return self.submit_model_session(request, retry_of_job_id=job_id)
 
     def submit_benchmark(self, request: RunRequest) -> JobRecord:
         self._ensure_no_active_job()
@@ -1294,25 +1467,16 @@ class ResearchLab:
     def submit_experiment(self, request: CreateExperimentRequest) -> Experiment:
         self._ensure_no_active_job()
         descriptor = self.get_workload_descriptor(request.workload_id)
-        self.experiments.validate_request(request, descriptor)
+        expanded_run_units = self.experiments.validate_request(request, descriptor)
         experiment_id = str(uuid4())
         job_id = str(uuid4())
-        dimensions = (
-            len(request.scenario_ids)
-            * len(request.conditions)
-            * len(request.horizons)
-            * len(request.seeds)
-            if descriptor.kind is WorkloadKind.STATE_DRIFT
-            else len(request.seeds)
-        )
-        lane_count = 2 if request.candidate_profile_id is not None else 1
         self._queue_job(
             kind=JobKind.EXPERIMENT_RUN,
             payload={
                 "experiment_id": experiment_id,
                 "request": request.model_dump(mode="json"),
             },
-            progress_total=dimensions * lane_count,
+            progress_total=expanded_run_units,
             job_id=job_id,
             result_id=experiment_id,
         )
@@ -1774,11 +1938,12 @@ class ResearchLab:
         if request.should_cancel():
             raise ExperimentCancellationRequested
         descriptor = request.experiment.workload
-        if descriptor.parent_id is None or descriptor.task_id is None:
+        workload_unit_id = request.unit.workload_unit_id or descriptor.task_id
+        if descriptor.parent_id is None or workload_unit_id is None:
             raise RuntimeError("answer workload descriptor is missing its source item")
         adapter = self.benchmark_catalog.get_adapter(descriptor.parent_id)
         item = next(
-            (item for item in adapter.items() if item.id == descriptor.task_id),
+            (item for item in adapter.items() if item.id == workload_unit_id),
             None,
         )
         if item is None:
@@ -1793,34 +1958,40 @@ class ResearchLab:
             current_context.context_fingerprint != request.context.context_fingerprint
         ):
             raise RuntimeError("answer workload context changed before inference")
-        generation = adapter.info.default_generation.model_copy(
+        generation = request.experiment.generation.model_copy(
             update={"seed": request.unit.seed}
         )
-        contract = _default_evaluation_contract(adapter.info, item)
+        contract = request.experiment.evaluation_contract
+        policy = request.experiment.execution_policy
         execution = await self._execute_benchmark_item(
             adapter=adapter,
             item=item,
             attempt=1,
             generation=generation,
             contract=contract,
-            policy=ExecutionPolicy(attempts=1, concurrency=1),
+            policy=policy,
             session=session,
             profile=request.profile.profile if request.profile is not None else None,
             run_id=request.unit.id,
-            token_budget=None,
-            cost_budget_usd=None,
+            token_budget=request.remaining_token_budget,
+            cost_budget_usd=request.remaining_cost_budget_usd,
+            on_inference_progress=request.emit_inference_progress,
         )
         if request.should_cancel():
             raise ExperimentCancellationRequested
         item_result = execution.result
+        budget_exhausted = (
+            execution.token_budget_exhausted or execution.cost_budget_exhausted
+        )
+        passed = None if budget_exhausted else item_result.passed
         deterministic = item_result.evaluation
         score = (
             None
-            if item_result.passed is None
+            if passed is None
             else (
                 deterministic.combined_score
                 if deterministic is not None
-                else (1.0 if item_result.passed else 0.0)
+                else (1.0 if passed else 0.0)
             )
         )
         routing = None
@@ -1841,11 +2012,15 @@ class ResearchLab:
             id=str(uuid4()),
             workload_run_id=request.workload_run.id,
             run_unit_id=request.unit.id,
-            passed=item_result.passed,
+            passed=passed,
             score=score,
             metrics={
-                "passed": item_result.passed,
-                "scored": item_result.passed is not None,
+                "passed": passed,
+                "scored": passed is not None,
+                "budget_exhausted": execution.token_budget_exhausted,
+                "token_budget_exhausted": execution.token_budget_exhausted,
+                "cost_budget_exhausted": execution.cost_budget_exhausted,
+                "budget_debit_usd": execution.budget_debit_usd,
             },
             formula_fingerprint=contract.fingerprint,
             deterministic=deterministic,
@@ -1862,15 +2037,17 @@ class ResearchLab:
             inference=inference,
         )
         return ExperimentAdapterResult(
-            passed=item_result.passed,
+            passed=passed,
             score=score,
             result={
                 "kind": WorkloadKind.ANSWER.value,
                 "benchmark_id": descriptor.parent_id,
+                "workload_unit_id": workload_unit_id,
                 "benchmark_revision": adapter.info.revision,
                 "dataset_content_hash": adapter.content_hash,
                 "scoring_version": adapter.scoring_version,
                 "evaluation_contract_fingerprint": contract.fingerprint,
+                "execution_policy_fingerprint": policy.fingerprint,
                 "generation": generation.model_dump(mode="json"),
                 "model_session_id": session.id,
                 "context": request.context.model_dump(mode="json"),
@@ -1892,7 +2069,8 @@ class ResearchLab:
         if request.should_cancel():
             raise ExperimentCancellationRequested
         descriptor = request.experiment.workload
-        if descriptor.parent_id is None or descriptor.task_id is None:
+        workload_unit_id = request.unit.workload_unit_id or descriptor.task_id
+        if descriptor.parent_id is None or workload_unit_id is None:
             raise RuntimeError("coding workload descriptor is missing its source task")
         session = self.session
         if session is None or session.state is not ModelState.READY:
@@ -1910,14 +2088,31 @@ class ResearchLab:
         sandbox_provider_id = str(
             request.experiment.execution_config.get("sandbox_provider_id", "fake")
         )
+        policy = ExecutionPolicy.model_validate(
+            {
+                **request.experiment.execution_policy.model_dump(
+                    mode="python", exclude={"fingerprint"}
+                ),
+                "timeout_seconds": (
+                    request.experiment.execution_policy.per_item_timeout_seconds
+                ),
+                "max_tokens": request.remaining_token_budget,
+                "max_cost_usd": request.remaining_cost_budget_usd,
+            }
+        )
         agent_request = CreateAgentRunRequest(
             task_pack_id=descriptor.parent_id,
-            task_ids=[descriptor.task_id],
+            task_ids=[workload_unit_id],
             agent_id=agent_id,
             sandbox_provider_id=sandbox_provider_id,
             model_session_id=session.id,
             attempts=1,
             seed=request.unit.seed if request.unit.seed is not None else 0,
+            generation=request.experiment.generation.model_copy(
+                update={"seed": request.unit.seed}
+            ),
+            evaluation_contract=request.experiment.evaluation_contract,
+            execution_policy=policy,
         )
         agent_run_id = str(uuid4())
         self.agentic.create_run(
@@ -1942,6 +2137,7 @@ class ResearchLab:
                 profile=(
                     request.profile.profile if request.profile is not None else None
                 ),
+                on_tool_command_started=request.emit_trajectory,
             )
         )
         emitted_steps = 0
@@ -1982,10 +2178,20 @@ class ResearchLab:
         trajectory = self.agentic.get_trajectory(trial.id)
         routing = self.agentic.routings.get(trial.id)
         evaluation = trial.evaluation
-        score = evaluation.combined_score if evaluation is not None else trial.reward
-        passed = evaluation.passed if evaluation is not None else None
-        if passed is None:
-            passed = trial.status.value == "passed"
+        budget_termination = trial.termination_cause in {
+            TerminationCause.TOKEN_LIMIT,
+            TerminationCause.COST_LIMIT,
+        }
+        score = (
+            None
+            if budget_termination
+            else (evaluation.combined_score if evaluation is not None else trial.reward)
+        )
+        passed = (
+            None
+            if budget_termination
+            else (evaluation.passed if evaluation is not None else None)
+        )
         trial_performance = trial.performance
         inference_performance = InferencePerformance(
             prompt_tokens=trial.prompt_tokens,
@@ -2010,6 +2216,17 @@ class ResearchLab:
                 "reward": trial.reward,
                 "turns": trial.turns,
                 "commands": trial.commands,
+                "token_budget_exhausted": (
+                    trial.termination_cause is TerminationCause.TOKEN_LIMIT
+                ),
+                "cost_budget_exhausted": (
+                    trial.termination_cause is TerminationCause.COST_LIMIT
+                ),
+                "budget_debit_usd": (
+                    trial_performance.judge_cost_debit_usd
+                    if trial_performance is not None
+                    else trial.judge_cost_debit_usd
+                ),
             },
             formula_fingerprint=agent_run.evaluation_contract.fingerprint,
             deterministic=evaluation,
@@ -2034,6 +2251,7 @@ class ResearchLab:
             score=score,
             result={
                 "kind": WorkloadKind.CODING.value,
+                "workload_unit_id": workload_unit_id,
                 "agent_run_id": agent_run.id,
                 "trial_id": trial.id,
                 "agent_run_status": agent_run.status.value,
@@ -2049,6 +2267,10 @@ class ResearchLab:
                 "evaluation_contract_fingerprint": (
                     agent_run.evaluation_contract.fingerprint
                 ),
+                "execution_policy_fingerprint": (
+                    agent_run.execution_policy.fingerprint
+                ),
+                "generation": agent_run.generation.model_dump(mode="json"),
                 "model_session_id": session.id,
                 "context": request.context.model_dump(mode="json"),
                 "trajectory": [
@@ -2274,6 +2496,7 @@ class ResearchLab:
         run_id: str,
         token_budget: int | None,
         cost_budget_usd: float | None,
+        on_inference_progress: CompletionProgressCallback | None = None,
     ) -> BenchmarkItemExecution:
         prompt = adapter.render_prompt(item)
         started_at = datetime.now(UTC)
@@ -2328,12 +2551,21 @@ class ResearchLab:
             )
             request_key = item.id if attempt == 1 else f"{item.id}:attempt-{attempt}"
             async with asyncio.timeout(policy.per_item_timeout_seconds):
-                completion = await self.runtime.complete(
-                    prompt,
-                    request_key=request_key,
-                    profile=profile,
-                    generation=attempt_generation,
-                )
+                if on_inference_progress is None:
+                    completion = await self.runtime.complete(
+                        prompt,
+                        request_key=request_key,
+                        profile=profile,
+                        generation=attempt_generation,
+                    )
+                else:
+                    completion = await self.runtime.complete(
+                        prompt,
+                        request_key=request_key,
+                        profile=profile,
+                        generation=attempt_generation,
+                        on_progress=on_inference_progress,
+                    )
             latency_ms = (time.perf_counter() - started) * 1000
             routing = aggregate_routing(completion.routing, self.topology)
             output = completion.content.strip()
@@ -2662,45 +2894,132 @@ class ResearchLab:
         *,
         detail: str,
         terminal: bool = False,
+        observability: Literal["observed", "unavailable"] = "observed",
+        source: Literal["application", "managed_runtime"] = "application",
     ) -> None:
         if job_id is None:
             return
         with self._job_guard:
             artifacts = self.jobs[job_id]
             now = datetime.now(UTC)
-            for record in reversed(artifacts.record.phase_history):
-                if record.status == "active":
-                    record.status = "completed"
-                    record.completed_at = now
-                    break
+            if observability == "observed":
+                for record in reversed(artifacts.record.phase_history):
+                    if (
+                        record.status == "active"
+                        and record.phase not in _MODEL_LOAD_CHILD_PHASES
+                    ):
+                        record.status = "completed"
+                        record.completed_at = now
+                        break
             artifacts.record.phase_history.append(
                 JobPhaseRecord(
                     phase=phase,
-                    status="completed" if terminal else "active",
+                    status=(
+                        "unavailable"
+                        if observability == "unavailable"
+                        else ("completed" if terminal else "active")
+                    ),
+                    observability=observability,
+                    source=source,
                     started_at=now,
-                    completed_at=now if terminal else None,
+                    completed_at=(
+                        now if terminal or observability == "unavailable" else None
+                    ),
                     detail=detail,
                 )
             )
+            self.store.save_job(artifacts.record, artifacts.payload)
+
+    def _update_managed_model_load_phase(
+        self,
+        job_id: str | None,
+        update: ModelLoadPhaseUpdate,
+    ) -> None:
+        if job_id is None:
+            return
+        detail = redact_runtime_secrets(update.detail)
+        with self._job_guard:
+            artifacts = self.jobs[job_id]
+            now = datetime.now(UTC)
+            active = next(
+                (
+                    record
+                    for record in reversed(artifacts.record.phase_history)
+                    if record.phase is update.phase
+                    and record.source == "managed_runtime"
+                    and record.status == "active"
+                ),
+                None,
+            )
+            if update.status == "started":
+                if active is None:
+                    active = JobPhaseRecord(
+                        phase=update.phase,
+                        status="active",
+                        source="managed_runtime",
+                        started_at=now,
+                    )
+                    artifacts.record.phase_history.append(active)
+                active.detail = detail
+                active.bytes_current = update.bytes_current
+                active.bytes_total = update.bytes_total
+                active.files_current = update.files_current
+                active.files_total = update.files_total
+            else:
+                status = {
+                    "completed": "completed",
+                    "failed": "failed",
+                    "unavailable": "unavailable",
+                }[update.status]
+                if active is None:
+                    active = JobPhaseRecord(
+                        phase=update.phase,
+                        status=status,
+                        observability=(
+                            "unavailable"
+                            if update.status == "unavailable"
+                            else "observed"
+                        ),
+                        source="managed_runtime",
+                        started_at=now,
+                    )
+                    artifacts.record.phase_history.append(active)
+                active.status = status
+                active.observability = (
+                    "unavailable" if update.status == "unavailable" else "observed"
+                )
+                active.completed_at = now
+                active.detail = detail
+                active.bytes_current = update.bytes_current
+                active.bytes_total = update.bytes_total
+                active.files_current = update.files_current
+                active.files_total = update.files_total
             self.store.save_job(artifacts.record, artifacts.payload)
 
     @staticmethod
     def _fail_model_load_phase_unlocked(job: JobRecord, detail: str | None) -> None:
         if job.kind is not JobKind.MODEL_LOAD:
             return
+        summary, failure_code, recovery_action, diagnostics = _model_load_failure(
+            detail
+        )
+        job.error = summary
         now = datetime.now(UTC)
-        for record in reversed(job.phase_history):
+        for record in job.phase_history:
             if record.status == "active":
                 record.status = "failed"
                 record.completed_at = now
-                break
         job.phase_history.append(
             JobPhaseRecord(
                 phase=ModelLoadPhase.FAILED,
                 status="failed",
+                source="application",
                 started_at=now,
                 completed_at=now,
-                detail=detail,
+                detail=summary,
+                failure_code=failure_code,
+                recovery_action=recovery_action,
+                diagnostics=diagnostics,
             )
         )
 
@@ -2709,15 +3028,15 @@ class ResearchLab:
         if job.kind is not JobKind.MODEL_LOAD:
             return
         now = datetime.now(UTC)
-        for record in reversed(job.phase_history):
+        for record in job.phase_history:
             if record.status == "active":
                 record.status = "cancelled"
                 record.completed_at = now
-                break
         job.phase_history.append(
             JobPhaseRecord(
                 phase=ModelLoadPhase.CANCELLED,
                 status="cancelled",
+                source="application",
                 started_at=now,
                 completed_at=now,
                 detail=detail,
@@ -3619,3 +3938,72 @@ def _judge_budget_accounting(result: LLMJudgeResult) -> tuple[float, bool]:
 
 def _prompt_token_upper_bound(prompt: str) -> int:
     return len(prompt.encode("utf-8")) + 4096
+
+
+def _model_load_failure(
+    detail: str | None,
+) -> tuple[str, str, str, str | None]:
+    diagnostics = redact_runtime_secrets(
+        detail or "Model loading failed without diagnostic detail"
+    ).strip()
+    summary = next(
+        (line.strip() for line in diagnostics.splitlines() if line.strip()),
+        "Model loading failed",
+    )
+    lowered = diagnostics.lower()
+    if "cleanup failed" in lowered or "could not prove" in lowered:
+        return (
+            summary,
+            "cleanup_failed",
+            (
+                "Restart the deployment and inspect diagnostics before retrying; "
+                "runtime cleanup could not be proven."
+            ),
+            diagnostics,
+        )
+    if "restarted" in lowered or "interrupted during shutdown" in lowered:
+        return (
+            summary,
+            "application_restarted",
+            "Confirm no model load is active, then retry the same pinned model.",
+            diagnostics,
+        )
+    if "launcher is not executable" in lowered:
+        return (
+            summary,
+            "launcher_unavailable",
+            "Repair the managed vLLM launcher configuration before retrying.",
+            diagnostics,
+        )
+    if any(
+        marker in lowered
+        for marker in (
+            "ready context",
+            "context verification",
+            "expert context",
+            "expert-context",
+            "canonical expert mask",
+        )
+    ):
+        return (
+            summary,
+            "context_verification_failed",
+            (
+                "Inspect expert-context provenance in diagnostics, then retry the "
+                "same pinned model or load the baseline context."
+            ),
+            diagnostics,
+        )
+    if "not ready" in lowered or "readiness" in lowered or "during startup" in lowered:
+        return (
+            summary,
+            "readiness_failed",
+            "Inspect launcher diagnostics and accelerator capacity, then retry.",
+            diagnostics,
+        )
+    return (
+        summary,
+        "runtime_start_failed",
+        "Inspect the collapsed diagnostics, correct the runtime cause, then retry.",
+        diagnostics,
+    )

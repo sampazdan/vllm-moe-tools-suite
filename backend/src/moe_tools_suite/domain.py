@@ -49,6 +49,13 @@ class ModelLoadPhase(StrEnum):
     STOPPING_PREVIOUS = "stopping_previous"
     CONFIGURING_RUNTIME = "configuring_runtime"
     LAUNCHING_PROCESS = "launching_process"
+    CHECKING_CACHE = "checking_cache"
+    DOWNLOADING = "downloading"
+    LOADING_WEIGHTS = "loading_weights"
+    INITIALIZING_DISTRIBUTED_WORKERS = "initializing_distributed_workers"
+    COMPILING = "compiling"
+    CAPTURING_GRAPHS = "capturing_graphs"
+    WARMING = "warming"
     WAITING_FOR_READINESS = "waiting_for_readiness"
     STARTING_RUNTIME = "starting_runtime"
     VERIFYING_READY_CONTEXT = "verifying_ready_context"
@@ -59,10 +66,23 @@ class ModelLoadPhase(StrEnum):
 
 class JobPhaseRecord(BaseModel):
     phase: ModelLoadPhase
-    status: Literal["active", "completed", "failed", "cancelled"] = "active"
+    status: Literal["active", "completed", "failed", "cancelled", "unavailable"] = (
+        "active"
+    )
+    observability: Literal["observed", "unavailable"] = "observed"
+    source: Literal["application", "managed_runtime", "legacy_unknown"] = (
+        "legacy_unknown"
+    )
     started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     completed_at: datetime | None = None
     detail: str | None = None
+    bytes_current: Annotated[int, Field(ge=0)] | None = None
+    bytes_total: Annotated[int, Field(ge=0)] | None = None
+    files_current: Annotated[int, Field(ge=0)] | None = None
+    files_total: Annotated[int, Field(ge=0)] | None = None
+    failure_code: str | None = None
+    recovery_action: str | None = None
+    diagnostics: str | None = None
 
 
 class JobRecord(BaseModel):
@@ -72,6 +92,7 @@ class JobRecord(BaseModel):
     progress_current: Annotated[int, Field(ge=0)] = 0
     progress_total: Annotated[int, Field(ge=0)] = 0
     result_id: str | None = None
+    retry_of_job_id: str | None = None
     error: str | None = None
     phase_history: list[JobPhaseRecord] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

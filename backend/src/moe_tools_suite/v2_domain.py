@@ -8,7 +8,13 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .domain import EvaluationResult, InferencePerformance
+from .domain import (
+    EvaluationContract,
+    EvaluationResult,
+    ExecutionPolicy,
+    GenerationConfig,
+    InferencePerformance,
+)
 
 
 def utc_now() -> datetime:
@@ -80,6 +86,7 @@ class RunEventKind(StrEnum):
     CURRENT_UNIT = "current_unit"
     CURRENT_CHECKPOINT = "current_checkpoint"
     MODEL_REQUEST_STARTED = "model_request_started"
+    INFERENCE_PROGRESS = "inference_progress"
     MODEL_REQUEST_COMPLETED = "model_request_completed"
     TOOL_COMMAND_STARTED = "tool_command_started"
     TOOL_COMMAND_COMPLETED = "tool_command_completed"
@@ -100,6 +107,33 @@ class DriftCondition(StrEnum):
     ORACLE_RESET = "oracle_reset"
     CHAINED = "chained"
     STATE_ANCHORED = "state_anchored"
+
+
+class DriftParameters(V2Model):
+    """Deterministic dimensions applied to every first-party drift scenario."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    dependency_span: Annotated[int, Field(ge=1, le=32)] = 1
+    branch_count: Annotated[int, Field(ge=1, le=16)] = 1
+    rollback_depth: Annotated[int, Field(ge=0, le=16)] = 0
+    distractor_ratio: Annotated[float, Field(ge=0, le=0.9)] = 0
+    tool_error_rate: Annotated[float, Field(ge=0, le=0.9)] = 0
+    state_size: Annotated[int, Field(ge=3, le=128)] = 3
+
+    @property
+    def fingerprint(self) -> str:
+        return canonical_fingerprint(
+            {"version": "drift-parameters-v1", **self.model_dump(mode="json")}
+        )
+
+    @model_validator(mode="after")
+    def validate_state_shape(self) -> Self:
+        if self.branch_count > self.state_size:
+            raise ValueError("branch_count cannot exceed state_size")
+        if self.dependency_span >= self.state_size:
+            raise ValueError("dependency_span must be smaller than state_size")
+        return self
 
 
 class InterventionContextRef(V2Model):
@@ -218,6 +252,7 @@ class RunUnit(V2Model):
     workload_run_id: str
     ordinal: Annotated[int, Field(ge=0)]
     unit_key: Annotated[str, Field(min_length=1, max_length=300)]
+    workload_unit_id: Annotated[str | None, Field(min_length=1, max_length=240)] = None
     status: RunUnitStatus = RunUnitStatus.QUEUED
     scenario_id: str | None = None
     condition: DriftCondition | None = None
@@ -241,7 +276,7 @@ class WorkloadRun(V2Model):
     completed_units: Annotated[int, Field(ge=0)] = 0
     passed_units: Annotated[int, Field(ge=0)] = 0
     total_units: Annotated[int, Field(ge=0)]
-    aggregate_metrics: dict[str, str | float | int | bool | None] = Field(
+    aggregate_metrics: dict[str, str | float | int | bool | list[float] | None] = Field(
         default_factory=dict
     )
     created_at: datetime = Field(default_factory=utc_now)
@@ -288,6 +323,14 @@ class Experiment(V2Model):
     name: Annotated[str, Field(min_length=1, max_length=200)]
     model_id: str
     workload: WorkloadDescriptor
+    cohort_fingerprint: Annotated[
+        str | None, Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    ] = None
+    contract_provenance: Literal["known", "legacy_unknown"] = "legacy_unknown"
+    generation: GenerationConfig | None = None
+    evaluation_contract: EvaluationContract | None = None
+    execution_policy: ExecutionPolicy | None = None
+    drift_parameters: DriftParameters | None = None
     execution_config: dict[str, Any] = Field(default_factory=dict)
     status: ExperimentStatus = ExperimentStatus.QUEUED
     lanes: list[ExperimentLane]
@@ -308,6 +351,19 @@ class Experiment(V2Model):
             raise ValueError("experiment requires exactly one baseline lane")
         if len(roles) != len(set(roles)):
             raise ValueError("experiment lane roles must be unique")
+        contracts = (
+            self.generation,
+            self.evaluation_contract,
+            self.execution_policy,
+        )
+        if self.contract_provenance == "known" and any(
+            contract is None for contract in contracts
+        ):
+            raise ValueError("known experiment contracts must be fully populated")
+        if self.contract_provenance == "legacy_unknown" and any(
+            contract is not None for contract in contracts
+        ):
+            raise ValueError("legacy experiment contract provenance must stay unknown")
         return self
 
 
@@ -321,6 +377,9 @@ class CreateExperimentRequest(V2Model):
     name: Annotated[str | None, Field(max_length=200)] = None
     model_id: Annotated[str, Field(min_length=1, max_length=300)]
     workload_id: Annotated[str, Field(min_length=1, max_length=240)]
+    workload_unit_ids: Annotated[
+        list[str] | None, Field(min_length=1, max_length=10_000)
+    ] = None
     candidate_profile_id: str | None = None
     agent_id: Annotated[str, Field(min_length=1, max_length=128)] = "bash-json-v1"
     sandbox_provider_id: Annotated[str, Field(min_length=1, max_length=128)] = "fake"
@@ -342,10 +401,18 @@ class CreateExperimentRequest(V2Model):
     seeds: Annotated[list[int], Field(min_length=1, max_length=20)] = Field(
         default_factory=lambda: [0]
     )
+    generation: GenerationConfig = Field(default_factory=GenerationConfig)
+    evaluation_contract: EvaluationContract | None = None
+    execution_policy: ExecutionPolicy = Field(default_factory=ExecutionPolicy)
+    drift_parameters: DriftParameters = Field(default_factory=DriftParameters)
 
-    @field_validator("scenario_ids", "conditions", "horizons", "seeds")
+    @field_validator(
+        "scenario_ids", "conditions", "horizons", "seeds", "workload_unit_ids"
+    )
     @classmethod
-    def require_unique(cls, values: list[Any]) -> list[Any]:
+    def require_unique(cls, values: list[Any] | None) -> list[Any] | None:
+        if values is None:
+            return None
         if len(values) != len(set(values)):
             raise ValueError("experiment dimensions cannot contain duplicates")
         return values
@@ -356,6 +423,15 @@ class CreateExperimentRequest(V2Model):
         if any(value not in {2, 4, 8, 12, 16, 24} for value in values):
             raise ValueError("supported drift horizons are 2, 4, 8, 12, 16, and 24")
         return values
+
+    @model_validator(mode="after")
+    def validate_drift_dimensions(self) -> Self:
+        depth = self.drift_parameters.rollback_depth
+        if depth and min(self.horizons) < depth + 2:
+            raise ValueError(
+                "each drift horizon must fit a snapshot, rollback span, and rollback"
+            )
+        return self
 
 
 class UpdateProfileMetadataRequest(V2Model):

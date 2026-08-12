@@ -841,7 +841,7 @@ function ProfileDetailPage({ profileId, model }: { profileId: string; model: Mod
   );
 }
 
-function ProfileStudioPage({
+export function ProfileStudioPage({
   route,
   model,
 }: {
