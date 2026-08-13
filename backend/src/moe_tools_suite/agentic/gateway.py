@@ -9,10 +9,11 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain import GenerationConfig, ModelSession, ModelTopology
+from ..domain import ExpertProfile, GenerationConfig, ModelSession, ModelTopology
 from ..persistence import SqliteStore
 from ..runtime import ModelRuntime
 from ..telemetry import AggregatedRouting, DecodedRouting, aggregate_routing
+from ..v2_domain import InterventionContextRef
 from .artifacts import AgentArtifactStore
 from .atif import BASH_JSON_SYSTEM_PROMPT, BASH_TOOL_DEFINITION
 from .domain import InferenceCall, utc_now
@@ -61,6 +62,8 @@ class InstrumentedAgentGateway:
         generation: GenerationConfig,
         request_key: str,
         scripted_content: str | None = None,
+        profile: ExpertProfile | None = None,
+        context: InterventionContextRef | None = None,
     ) -> GatewayResult:
         inference_id = str(uuid4())
         request_hash = hashlib.sha256(
@@ -76,7 +79,7 @@ class InstrumentedAgentGateway:
             completion = await self.runtime.complete_chat(
                 messages,
                 request_key=request_key,
-                profile=model_session.profile,
+                profile=profile,
                 generation=generation,
             )
         except Exception as error:
@@ -85,6 +88,13 @@ class InstrumentedAgentGateway:
                 trial_id=trial_id,
                 trajectory_step_id=trajectory_step_id,
                 model_session_id=model_session.id,
+                context_id=context.context_id if context is not None else None,
+                context_fingerprint=(
+                    context.context_fingerprint if context is not None else None
+                ),
+                topology_fingerprint=(
+                    context.topology_fingerprint if context is not None else None
+                ),
                 request_hash=request_hash,
                 latency_ms=(time.perf_counter() - started) * 1000,
                 started_at=started_at,
@@ -94,14 +104,55 @@ class InstrumentedAgentGateway:
             self.store.save_agent_inference(inference)
             raise
 
+        if context is not None and (
+            completion.context_id != context.context_id
+            or completion.context_fingerprint != context.context_fingerprint
+            or completion.topology_fingerprint != context.topology_fingerprint
+        ):
+            error = RuntimeError(
+                "model response expert-context provenance did not match the "
+                "coding trial context"
+            )
+            inference = InferenceCall(
+                id=inference_id,
+                trial_id=trial_id,
+                trajectory_step_id=trajectory_step_id,
+                model_session_id=model_session.id,
+                context_id=context.context_id,
+                context_fingerprint=context.context_fingerprint,
+                topology_fingerprint=context.topology_fingerprint,
+                request_hash=request_hash,
+                latency_ms=(time.perf_counter() - started) * 1000,
+                started_at=started_at,
+                completed_at=utc_now(),
+                error=_bounded_error(error),
+            )
+            self.store.save_agent_inference(inference)
+            raise error
         routing_artifact = self.artifacts.save_inference_routing(
-            trial_id, inference_id, completion.routing
+            trial_id,
+            inference_id,
+            completion.routing,
+            context_id=context.context_id if context is not None else None,
+            context_fingerprint=(
+                context.context_fingerprint if context is not None else None
+            ),
+            topology_fingerprint=(
+                context.topology_fingerprint if context is not None else None
+            ),
         )
         inference = InferenceCall(
             id=inference_id,
             trial_id=trial_id,
             trajectory_step_id=trajectory_step_id,
             model_session_id=model_session.id,
+            context_id=context.context_id if context is not None else None,
+            context_fingerprint=(
+                context.context_fingerprint if context is not None else None
+            ),
+            topology_fingerprint=(
+                context.topology_fingerprint if context is not None else None
+            ),
             request_hash=request_hash,
             prompt_tokens=completion.prompt_tokens,
             reasoning_tokens=completion.reasoning_tokens,

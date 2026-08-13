@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install uv
         run: curl -LsSf https://astral.sh/uv/0.11.32/install.sh | sh
@@ -33,11 +33,18 @@ jobs:
       - name: Lint backend
         run: uv run ruff check backend
 
+      - name: Check backend formatting
+        run: uv run ruff format --check backend
+
       - name: Validate deployment assets
         run: |
-          bash -n docker/runpod/pre_start.sh scripts/create_runpod_template.sh
+          bash -n \
+            docker/runpod/pre_start.sh \
+            docker/runpod/run_v2_live_acceptance_on_start.sh \
+            scripts/create_runpod_template.sh
           uv run python -m json.tool deploy/runpod-template.example.json >/dev/null
           uv run python -m json.tool deploy/runpod-agentic-template.example.json >/dev/null
+          uv run python -m json.tool deploy/runpod-v2-template.example.json >/dev/null
           MOE_TOOLS_IMAGE=ghcr.io/example/moe-tools:canary \
             MOE_TOOLS_TEMPLATE_DRY_RUN=1 \
             MOE_TOOLS_TEMPLATE_MODE=mock \
@@ -49,6 +56,12 @@ jobs:
             MOE_TOOLS_TEMPLATE_MODE=agentic \
             ./scripts/create_runpod_template.sh \
             | jq -e '.env.MOE_TOOLS_MODE == "vllm" and (.env.MOE_TOOLS_ANTHROPIC_API_KEY | contains("RUNPOD_SECRET"))' \
+            >/dev/null
+          MOE_TOOLS_IMAGE=ghcr.io/example/moe-tools@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            MOE_TOOLS_TEMPLATE_DRY_RUN=1 \
+            MOE_TOOLS_TEMPLATE_MODE=v2 \
+            ./scripts/create_runpod_template.sh \
+            | jq -e '(.name | contains("v2")) and .imageName == "ghcr.io/example/moe-tools@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
             >/dev/null
 
       - name: Run backend tests
@@ -63,10 +76,10 @@ jobs:
         working-directory: frontend
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
         with:
           node-version: 24.6.0
           cache: npm

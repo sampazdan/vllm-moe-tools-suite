@@ -409,6 +409,7 @@ def trajectory_to_view(
                 content=json.dumps(call.arguments, indent=2, sort_keys=True),
                 tool_name=call.function_name,
                 command=command,
+                tool_call_id=call.tool_call_id,
                 phase="command",
             )
         if step.observation is not None:
@@ -420,6 +421,7 @@ def trajectory_to_view(
                     type=TrajectoryStepType.OBSERVATION,
                     title="Command observation",
                     content=result.content,
+                    source_call_id=result.source_call_id,
                     phase="observation",
                     stream=(
                         extra.get("stream")

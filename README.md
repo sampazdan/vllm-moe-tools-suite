@@ -1,17 +1,18 @@
 # MoE Tools Test Suite
 
-MoE Atelier is a single-user research workbench for understanding expert routing,
-building expert-eligibility profiles, and measuring what those profiles do to a
-Mixture-of-Experts model. It keeps one-request benchmarks and multi-turn coding
-workloads in the same reproducible loop:
+MoE Atelier is a single-user experiment workbench for understanding expert
+routing, building expert-eligibility profiles, and measuring how those profiles
+change a Mixture-of-Experts model. Answer evaluation, coding, and stateful drift
+workloads share one reproducible experiment loop:
 
 1. load a model through the custom vLLM fork;
 2. run a pinned cohort and capture routed expert IDs and probabilities;
 3. explore the full layer-by-expert topology;
-4. create an immutable custom profile from one or more workloads;
-5. reload the model with that profile; and
-6. rerun the same contract and inspect a paired quality, behavior, routing, and
-   performance comparison.
+4. create an immutable mask with editable human metadata;
+5. activate baseline and candidate contexts on the same warm engine without
+   reloading weights; and
+6. run synchronized lanes over the same cohort and inspect quality, behavior,
+   state fidelity, routing, and performance together.
 
 The enabled model is `Qwen/Qwen3.6-35B-A3B-FP8`. The registry, topology contract,
 and model-session records are designed for more models later.
@@ -21,13 +22,36 @@ research stages.
 
 ## Release status
 
-`0.3.0-rc.1` is the current finish-line candidate. The exact application and fork
-commits have been published as an attested `linux/amd64` image and have completed a
-bounded live Runpod/Daytona/Anthropic acceptance pass. The immutable coordinates
-and observed results are recorded below. All GPU compute and owned Daytona
-sandboxes were stopped or deleted at handoff. The stopped acceptance Pod remains
-undeleted because permanent deletion would irreversibly erase its fresh 150 GB Pod
-volume and requires an explicit user decision.
+`0.4.0-rc.1` is the V2 candidate on `codex/moe-atelier-v2`. Local implementation
+and acceptance evidence are recorded in this branch, while immutable image and
+live Runpod coordinates are added only after the corresponding commits complete
+the release gates. Nothing in a manifest or mock run is represented as live model
+qualification.
+
+V2 is currently **local-only**. It has not been pushed as a release branch, built
+as an attested V2 image, installed as a V2 Runpod template, or exercised against a
+real GPU or Daytona sandbox. No V2 resource-cleanup claim is made because no
+V2-owned external resource was created. The remaining release gates are:
+
+- publish the exact application and fork commits and record the resulting OCI
+  digest and provenance attestation;
+- run the authenticated V2 acceptance driver on a real warm Qwen engine and
+  capture switch P50/P95, stable PID and memory, no weight reread, rollback,
+  routing, cold/hot equivalence, tensor-parallel/cache, eager, and CUDA evidence;
+- run model-authored coding in a real Daytona sandbox and verify provider-wide
+  cleanup;
+- qualify or precisely block one additional MoE model; and
+- record final Runpod/Daytona inventories, spend, and teardown state.
+
+Local mock evidence and screenshots are indexed in
+[`docs/evidence/v2-local/README.md`](docs/evidence/v2-local/README.md). The V2 live
+driver writes its own machine-readable result; no hand-authored JSON is treated as
+acceptance evidence.
+
+`0.3.0-rc.1` remains the last published and bounded live-accepted V1 release. Its
+exact application/fork commits, attested `linux/amd64` image, and Runpod/Daytona/
+Anthropic evidence are retained below as historical provenance. V2 does not
+reinterpret V1 rows or overwrite its deployment resources.
 
 An older internal candidate called **RC3** completed a bounded Runpod/Daytona test
 on 2026-08-11. Those historical results are retained near the end of this README
@@ -35,31 +59,135 @@ because they establish that the basic appliance, real-model telemetry, profile
 reload, and Daytona lifecycle worked. They are not acceptance evidence for
 `0.3.0-rc.1` or its newer evaluator, profile, command-center, and clean-room paths.
 
+## V2 architecture
+
+V2 separates five identities that V1 sometimes presented as one lifecycle:
+
+- **Engine instance:** one loaded model process and its compiled runtime.
+- **Intervention context:** the all-experts baseline or a named eligibility mask
+  bound to the loaded topology.
+- **Experiment:** one or two synchronized lanes with durable status and events.
+- **Workload:** an answer item, coding task, or deterministic state-drift
+  scenario whose adapter owns execution and evaluation.
+- **Profile:** immutable mask content and lineage plus mutable display name and
+  description. Renaming never changes the mask fingerprint or activates it.
+
+The fork exposes a loopback-only, separately authenticated control surface at
+`/v1/internal/moe-contexts`. Registration canonicalizes omitted layers as fully
+eligible. Activation rejects new inference, drains current work, clears
+context-sensitive caches, prepares all tensor-parallel workers, updates stable
+router buffers in place, synchronizes, commits unanimously, and rolls back on any
+failure. Receipts report old/new fingerprints, duration, process identity, and
+`weights_reloaded=false`. Data or pipeline parallel activation and unsupported
+router/kernel paths fail closed rather than restarting the model and calling it a
+hot switch.
+
+The application keeps this private token out of browser and sandbox environments.
+Its public API distinguishes model loads from context changes:
+
+```text
+POST  /api/model-sessions                  expensive weight lifecycle
+GET   /api/models                          pinned manifest and qualification state
+GET   /api/expert-contexts/current         active immutable provenance
+POST  /api/expert-contexts/activate        baseline/profile hot activation
+PATCH /api/profiles/{profile_id}           mutable name/description only
+GET   /api/workloads                       task-level readiness catalog
+POST  /api/experiments                     durable synchronized experiment
+GET   /api/experiments/{id}                lanes, runs, units, evaluations
+GET   /api/experiments/{id}/events         sequence-based durable polling
+GET   /api/experiments/{id}/events/stream  replayable SSE
+POST  /api/experiments/{id}/cancel         cooperative boundary cancellation
+```
+
+V2 persistence is additive. `Experiment`, lane, workload-run, run-unit,
+evaluation, performance, context, and append-only event tables live beside the V1
+schema. Event sequences are monotonic per experiment; terminal records survive a
+refresh, and interrupted active records are reconciled honestly after restart.
+Legacy records retain unknown provenance where it was never captured.
+
+### Model-load lifecycle semantics
+
+Model loading is a durable job with an ordered phase history. Application-owned
+phases such as queueing, model resolution, runtime configuration, process launch,
+readiness polling, context verification, and ready state are observed directly.
+The managed runtime may additionally emit authenticated loopback signals for cache
+checks, download byte/file progress, weight loading, distributed-worker startup,
+compilation, graph capture, and warming. If it does not emit a complete structured
+signal, the phase is persisted as **unavailable** with no fabricated timing or
+counter. Old rows use `legacy_unknown` rather than acquiring invented provenance.
+
+Cancellation keeps cleanup visible. Failures preserve a redacted diagnostic tail,
+a stable failure code, and a recovery action. Retry first verifies that the model
+revision, topology, and runtime recipe still match the immutable load plan, rejects
+manifest drift, and remains disabled when cleanup safety is uncertain.
+
+### Cohorts, evaluation, and budgets
+
+Answer and coding workload descriptors publish stable unit IDs. V2 creates real
+cohorts by persisting the ordered selected IDs and expanding each ID across seeds
+and baseline/candidate lanes. The UI defaults large workloads to a bounded subset,
+supports search and explicit selection, and caps one submission at 10,000 units;
+it never silently submits all 12,032 MMLU-Pro test items. Drift expands selected
+scenarios across conditions, horizons, seeds, and lanes.
+
+The cohort fingerprint binds workload content, exact ordered unit/scenario
+selection, seeds, generation settings, evaluation-contract fingerprint,
+execution-policy fingerprint, and Drift parameter fingerprint. V2 currently keeps
+paired work serialized with one attempt so context switches remain aligned.
+Evaluation may use the workload-owned deterministic contract or explicit
+record-only mode. Time, per-item time, token, turn, command, and optional paid-judge
+cost caps terminate work without fabricating a pass; exhausted units are retained
+as unscored. A V2 judge contract requires an explicit priced `max_cost_usd` policy.
+Archived experiments whose contracts were never captured remain visibly unknown
+and cannot be resumed under invented defaults.
+
+### State Drift Bench
+
+The first-party state-drift adapter uses typed deterministic state, reducers,
+snapshots, rollback, invariants, seeded perturbations, and exact hidden canonical
+checkpoints. It supports independent/oracle-reset, chained, and state-anchored
+conditions. Authoritative metrics include transition correctness, checkpoint
+fidelity and survival, first divergence, fidelity AUC, recovery, invariant and
+collateral failures, rollback correctness, divergence slope, and reliability
+horizons. Formula configuration is fingerprinted; no LLM judge replaces exact
+state validation.
+
+Each Drift experiment also persists a fingerprinted parameter set: dependency
+span, branch count, rollback depth, distractor ratio, deterministic tool-error
+rate, and state size. The command center renders final success, transition
+accuracy, survival and fidelity over time, recovery, violations, invalid calls,
+collateral mutations, rollback correctness, growth slope, 80%/50% reliability
+horizons, local competence, chained fidelity, paired drift, local-capability delta,
+compounding penalties, and checkpoint-aligned routing overlap/divergence. When
+routing exists, absolute baseline/candidate selection slots and routing mass remain
+visible alongside normalized deltas; the mock runtime correctly leaves them
+unknown.
+
+The design is informed by stateful-evaluation ideas from
+[LongDS-Bench](https://arxiv.org/abs/2605.30434),
+[τ²-bench](https://github.com/sierra-research/tau2-bench),
+[AppWorld](https://github.com/StonyBrookNLP/appworld), and
+[METR time horizons](https://metr.org/time-horizons/), but internal experiments
+are not described as official scores from those projects.
+
 ## What is in the application
 
-The warm, editorial interface is organized as full-screen research command centers
-that also collapse cleanly onto a phone:
+The warm, editorial V2 interface is organized as full-screen research command
+centers that also collapse cleanly onto a phone:
 
-- **Home** owns model load/reload state, topology, runtime facts, startup logs, a
-  compact chat, and the active durable job.
-- **Bench** browses datasets, opens individual problems and their public success
-  criteria, creates immutable cohorts, edits evaluation and execution contracts,
-  follows progress, and opens complete run records.
-- **Agents** selects a pinned coding pack and task attempts, configures the native
-  controller and remote sandbox, follows every trial, and opens its full
-  trajectory, verifier, artifact, routing, and performance record.
-- **Profiles** combines regular benchmark runs and agentic trials, assigns explicit
-  source weights, explores routing, edits expert eligibility, and saves immutable
-  profile revisions.
-- **Compare** contains strict paired views for both regular benchmarks and agentic
-  runs, including scores/rewards, outcome transitions, routing, budgets, and
-  performance. Benchmark comparisons are persisted. Agent comparisons are
-  deterministic views recomputed from their two durable runs; they are not stored
-  as independent archive records.
-- **Archive** persists benchmark runs, agent runs, profiles, and benchmark
-  comparisons.
-  Benchmark summaries and item histories are paginated; JSON/CSV exports stream so
-  large cohorts do not need a second full in-memory response.
+- **Experiments** creates and reopens answer, coding, and Drift lanes through one
+  command center, with durable progress, evaluation, performance, routing, and
+  event replay.
+- **Workload Library** exposes cohort/task readiness, stable unit IDs, provenance,
+  public problem statements, and blockers.
+- **Profiles** names and renames immutable masks, preserves lineage and fingerprint
+  identity, and links to the existing Profile Studio for expert selection.
+- **Models** owns the expensive weight lifecycle, structured phase history,
+  diagnostics, cancellation/retry, topology, and current intervention context.
+- **Settings** explains runtime security and readiness without presenting disabled
+  integrations as available.
+- **Legacy workflows** preserve the V1 Bench, Agents, Compare, and Archive routes
+  and their historical records; they are not rewritten as V2 experiments.
 
 Browser polling survives transient Runpod proxy failures, reconnects, and hard
 reloads. Model loads, dataset preparation, benchmark runs, and agent runs are
@@ -70,8 +198,9 @@ mutex until the worker has acknowledged termination. Startup reconciliation repa
 interrupted records and retries owned process or sandbox cleanup.
 
 There is no public “stop model” action in this candidate. The managed process is
-stopped internally when a model/profile reload replaces it or when the application
-shuts down; stopping paid idle compute remains a Runpod Pod operation.
+stopped internally when a different model load replaces it or when the application
+shuts down. A V2 baseline/profile activation does not stop or restart the process;
+stopping paid idle compute remains a Runpod Pod operation.
 
 ## Benchmark catalog
 
@@ -201,10 +330,12 @@ observed mass retained, parent profile, topology validation, and profile/source
 fingerprints. A profile can be created directly from a whole agent run by selecting
 all of its trial traces, or from any hand-picked mix of trials and ordinary runs.
 
-Profiles are applied only during model load. Changing one restarts vLLM and creates
-a new model session. The current fork changes expert eligibility before top-k
-routing; ineligible weights remain loaded. This is **behavioral masking**, not
-checkpoint pruning, expert offload, or a demonstrated reduction in VRAM.
+In V2, a saved profile is registered and hot-activated on the ready engine; a
+context change does not create a model session or reread weights. V1 archived
+sessions still describe their original cold-start profile honestly. The current
+fork changes expert eligibility before top-k routing; ineligible weights remain
+loaded. This is **behavioral masking**, not checkpoint pruning, expert offload, or
+a demonstrated reduction in VRAM.
 
 ## Native agentic coding
 
@@ -246,6 +377,7 @@ embedded Harbor runtime.
 | `smoke-python-v1` revision 2 | 3 | Tiny dependency-free repair/implementation tasks for controller, routing, verifier, and cleanup acceptance. |
 | `repo-engineering-v1` revision 2 | 3 | Moderate first-party repository tasks covering JSONL pipeline repair, dependency-graph release planning, and bounded asynchronous concurrency. |
 | `aider-polyglot-python-canary-3` | 3 of 225 | Pinned Python `zipper`, `wordy`, and `zebra-puzzle` edits adapted from [Aider Polyglot](https://github.com/Aider-AI/polyglot-benchmark) through Harbor. This is an application canary, **not** an official Aider leaderboard cohort or score. |
+| `aider-polyglot-python-expansion-5` | 5 of 225 | Pinned `affine-cipher`, `dominoes`, `proverb`, `transpose`, and `variable-length-quantity` Python tasks with isolated hidden verifiers, exact source attestation, and no-op/oracle admission. This is an application cohort, not an official Aider score. |
 
 The source-pinned external manifests for Terminal-Bench 2.1 engineering 15, Aider
 Polyglot balanced 12, and FeatureBench Fast 100 remain intentionally
@@ -255,8 +387,12 @@ are not complete. A pinned manifest is provenance, not permission to claim a sco
 
 ### Daytona provider
 
-The fake provider is deterministic and never invokes a host subprocess. Real coding
-trials use private ephemeral Daytona sandboxes through the exact
+The fake provider is deterministic and never invokes a host subprocess. It
+substitutes pinned oracle actions after model calls so the controller, persistence,
+trajectory, verifier, and UI contracts can be tested locally. A fake-provider pass
+is **diagnostic-only** and is not evidence of model-authored coding behavior or a
+release-qualifying coding result. Real coding trials use private ephemeral Daytona
+sandboxes through the exact
 [`daytona==0.192.0`](https://pypi.org/project/daytona/0.192.0/) SDK pin. Provider
 listing is side-effect free; the explicit preflight is a bounded read-only list
 request and creates no sandbox.
@@ -326,7 +462,10 @@ uv run ruff check backend scripts
 uv run pytest -q
 npm --prefix frontend test -- --run
 npm --prefix frontend run build
-bash -n docker/runpod/pre_start.sh scripts/create_runpod_template.sh
+bash -n \
+  docker/runpod/pre_start.sh \
+  docker/runpod/run_v2_live_acceptance_on_start.sh \
+  scripts/create_runpod_template.sh
 ```
 
 ## Container and Runpod runbook
@@ -362,14 +501,16 @@ docker buildx build \
   --platform linux/amd64 \
   --build-context vllm_source=../vllm-moe-tools \
   --file docker/Dockerfile.runpod \
+  --build-arg APP_SOURCE_REF="$(git rev-parse HEAD)" \
   --build-arg VLLM_SOURCE_REF="$(git -C ../vllm-moe-tools rev-parse HEAD)" \
-  --tag YOUR_REGISTRY/moe-tools-test-suite:0.3.0-rc.1 \
+  --tag YOUR_REGISTRY/moe-tools-test-suite:0.4.0-rc.1 \
   .
 ```
 
-`.github/workflows/publish-container.yml` publishes version and application-commit
-tags to `ghcr.io/sampazdan/vllm-moe-tools-suite`, creates a provenance attestation,
-and requires the exact fork SHA as a manual input. RC1 was published from:
+`.github/workflows/publish-container.yml` can publish version and
+application-commit tags to `ghcr.io/sampazdan/vllm-moe-tools-suite`, create a
+provenance attestation, and require the exact fork SHA as a manual input. The
+following coordinates belong only to the published V1 RC1:
 
 - application `0c8c8ffcbcd72f1cf9b664a1d4cf7813f701c345`;
 - vLLM fork `28a44cf4291c05af070c7d8398c462459b9992d1`;
@@ -386,9 +527,19 @@ which resolved to the verified child image above. Keep the full SHA plus resolve
 digest in experiment records; the full-SHA tag was the proven Runpod launch
 coordinate for this build.
 
+V2 will publish independently as `0.4.0-rc.1` after its external gates are
+authorized and run. No V2 OCI digest or attestation exists in this local handoff.
+Its workflow requires both the
+application commit (from the checked-out GitHub SHA) and a manually supplied
+full fork commit, pins every third-party action by commit, records both OCI
+labels, and has no tag-triggered V1 fallback. Use
+`deploy/runpod-v2-template.example.json` or
+`MOE_TOOLS_TEMPLATE_MODE=v2 ./scripts/create_runpod_template.sh`; V1 templates
+and their `/workspace/moe-tools` data directory are unchanged.
+
 ### Secrets and template
 
-Create Runpod secrets before deploying `deploy/runpod-agentic-template.example.json`:
+Create Runpod secrets before deploying `deploy/runpod-v2-template.example.json`:
 
 | Template reference | Application environment | Required for |
 | --- | --- | --- |
@@ -400,27 +551,85 @@ The uppercase Anthropic secret name is deliberate. An unresolved placeholder is
 treated as unconfigured and is never passed to vLLM or a sandbox. A Hugging Face
 token may be added through the private template when the model download needs it.
 
-Create the template with the full application-SHA tag proven on Runpod. A digest
-coordinate is also valid when the selected Runpod deployment path accepts OCI
-index digests:
+Create the template only with the published V2 OCI digest. The checked-in JSON
+keeps an explicit non-launchable placeholder until that digest exists, so it
+cannot be mistaken for a reproducible release coordinate:
 
 ```bash
 export RUNPOD_API_KEY="..."
-export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite:sha-0c8c8ffcbcd72f1cf9b664a1d4cf7813f701c345"
-export MOE_TOOLS_TEMPLATE_MODE="agentic"
-export MOE_TOOLS_TEMPLATE_NAME="moe-tools-agentic-a3b"
+export MOE_TOOLS_IMAGE="ghcr.io/sampazdan/vllm-moe-tools-suite@sha256:<64-hex-v2-digest>"
+export MOE_TOOLS_TEMPLATE_MODE="v2"
+export MOE_TOOLS_TEMPLATE_NAME="moe-atelier-v2-a3b"
 ./scripts/create_runpod_template.sh
 ```
 
-The script rejects `latest`, malformed digests, and invalid modes. The generated
+V2 mode rejects every tag, including semantic-version and application-SHA tags;
+it accepts only a complete lowercase `sha256` digest. The script also rejects
+`latest`, malformed digests, and invalid modes. The generated
 template configures port 8080, a 50 GB container disk, and `/workspace` for
 application state and the model cache. Runpod templates do not select a GPU: choose
-a compatible 96 GB RTX PRO 6000 Blackwell offering when the Pod is deployed. RC1
-acceptance used the **Workstation Edition**, not the Server Edition. Attach a
+a compatible 96 GB RTX PRO 6000 Blackwell offering when the Pod is deployed.
+Historical V1 RC1 acceptance used the **Workstation Edition**, not the Server
+Edition. Attach a
 network volume at `/workspace` if records and weights must outlive the Pod. A
 volume is tied to one Runpod data center and continues billing after the Pod stops.
 
-### RC1 live-acceptance driver
+### V2 live-acceptance driver — not yet executed on a GPU
+
+The V2 driver loads one model, creates and repeatedly activates three named
+profiles, rejects an invalid activation, verifies rename identity, follows and
+reconnects to a true multi-item answer cohort, and runs paired coding and Drift
+experiments. It writes a machine-readable record and keeps provider-wide inventory,
+failure injection, memory/equivalence, additional-model, browser, spend, and
+teardown gates explicitly false until separate evidence is supplied.
+
+The default fake coding provider is intentionally diagnostic-only and makes the
+driver exit nonzero. `--allow-missing-routing` is also diagnostic-only. A
+release-qualifying invocation requires real routing plus an explicitly authorized
+Daytona run:
+
+```bash
+MOE_TOOLS_CANARY_BASE_URL=https://POD_ID-8080.proxy.runpod.net \
+MOE_TOOLS_CANARY_TOKEN="..." \
+uv run python scripts/v2_live_acceptance.py \
+  --coding-provider daytona \
+  --output artifacts/v2-live-acceptance.json
+```
+
+The output is evidence for the in-appliance checks only. It does not by itself
+prove the external gates or authorize paid infrastructure.
+
+For a disposable acceptance Pod whose secrets are supplied by its private Runpod
+template, set `MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START=1`. After the application is
+ready, the image starts the same Daytona-qualified driver against loopback HTTP.
+The runner never passes credentials on the command line, performs provider-wide
+Daytona inventories before and after the run, and separates its persistent guard
+state from its private artifacts. Runpod's `/workspace` FUSE mount can report
+`0666` even after a successful `chmod 0600`, so it is not used for logs or
+evidence that may contain provider output.
+
+- `${MOE_TOOLS_DATA_DIR}/acceptance/v2-live-acceptance.status` is the nonsecret,
+  atomic at-most-once guard that survives a container restart on `/workspace`.
+- `${MOE_TOOLS_ACCEPTANCE_PRIVATE_DIR}` defaults to the POSIX-capable container
+  disk path `/var/lib/moe-tools/acceptance`. Its `v2-live-acceptance.json`,
+  `daytona-before.json`, `daytona-after.json`, and `v2-live-acceptance.log` are
+  required to retain mode `0600`; the directory must retain `0700`.
+- The terminal status records the private absolute paths and requires both a
+  byte-level credential scan and a successful permission readback. The runner
+  writes a persistent terminal failure and refuses paid work if those modes
+  cannot be enforced.
+
+This paid opt-in is at most once per persistent data directory. A terminal failure
+is not retried on container restart, and an interrupted run is marked rather than
+silently repeated. Copy the container-disk artifacts before deleting the Pod, and
+inspect and preserve them before deliberately removing the persistent status for a
+new attempt. The secure session cookie is
+rebound as non-Secure only inside the private canary client and only for literal
+plain-HTTP loopback; public proxy and arbitrary HTTP origins retain secure-cookie
+behavior. Browser, GPU-memory/equivalence, spend, and infrastructure teardown
+remain separate external gates.
+
+### Historical V1 RC1 live-acceptance driver
 
 The public API canary covers the bounded baseline-to-mask path. Daytona and
 Anthropic are opt-in because they create paid work:
@@ -431,7 +640,7 @@ MOE_TOOLS_CANARY_TOKEN="..." \
 uv run python scripts/acceptance_canary.py --daytona --anthropic-judge
 ```
 
-### RC1 acceptance record — observed 2026-08-11
+### Historical V1 RC1 acceptance record — observed 2026-08-11
 
 The immutable application/fork/image coordinates are recorded in
 [Reproducible image](#reproducible-image). Template `w2wkhbveg2`
@@ -588,16 +797,19 @@ verifier isolation, or paired agent comparison.
 
 ## Important limitations
 
-- Mask changes require a model restart; they are not hot-swappable.
+- V2 hot activation is supported only for the fork's safely discoverable modular
+  router paths and currently requires data parallel 1, pipeline parallel 1, and
+  one API-server process. Other paths fail closed; they do not silently restart.
 - Ineligible experts stay resident. Eligibility masking does not shrink the
   checkpoint, VRAM, host memory, or disk footprint.
 - Routed telemetry adds memory, transport, and latency overhead. Quality analysis
   should compare like with like; clean throughput claims need capture disabled.
-- The application is a single-user, one-model, one-GPU research appliance, not a
-  multi-tenant service.
-- Agent results depend on the exact task, scaffold, sandbox, model session, profile,
-  seed, generation, evaluator, and budget contract. A three-task canary is not a
-  leaderboard score.
+- The application is a single-user, one-ready-engine research appliance, not a
+  multi-tenant service. Manifest entries are selectable only after their exact
+  topology and runtime path qualify.
+- Agent results depend on the exact task, scaffold, sandbox, model session,
+  intervention context, seed, generation, evaluator, and budget contract. A
+  curated eight-task Python cohort is not a leaderboard score.
 - Terminal-Bench engineering 15, Aider balanced 12, and FeatureBench Fast remain
   fail-closed manifests until their real assets and harnesses pass admission.
 - Selective quantization, physical checkpoint materialization, expert offload, and

@@ -35,7 +35,8 @@ export type JobKind =
   | "model_load"
   | "benchmark_run"
   | "dataset_prepare"
-  | "agent_run";
+  | "agent_run"
+  | "experiment_run";
 export type JobStatus =
   | "queued"
   | "running"
@@ -44,6 +45,43 @@ export type JobStatus =
   | "failed"
   | "cancelled";
 
+export type ModelLoadPhase =
+  | "queued"
+  | "resolving_model"
+  | "stopping_previous"
+  | "configuring_runtime"
+  | "launching_process"
+  | "checking_cache"
+  | "downloading"
+  | "loading_weights"
+  | "initializing_distributed_workers"
+  | "compiling"
+  | "capturing_graphs"
+  | "warming"
+  | "waiting_for_readiness"
+  | "starting_runtime"
+  | "verifying_ready_context"
+  | "ready"
+  | "cancelled"
+  | "failed";
+
+export interface JobPhaseRecord {
+  phase: ModelLoadPhase;
+  status: "active" | "completed" | "failed" | "cancelled" | "unavailable";
+  observability: "observed" | "unavailable";
+  source: "application" | "managed_runtime" | "legacy_unknown";
+  started_at: string;
+  completed_at: string | null;
+  detail: string | null;
+  bytes_current: number | null;
+  bytes_total: number | null;
+  files_current: number | null;
+  files_total: number | null;
+  failure_code: string | null;
+  recovery_action: string | null;
+  diagnostics: string | null;
+}
+
 export interface JobRecord {
   id: string;
   kind: JobKind;
@@ -51,7 +89,9 @@ export interface JobRecord {
   progress_current: number;
   progress_total: number;
   result_id: string | null;
+  retry_of_job_id?: string | null;
   error: string | null;
+  phase_history: JobPhaseRecord[];
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
@@ -69,7 +109,7 @@ export interface ModelRegistryEntry {
   display_name: string;
   enabled: boolean;
   revision: string | null;
-  topology: ModelTopology;
+  topology: ModelTopology | null;
   notes: string;
 }
 
@@ -797,6 +837,8 @@ export interface TrajectoryStep {
   content: string;
   tool_name: string | null;
   command: string | null;
+  tool_call_id?: string | null;
+  source_call_id?: string | null;
   exit_code: number | null;
   duration_ms: number | null;
   truncated: boolean;

@@ -11,17 +11,21 @@ FROM --platform=linux/amd64 runpod/pytorch:1.0.3-cu1300-torch290-ubuntu2404@sha2
 
 ARG VLLM_PRECOMPILED_WHEEL_COMMIT=b1e12d142d8c9533f857f8da13d8fc368e95a8cd
 ARG VLLM_PRECOMPILED_WHEEL_VARIANT=cu130
-ARG VLLM_IMAGE_VERSION=0.1.dev1+moe-tools
+ARG VLLM_IMAGE_VERSION=0.2.dev0+moe-atelier-v2
+ARG APP_SOURCE_REF
 ARG VLLM_SOURCE_REF
 ARG IMAGE_SOURCE=https://github.com/sampazdan/vllm-moe-tools-suite
 
+RUN printf '%s\n' "${APP_SOURCE_REF}" \
+    | grep -Eq '^[0-9a-f]{40}$'
 RUN printf '%s\n' "${VLLM_SOURCE_REF}" \
     | grep -Eq '^[0-9a-f]{40}$'
 
 LABEL org.opencontainers.image.title="MoE Tools Test Suite" \
       org.opencontainers.image.description="Interactive expert-routing and pruning research appliance" \
       org.opencontainers.image.source="${IMAGE_SOURCE}" \
-      org.opencontainers.image.revision="${VLLM_SOURCE_REF}"
+      org.opencontainers.image.revision="${APP_SOURCE_REF}" \
+      io.moe-atelier.vllm-source-revision="${VLLM_SOURCE_REF}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -36,8 +40,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCHINDUCTOR_CACHE_DIR=/workspace/cache/torchinductor \
     TRITON_CACHE_DIR=/workspace/cache/triton \
     RUNPOD_RESULTS_DIR=/workspace/results \
+    MOE_TOOLS_APP_SOURCE_REF=${APP_SOURCE_REF} \
     RUNPOD_VLLM_SOURCE_REF=${VLLM_SOURCE_REF} \
     RUNPOD_VLLM_MODEL=Qwen/Qwen3.6-35B-A3B-FP8 \
+    RUNPOD_VLLM_REVISION=95a723d08a9490559dae23d0cff1d9466213d989 \
     RUNPOD_VLLM_HOST=127.0.0.1 \
     RUNPOD_VLLM_PORT=8000 \
     RUNPOD_VLLM_MAX_MODEL_LEN=4096 \
@@ -108,20 +114,29 @@ COPY backend/ backend/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/vllm-venv/bin/python --no-deps .
 COPY --from=frontend-build /build/frontend/dist frontend/dist
+COPY scripts/acceptance_canary.py scripts/v2_live_acceptance.py \
+    scripts/daytona_inventory.py scripts/
 
 COPY --from=vllm_source docker/runpod/profile.sh /etc/profile.d/vllm-runpod.sh
 COPY --from=vllm_source docker/runpod/runpod-serve.sh /usr/local/bin/runpod-serve
 COPY --from=vllm_source docker/runpod/runpod-bench.sh /usr/local/bin/runpod-bench
 COPY --from=vllm_source docker/runpod/make_moe_profile.py /usr/local/bin/make-moe-profile
 COPY docker/runpod/pre_start.sh /pre_start.sh
+COPY docker/runpod/run_v2_live_acceptance_on_start.sh \
+    /usr/local/bin/run-v2-live-acceptance-on-start
 
 RUN chmod 0755 \
         /pre_start.sh \
+        /usr/local/bin/run-v2-live-acceptance-on-start \
         /usr/local/bin/runpod-serve \
         /usr/local/bin/runpod-bench \
         /usr/local/bin/make-moe-profile \
-    && chmod 0644 /etc/profile.d/vllm-runpod.sh \
-    && /opt/vllm-venv/bin/python -c "from pathlib import Path; import moe_tools_suite, torch, vllm; torch_lib = Path(torch.__file__).parent / 'lib'; assert torch.version.cuda == '13.0', f'expected CUDA 13.0 PyTorch, got {torch.__version__} ({torch.version.cuda=})'; assert (torch_lib / 'libtorch_cuda.so').is_file(), f'libtorch_cuda.so missing from {torch_lib}'; print(moe_tools_suite.__version__, vllm.__version__, torch.__version__, torch.version.cuda)"
+    && chmod 0644 \
+        /etc/profile.d/vllm-runpod.sh \
+        /opt/moe-tools-test-suite/scripts/acceptance_canary.py \
+        /opt/moe-tools-test-suite/scripts/v2_live_acceptance.py \
+        /opt/moe-tools-test-suite/scripts/daytona_inventory.py \
+    && /opt/vllm-venv/bin/python -c "from importlib.metadata import version; from pathlib import Path; import hf_xet, huggingface_hub, moe_tools_suite, safetensors, sentencepiece, tiktoken, tokenizers, torch, transformers, vllm; expected = {'hf-xet': '1.5.1', 'huggingface-hub': '1.26.0', 'safetensors': '0.8.0', 'sentencepiece': '0.2.1', 'tiktoken': '0.12.0', 'tokenizers': '0.22.2', 'transformers': '5.14.1'}; actual = {package: version(package) for package in expected}; assert actual == expected, f'tokenizer runtime mismatch: {actual!r}'; torch_lib = Path(torch.__file__).parent / 'lib'; assert torch.version.cuda == '13.0', f'expected CUDA 13.0 PyTorch, got {torch.__version__} ({torch.version.cuda=})'; assert (torch_lib / 'libtorch_cuda.so').is_file(), f'libtorch_cuda.so missing from {torch_lib}'; print(moe_tools_suite.__version__, vllm.__version__, torch.__version__, torch.version.cuda, actual)"
 
 WORKDIR /workspace
 EXPOSE 8080

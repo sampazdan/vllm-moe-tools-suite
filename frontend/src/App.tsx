@@ -577,6 +577,10 @@ export default function App() {
 
   async function refreshRecoveredJob(job: JobRecord) {
     setJobAdoptionNotice(null);
+    if (job.kind === "experiment_run") {
+      await queryClient.invalidateQueries({ queryKey: ["v2-experiments"] });
+      return;
+    }
     if (job.kind === "model_load") {
       await refreshModelQueries();
       return;
@@ -717,6 +721,8 @@ export default function App() {
               <span className="section-label">
                 {activeJob.kind === "model_load"
                   ? "Model job"
+                  : activeJob.kind === "experiment_run"
+                    ? "Experiment job"
                   : activeJob.kind === "dataset_prepare"
                     ? "Dataset job"
                     : activeJob.kind === "agent_run"
@@ -781,9 +787,9 @@ export default function App() {
             </div>
             <p>{model?.notes}</p>
             <div className="fact-row">
-              <Fact value={model?.topology.num_layers ?? "—"} label="MoE layers" />
-              <Fact value={model?.topology.num_experts ?? "—"} label="Experts / layer" />
-              <Fact value={model?.topology.top_k ?? "—"} label="Active / token" />
+              <Fact value={model?.topology?.num_layers ?? "—"} label="MoE layers" />
+              <Fact value={model?.topology?.num_experts ?? "—"} label="Experts / layer" />
+              <Fact value={model?.topology?.top_k ?? "—"} label="Active / token" />
             </div>
             <button
               className="primary-button"
@@ -1094,7 +1100,7 @@ export default function App() {
               </div>
             )}
 
-            {routingVariant === "baseline" && baselineRun ? (
+            {routingVariant === "baseline" && baselineRun && model?.topology ? (
               <>
                 <div className="profile-workbench">
                   <div>
@@ -1109,8 +1115,8 @@ export default function App() {
                     <input
                       aria-label="Experts to keep per routed layer"
                       type="range"
-                      min={model?.topology.top_k ?? 8}
-                      max={model?.topology.num_experts ?? 256}
+                      min={model.topology.top_k}
+                      max={model.topology.num_experts}
                       step="8"
                       value={keepPerLayer}
                       disabled={proposeProfile.isPending}
@@ -1211,12 +1217,14 @@ export default function App() {
                 <div>
                   <span className="section-label">Profile proposals use baselines</span>
                   <h3>
-                    {baselineRun
+                    {baselineRun && !model?.topology
+                      ? "Profile shaping is unavailable until this model’s routed-expert topology is discovered."
+                      : baselineRun
                       ? "Return to baseline routing to shape another mask."
                       : "Choose a baseline run before shaping or comparing profiles."}
                   </h3>
                 </div>
-                {baselineRun ? (
+                {baselineRun && !model?.topology ? null : baselineRun ? (
                   <button
                     className="text-button"
                     onClick={() => setRoutingVariant("baseline")}
@@ -1374,7 +1382,7 @@ export default function App() {
           </section>
         )}
 
-        {model && (
+        {model?.topology && (
           <ResearchArchive
             runs={runsQuery.data?.items ?? []}
             profiles={profiles}
@@ -1507,6 +1515,7 @@ function formatBytes(value: number) {
 }
 
 function jobKindLabel(kind: JobRecord["kind"]) {
+  if (kind === "experiment_run") return "experiment";
   if (kind === "model_load") return "model load";
   if (kind === "dataset_prepare") return "dataset preparation";
   if (kind === "agent_run") return "coding run";

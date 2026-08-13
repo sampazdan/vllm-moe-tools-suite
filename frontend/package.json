@@ -1,12 +1,12 @@
 {
   "name": "moe-tools-test-suite-frontend",
   "private": true,
-  "version": "0.3.0-rc.1",
+  "version": "0.4.0-rc.1",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
-    "test": "node --experimental-transform-types --test src/*.test.ts",
+    "test": "node --experimental-transform-types --test src/*.test.ts src/v2/*.test.ts",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {

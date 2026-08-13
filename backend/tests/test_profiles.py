@@ -5,7 +5,12 @@ from moe_tools_suite.domain import (
     ProfileLayer,
     RoutingSummary,
 )
-from moe_tools_suite.profiles import propose_fixed_budget_profile, validate_profile
+from moe_tools_suite.profiles import (
+    canonical_profile_layer_map,
+    expert_profile_fingerprint,
+    propose_fixed_budget_profile,
+    validate_profile,
+)
 from pydantic import ValidationError
 
 
@@ -33,6 +38,43 @@ def test_profile_matches_fork_schema_and_supports_sparse_layers(
         "version": 1,
         "layers": {"3": {"keep": [0, 2]}},
     }
+
+
+def test_profile_fingerprint_matches_canonical_full_runtime_mask(
+    topology: ModelTopology,
+) -> None:
+    sparse = ExpertProfile(layers={"3": ProfileLayer(keep=[2, 0])})
+    explicit = ExpertProfile(
+        layers={
+            "7": ProfileLayer(keep=[3, 1, 0, 2]),
+            "3": ProfileLayer(keep=[0, 2]),
+        }
+    )
+
+    assert canonical_profile_layer_map(sparse, topology) == {
+        "3": {"keep": [0, 2]},
+        "7": {"keep": [0, 1, 2, 3]},
+    }
+    assert expert_profile_fingerprint(sparse, topology) == (
+        expert_profile_fingerprint(explicit, topology)
+    )
+    assert expert_profile_fingerprint(sparse, topology) == (
+        "7d27055560c18d5a9fad038620643c9517c003402a2bd8102df75141b914dc6e"
+    )
+
+
+def test_profile_fingerprint_matches_fork_contract_vector() -> None:
+    topology = ModelTopology(
+        num_layers=2,
+        num_experts=4,
+        top_k=2,
+        routed_layer_ids=[2, 3],
+    )
+    profile = ExpertProfile(layers={"2": ProfileLayer(keep=[1, 0])})
+
+    assert expert_profile_fingerprint(profile, topology) == (
+        "a17d14598059438d9adeca3139d5645070d130c45d65a30e940001894366914e"
+    )
 
 
 @pytest.mark.parametrize("bad_keep", [[0], [0, 4]])

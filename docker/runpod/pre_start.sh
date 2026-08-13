@@ -7,6 +7,18 @@ data_root="${MOE_TOOLS_DATA_DIR:-/workspace/moe-tools}"
 log_dir="${data_root}/logs"
 pid_file="${data_root}/app.pid"
 startup_timeout="${MOE_TOOLS_APP_STARTUP_TIMEOUT_SECONDS:-300}"
+startup_acceptance="${MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START:-0}"
+
+if [[ "${startup_acceptance}" != "0" && "${startup_acceptance}" != "1" ]]; then
+    echo "MOE_TOOLS_RUN_V2_ACCEPTANCE_ON_START must be 0 or 1." >&2
+    exit 2
+fi
+
+launch_startup_acceptance() {
+    if [[ "${startup_acceptance}" == "1" ]]; then
+        /usr/local/bin/run-v2-live-acceptance-on-start
+    fi
+}
 
 if [[ ! "${startup_timeout}" =~ ^[0-9]+$ ]]; then
     echo "MOE_TOOLS_APP_STARTUP_TIMEOUT_SECONDS must be an integer from 5 to 900." >&2
@@ -50,6 +62,7 @@ if [[ -f "${pid_file}" ]]; then
     if [[ "${existing_pid}" =~ ^[0-9]+$ ]] && kill -0 "${existing_pid}" 2>/dev/null; then
         if curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null; then
             echo "MoE Tools Test Suite is already running."
+            launch_startup_acceptance
             exit 0
         fi
 
@@ -95,6 +108,7 @@ deadline=$((SECONDS + startup_timeout))
 while (( SECONDS < deadline )); do
     if curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null; then
         echo "MoE Tools Test Suite is ready on port 8080 (PID $(<"${pid_file}"))."
+        launch_startup_acceptance
         exit 0
     fi
     if ! kill -0 "${app_pid}" 2>/dev/null; then

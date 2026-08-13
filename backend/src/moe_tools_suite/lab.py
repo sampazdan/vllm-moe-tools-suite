@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import numpy as np
@@ -20,7 +20,8 @@ from .agentic.comparison import (
     compare_agent_runs,
 )
 from .agentic.controller import AgenticController
-from .agentic.domain import CreateAgentRunRequest
+from .agentic.domain import CreateAgentRunRequest, TerminationCause
+from .agentic.task_packs import load_external_task_pack_registry
 from .benchmarks import BenchmarkAdapter, BenchmarkCatalog
 from .domain import (
     BenchmarkCohort,
@@ -48,11 +49,13 @@ from .domain import (
     GenerationConfig,
     InferencePerformance,
     JobKind,
+    JobPhaseRecord,
     JobRecord,
     JobStatus,
     JudgeEvaluationRequest,
     JudgeMode,
     LLMJudgeResult,
+    ModelLoadPhase,
     ModelRegistryEntry,
     ModelSession,
     ModelState,
@@ -76,6 +79,12 @@ from .domain import (
     SuccessCriteriaView,
 )
 from .evaluation import evaluate_output, validate_cost_policy_pricing
+from .experiments import (
+    ExperimentAdapterRequest,
+    ExperimentAdapterResult,
+    ExperimentCancellationRequested,
+    ExperimentService,
+)
 from .expert_explorer import (
     ResolvedRoutingSource,
     RoutingExploreRequest,
@@ -91,20 +100,64 @@ from .judges import (
     JudgeService,
     judge_request_cost_upper_bound,
 )
+from .model_registry import QUALIFIED_MODEL_ID, model_registry
 from .persistence import SqliteStore
-from .process_manager import ManagedVllmServer
+from .process_manager import (
+    ManagedVllmServer,
+    ModelLoadPhaseUpdate,
+    redact_runtime_secrets,
+)
 from .profiles import (
+    EXPERT_PROFILE_FINGERPRINT_VERSION,
     calculate_observed_mass_retained,
+    canonical_profile_layer_map,
+    expert_profile_fingerprint,
+    legacy_profile_fingerprint,
     propose_fixed_budget_profile,
     validate_profile,
 )
-from .runtime import MockModelRuntime, ModelRuntime, VllmRuntime
+from .runtime import (
+    CompletionProgressCallback,
+    MockModelRuntime,
+    ModelRuntime,
+    VllmRuntime,
+)
 from .settings import Settings
 from .telemetry import AggregatedRouting, aggregate_routing
+from .v2_domain import (
+    ContextActivationResult,
+    CreateExperimentRequest,
+    EvaluationResultRecord,
+    Experiment,
+    ExperimentDetail,
+    ExperimentStatus,
+    InterventionContextRef,
+    InterventionKind,
+    PerformanceSnapshot,
+    RunEventPage,
+    UpdateProfileMetadataRequest,
+    WorkloadDescriptor,
+    WorkloadKind,
+    canonical_fingerprint,
+)
 
-MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8"
+MODEL_ID = QUALIFIED_MODEL_ID
 FIXTURE_BENCHMARK_ID = "fixture-arithmetic"
 logger = logging.getLogger(__name__)
+
+_MODEL_LOAD_CHILD_PHASES = (
+    ModelLoadPhase.CHECKING_CACHE,
+    ModelLoadPhase.DOWNLOADING,
+    ModelLoadPhase.LOADING_WEIGHTS,
+    ModelLoadPhase.INITIALIZING_DISTRIBUTED_WORKERS,
+    ModelLoadPhase.COMPILING,
+    ModelLoadPhase.CAPTURING_GRAPHS,
+    ModelLoadPhase.WARMING,
+)
+
+
+class _ModelLoadCleanupError(RuntimeError):
+    """A failed model load could not prove its managed process was stopped."""
 
 
 @dataclass
@@ -146,27 +199,16 @@ class ResearchLab:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.topology = ModelTopology(
-            num_layers=40,
-            num_experts=256,
-            top_k=8,
-            routed_layer_ids=list(range(40)),
+        self.models = model_registry()
+        self._active_model = next(
+            model for model in self.models if model.id == MODEL_ID
         )
-        self.models = [
-            ModelRegistryEntry(
-                id=MODEL_ID,
-                display_name="Qwen 3.6 35B A3B FP8",
-                enabled=True,
-                topology=self.topology,
-                notes=(
-                    "Validated target for one RTX PRO 6000 Blackwell. "
-                    "Mock mode synthesizes its 40 × 256 routing topology."
-                ),
-            )
-        ]
+        assert self._active_model.topology is not None
+        self.topology = self._active_model.topology.model_copy(deep=True)
         self.session: ModelSession | None = None
         self.store = SqliteStore(settings.data_dir)
         self.store.reconcile_interrupted_state()
+        self.store.reconcile_interrupted_experiments()
         self.datasets = self.store.load_benchmark_datasets()
         self.benchmark_catalog = BenchmarkCatalog(
             settings.data_dir,
@@ -189,6 +231,8 @@ class ResearchLab:
             for job_id, (job, payload) in self.store.load_jobs().items()
         }
         self.profiles = self.store.load_expert_profiles()
+        self.intervention_contexts = self.store.load_intervention_contexts()
+        self.active_context: InterventionContextRef | None = None
         self.comparisons = self.store.load_comparisons()
         self.judges = JudgeService(settings=settings, cache=self.store)
         self._job_guard = Lock()
@@ -201,18 +245,37 @@ class ResearchLab:
             store=self.store,
             runtime=self.runtime,
             topology=self.topology,
-            model_id=MODEL_ID,
+            model_id=self._active_model.id,
             judge_service=self.judges,
         )
+        self.experiments = ExperimentService(
+            store=self.store,
+            runtime=self.runtime,
+            topology=self.topology,
+            model_id=self._active_model.id,
+            mode=self.settings.mode,
+            profiles=self.profiles,
+            activate_context=lambda profile_id: self.activate_expert_context(
+                profile_id, internal=True
+            ),
+            context_builder=self._context_reference,
+            current_context=self.current_intervention_context,
+            current_session=self.current_model_session,
+            answer_executor=self._execute_v2_answer_unit,
+            coding_executor=self._execute_v2_coding_unit,
+        )
 
-    def _create_runtime(self) -> ModelRuntime:
+    def _create_runtime(self, model: ModelRegistryEntry | None = None) -> ModelRuntime:
+        selected = model or self._active_model
+        if selected.topology is None:
+            raise RuntimeError("enabled model is missing its manifest topology")
         if self.settings.mode == "vllm":
             return VllmRuntime(
                 base_url=self.settings.vllm_base_url,
-                model_id=MODEL_ID,
-                topology=self.topology,
+                model_id=selected.id,
+                topology=selected.topology,
             )
-        return MockModelRuntime(self.topology)
+        return MockModelRuntime(selected.topology)
 
     def _create_server(self) -> ManagedVllmServer | None:
         if self.settings.mode != "vllm":
@@ -220,7 +283,7 @@ class ResearchLab:
         return ManagedVllmServer(
             command=self.settings.vllm_command,
             base_url=self.settings.vllm_base_url,
-            model_id=MODEL_ID,
+            model_id=self._active_model.id,
             data_dir=self.settings.data_dir,
             startup_timeout_seconds=self.settings.vllm_startup_timeout_seconds,
             shutdown_timeout_seconds=self.settings.vllm_shutdown_timeout_seconds,
@@ -229,6 +292,254 @@ class ResearchLab:
 
     def list_benchmarks(self) -> list[BenchmarkInfo]:
         return self.benchmark_catalog.list_benchmarks()
+
+    def list_workloads(self) -> list[WorkloadDescriptor]:
+        descriptors: list[WorkloadDescriptor] = []
+        for benchmark in self.benchmark_catalog.list_benchmarks():
+            blocked_reason = None
+            try:
+                adapter = self.benchmark_catalog.get_adapter(benchmark.id)
+                items = adapter.items()
+                content_fingerprint = adapter.content_hash
+            except RuntimeError as error:
+                items = []
+                content_fingerprint = canonical_fingerprint(
+                    benchmark.model_dump(mode="json")
+                )
+                blocked_reason = str(error)
+            if items:
+                descriptors.append(
+                    WorkloadDescriptor(
+                        id=f"answer:{benchmark.id}",
+                        kind=WorkloadKind.ANSWER,
+                        name=f"{benchmark.name} cohort",
+                        description=benchmark.description,
+                        source=benchmark.source,
+                        revision=benchmark.revision,
+                        content_fingerprint=canonical_fingerprint(
+                            {
+                                "dataset": content_fingerprint,
+                                "item_ids": [item.id for item in items],
+                            }
+                        ),
+                        ready=benchmark.ready,
+                        blocked_reason=blocked_reason,
+                        unit_ids=[item.id for item in items],
+                        parent_id=benchmark.id,
+                        difficulty="mixed",
+                        expected_horizon=1,
+                        tools=[],
+                        runtime="model completion + deterministic scorer",
+                        preparation_status=(
+                            "validated" if benchmark.ready else "not_prepared"
+                        ),
+                        public_problem_statement=(
+                            f"Run the pinned {benchmark.name} item cohort."
+                        ),
+                        public_success_criteria=[
+                            "Score each item with the pinned "
+                            f"{benchmark.scoring.value} "
+                            "adapter contract."
+                        ],
+                        metadata={
+                            "benchmark_name": benchmark.name,
+                            "license": benchmark.license,
+                            "descriptor_scope": "cohort",
+                        },
+                    )
+                )
+            for item in items:
+                descriptors.append(
+                    WorkloadDescriptor(
+                        id=f"answer:{benchmark.id}:{item.id}",
+                        kind=WorkloadKind.ANSWER,
+                        name=f"{benchmark.name} · {item.id}",
+                        description=item.prompt,
+                        source=benchmark.source,
+                        revision=benchmark.revision,
+                        content_fingerprint=canonical_fingerprint(
+                            {
+                                "dataset": content_fingerprint,
+                                "item": item.model_dump(mode="json"),
+                            }
+                        ),
+                        ready=benchmark.ready,
+                        blocked_reason=blocked_reason,
+                        unit_ids=[item.id],
+                        parent_id=benchmark.id,
+                        task_id=item.id,
+                        difficulty=str(item.metadata.get("difficulty", "unspecified")),
+                        expected_horizon=1,
+                        tools=[],
+                        runtime="model completion + deterministic scorer",
+                        preparation_status=(
+                            "validated" if benchmark.ready else "not_prepared"
+                        ),
+                        public_problem_statement=item.prompt,
+                        public_success_criteria=[
+                            f"Pass the benchmark's {benchmark.scoring.value} scorer."
+                        ],
+                        metadata={
+                            "category": item.category,
+                            "benchmark_name": benchmark.name,
+                            "license": benchmark.license,
+                        },
+                    )
+                )
+        packs = {pack.id: pack for pack in self.agentic.list_task_packs()}
+        for pack_id, pack in packs.items():
+            tasks = self.agentic.list_tasks(pack_id)
+            ready = pack.ready and pack.oracle_passed and pack.noop_failed
+            if tasks:
+                descriptors.append(
+                    WorkloadDescriptor(
+                        id=f"coding:{pack_id}",
+                        kind=WorkloadKind.CODING,
+                        name=f"{pack.name} cohort",
+                        description=pack.description,
+                        source=pack.source,
+                        revision=pack.revision,
+                        content_fingerprint=canonical_fingerprint(
+                            {
+                                "pack": pack.fingerprint,
+                                "task_ids": [task.id for task in tasks],
+                            }
+                        ),
+                        ready=ready,
+                        blocked_reason=(
+                            None
+                            if ready
+                            else "task pack has not passed oracle/no-op eligibility"
+                        ),
+                        unit_ids=[task.id for task in tasks],
+                        parent_id=pack_id,
+                        language=(
+                            tasks[0].language
+                            if len({task.language for task in tasks}) == 1
+                            else "mixed"
+                        ),
+                        difficulty="mixed",
+                        expected_horizon=max(
+                            _task_expected_horizon(task.tags) for task in tasks
+                        ),
+                        tools=["bash"],
+                        runtime="one isolated sandbox per selected task",
+                        preparation_status=("validated" if ready else "not_eligible"),
+                        public_problem_statement=(
+                            f"Run the pinned {pack.name} engineering task cohort."
+                        ),
+                        public_success_criteria=[
+                            "Each selected task must pass its protected verifier."
+                        ],
+                        metadata={
+                            "tags": pack.tags,
+                            "descriptor_scope": "cohort",
+                        },
+                    )
+                )
+            for task in tasks:
+                ready = pack.ready and pack.oracle_passed and pack.noop_failed
+                descriptors.append(
+                    WorkloadDescriptor(
+                        id=f"coding:{pack_id}:{task.id}",
+                        kind=WorkloadKind.CODING,
+                        name=task.title,
+                        description=task.instruction,
+                        source=pack.source,
+                        revision=pack.revision,
+                        content_fingerprint=canonical_fingerprint(
+                            {
+                                "pack": pack.fingerprint,
+                                "task_id": task.id,
+                                "verifier": task.verifier_fingerprint(),
+                            }
+                        ),
+                        ready=ready,
+                        blocked_reason=(
+                            None
+                            if ready
+                            else "task pack has not passed oracle/no-op eligibility"
+                        ),
+                        unit_ids=[task.id],
+                        parent_id=pack_id,
+                        task_id=task.id,
+                        language=task.language,
+                        difficulty=_task_difficulty(task.tags),
+                        expected_horizon=_task_expected_horizon(task.tags),
+                        tools=["bash"],
+                        runtime=(
+                            f"{task.image_ref}@{task.image_digest}; "
+                            f"{task.timeout_seconds:g}s timeout"
+                        ),
+                        preparation_status=("validated" if ready else "not_eligible"),
+                        public_problem_statement=task.instruction,
+                        public_success_criteria=list(task.success_criteria),
+                        metadata={
+                            "category": task.category,
+                            "network_policy": task.network_policy.value,
+                            "tags": task.tags,
+                        },
+                    )
+                )
+        registry = load_external_task_pack_registry()
+        bundled_pack_ids = set(packs)
+        for pack in registry.task_packs:
+            if pack.id in bundled_pack_ids or pack.launchable:
+                continue
+            task_ids = pack.curated_task_ids or [f"{pack.id}:unselected-cohort"]
+            blocker = "; ".join(pack.limitations)
+            for task_id in task_ids:
+                descriptors.append(
+                    WorkloadDescriptor(
+                        id=f"coding:{pack.id}:{task_id}",
+                        kind=WorkloadKind.CODING,
+                        name=f"{pack.name} · {task_id}",
+                        description=pack.curated_selection,
+                        source=str(pack.source_url),
+                        revision=pack.source_revision,
+                        content_fingerprint=canonical_fingerprint(
+                            {
+                                "registry": registry.content_hash,
+                                "pack": pack.id,
+                                "task": task_id,
+                            }
+                        ),
+                        ready=False,
+                        blocked_reason=blocker,
+                        unit_ids=[task_id],
+                        parent_id=pack.id,
+                        task_id=task_id,
+                        language=_external_language(task_id),
+                        difficulty="unqualified",
+                        expected_horizon=None,
+                        tools=["bash"],
+                        runtime=pack.distribution,
+                        preparation_status=pack.preparation_state.value,
+                        public_problem_statement=(
+                            "Public task content becomes available only after the "
+                            "pinned assets are prepared."
+                        ),
+                        public_success_criteria=[pack.success_criteria],
+                        metadata={
+                            "family": pack.family,
+                            "license": pack.license,
+                            "assets_prepared": pack.assets_prepared,
+                            "oracle_passed": pack.oracle_passed,
+                            "noop_failed": pack.noop_failed,
+                        },
+                    )
+                )
+        descriptors.append(self.experiments.state_drift_descriptor())
+        return sorted(descriptors, key=lambda item: (item.kind.value, item.name))
+
+    def get_workload_descriptor(self, workload_id: str) -> WorkloadDescriptor:
+        descriptor = next(
+            (item for item in self.list_workloads() if item.id == workload_id),
+            None,
+        )
+        if descriptor is None:
+            raise KeyError(workload_id)
+        return descriptor
 
     async def startup(self) -> None:
         if self.server is not None:
@@ -349,22 +660,16 @@ class ResearchLab:
         request: CreateModelSessionRequest,
         *,
         session_id: str | None = None,
+        job_id: str | None = None,
     ) -> ModelSession:
+        self._set_model_load_phase(
+            job_id,
+            ModelLoadPhase.RESOLVING_MODEL,
+            detail="Resolving the enabled pinned model manifest",
+        )
         request = self._resolve_model_session_request(request)
-        previous_session = self.session
-        if previous_session is not None:
-            previous_session.state = ModelState.STOPPING
-            self.store.save_model_session(previous_session)
-            try:
-                if self.server is not None:
-                    await self.server.stop()
-            except Exception:
-                previous_session.state = ModelState.FAILED
-                self.store.save_model_session(previous_session)
-                raise
-            previous_session.state = ModelState.STOPPED
-            self.store.save_model_session(previous_session)
-
+        assert request.model_id is not None
+        model = self._resolve_manifest_model(request.model_id)
         matched_profile = (
             self._find_saved_profile(request.model_id, request.profile)
             if request.profile is not None
@@ -373,42 +678,225 @@ class ResearchLab:
         profile_id = request.profile_id or (
             matched_profile.id if matched_profile is not None else None
         )
-        planned_session = (
+        load_session = (
             self.model_sessions.get(session_id) if session_id is not None else None
         )
-        if planned_session is not None:
+        if load_session is not None:
             if (
-                planned_session.model_id != request.model_id
-                or planned_session.profile != request.profile
-                or planned_session.profile_id != profile_id
+                load_session.model_id != request.model_id
+                or load_session.profile != request.profile
+                or load_session.profile_id != profile_id
+                or load_session.model_revision != model.revision
+                or load_session.topology != model.topology
+                or load_session.runtime_recipe != model.runtime_recipe
             ):
                 raise RuntimeError("model-load job does not match its planned session")
-            planned_session.state = ModelState.STARTING
-            self.session = planned_session
         else:
-            self.session = ModelSession(
+            load_session = ModelSession(
                 id=session_id or str(uuid4()),
                 model_id=request.model_id,
                 state=ModelState.STARTING,
                 mode=self.settings.mode,
                 profile=request.profile,
                 profile_id=profile_id,
+                model_revision=model.revision,
+                topology=model.topology,
+                runtime_recipe=model.runtime_recipe,
             )
-        self.model_sessions[self.session.id] = self.session
-        self.store.save_model_session(self.session)
+            self.model_sessions[load_session.id] = load_session
+            self.store.save_model_session(load_session)
+        previous_session = self.session
         try:
+            if previous_session is not None:
+                self._set_model_load_phase(
+                    job_id,
+                    ModelLoadPhase.STOPPING_PREVIOUS,
+                    detail=f"Stopping model session {previous_session.id}",
+                )
+                previous_session.state = ModelState.STOPPING
+                self.store.save_model_session(previous_session)
+                if self.server is not None:
+                    await self.server.stop()
+                previous_session.state = ModelState.STOPPED
+                self.store.save_model_session(previous_session)
+                self.active_context = None
+                self.runtime.set_active_context(None)
+                self.session = None
+
+            self._set_model_load_phase(
+                job_id,
+                ModelLoadPhase.CONFIGURING_RUNTIME,
+                detail=(
+                    f"Configuring application runtime for {model.id} "
+                    f"at {model.revision}"
+                ),
+            )
+            await self._configure_runtime_for_model(model)
+
+            load_session.state = ModelState.STARTING
+            load_session.model_revision = model.revision
+            load_session.topology = model.topology
+            load_session.runtime_recipe = model.runtime_recipe
+            self.session = load_session
+            self.store.save_model_session(load_session)
             if self.server is not None:
                 await self.server.start(
                     profile=request.profile,
-                    session_id=self.session.id,
+                    session_id=load_session.id,
+                    model_id=model.id,
+                    model_revision=model.revision,
+                    runtime_recipe=model.runtime_recipe,
+                    on_phase=lambda phase, detail, observability="observed": (
+                        self._set_model_load_phase(
+                            job_id,
+                            phase,
+                            detail=detail,
+                            observability=observability,
+                            source="managed_runtime",
+                        )
+                    ),
+                    on_phase_update=lambda update: (
+                        self._update_managed_model_load_phase(job_id, update)
+                    ),
                 )
-        except Exception:
-            self.session.state = ModelState.FAILED
-            self.store.save_model_session(self.session)
+                if self.settings.mode == "vllm":
+                    self._set_model_load_phase(
+                        job_id,
+                        ModelLoadPhase.VERIFYING_READY_CONTEXT,
+                        detail=(
+                            "Verifying model identity and active expert-context "
+                            "provenance"
+                        ),
+                    )
+                    context = await self._synchronize_server_context(
+                        profile_id,
+                        profile=request.profile,
+                    )
+            else:
+                for phase in _MODEL_LOAD_CHILD_PHASES:
+                    self._set_model_load_phase(
+                        job_id,
+                        phase,
+                        detail=(
+                            "Mock mode does not execute a managed runtime; "
+                            f"{phase.value.replace('_', ' ')} is unavailable."
+                        ),
+                        observability="unavailable",
+                        source="managed_runtime",
+                    )
+            if self.settings.mode != "vllm":
+                saved_profile = (
+                    self.profiles.get(profile_id) if profile_id is not None else None
+                )
+                context = self._context_reference(saved_profile)
+            self.active_context = context
+            self.intervention_contexts[context.context_id] = context
+            self.store.save_intervention_context(context)
+            self.runtime.set_active_context(context)
+            load_session.state = ModelState.READY
+            self.store.save_model_session(load_session)
+            self._set_model_load_phase(
+                job_id,
+                ModelLoadPhase.READY,
+                detail="Model runtime is ready",
+                terminal=True,
+            )
+            return load_session
+        except BaseException as error:
+            cleanup_error = await self._stop_incomplete_model_load()
+            cancelled = (
+                isinstance(error, asyncio.CancelledError) and cleanup_error is None
+            )
+            load_session.state = ModelState.STOPPED if cancelled else ModelState.FAILED
+            self.store.save_model_session(load_session)
+            if previous_session is not None and (
+                previous_session.state is ModelState.STOPPING
+            ):
+                previous_session.state = (
+                    ModelState.STOPPED if cleanup_error is None else ModelState.FAILED
+                )
+                self.store.save_model_session(previous_session)
+            self.active_context = None
+            self.runtime.set_active_context(None)
+            self.session = None if cancelled else load_session
+            if cleanup_error is not None:
+                raise _ModelLoadCleanupError(
+                    "model load did not become ready and managed process cleanup "
+                    f"failed: {cleanup_error}"
+                ) from cleanup_error
             raise
-        self.session.state = ModelState.READY
-        self.store.save_model_session(self.session)
-        return self.session
+
+    async def _stop_incomplete_model_load(self) -> BaseException | None:
+        if self.server is None:
+            return None
+        cleanup = asyncio.create_task(self.server.stop())
+        cancellation: asyncio.CancelledError | None = None
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+            except BaseException:
+                break
+        if cleanup.cancelled():
+            return cancellation or RuntimeError("managed process cleanup was cancelled")
+        return cleanup.exception()
+
+    async def _synchronize_server_context(
+        self,
+        profile_id: str | None,
+        *,
+        profile: ExpertProfile | None,
+    ) -> InterventionContextRef:
+        if self.server is None:
+            raise RuntimeError("managed vLLM server is unavailable")
+        saved_profile = (
+            self.profiles.get(profile_id) if profile_id is not None else None
+        )
+        if profile is not None and saved_profile is None:
+            raise RuntimeError(
+                "masked managed startup requires saved expert-profile provenance"
+            )
+        context = self._context_reference(saved_profile)
+        current = await self.server.current_context()
+        observed_id = current.get("active_context_id")
+        observed_fingerprint = current.get("active_context_fingerprint")
+        observed_profile_fingerprint = current.get("profile_fingerprint")
+        observed_topology = current.get("topology_fingerprint")
+        observed_process_id = current.get("process_id")
+        if not isinstance(observed_id, str) or not observed_id:
+            raise RuntimeError(
+                "vLLM current expert context omitted its active context ID"
+            )
+        if not isinstance(observed_fingerprint, str) or not observed_fingerprint:
+            raise RuntimeError(
+                "vLLM current expert context omitted its active fingerprint"
+            )
+        if not isinstance(observed_topology, str) or not observed_topology:
+            raise RuntimeError(
+                "vLLM current expert context omitted its topology fingerprint"
+            )
+        if observed_process_id != self.server.pid:
+            raise RuntimeError("vLLM current expert context came from another process")
+        if profile is not None:
+            expected_profile_fingerprint = expert_profile_fingerprint(
+                profile,
+                self.topology,
+            )
+            if not isinstance(observed_profile_fingerprint, str):
+                raise RuntimeError(
+                    "vLLM current expert context omitted its profile fingerprint"
+                )
+            if observed_profile_fingerprint != expected_profile_fingerprint:
+                raise RuntimeError(
+                    "vLLM current expert context uses a different canonical expert mask"
+                )
+        return _validated_context_update(
+            context,
+            context_id=observed_id,
+            context_fingerprint=observed_fingerprint,
+            topology_fingerprint=observed_topology,
+        )
 
     def list_model_sessions(self) -> list[ModelSession]:
         return sorted(
@@ -438,12 +926,22 @@ class ResearchLab:
         if self.server is None:
             return RuntimeStatus(
                 managed=False,
-                model_id=MODEL_ID,
+                model_id=(
+                    current_session.model_id
+                    if current_session is not None
+                    else self._active_model.id
+                ),
+                model_revision=(
+                    current_session.model_revision
+                    if current_session is not None
+                    else self._active_model.revision
+                ),
                 session_id=current_session.id if current_session else None,
             )
         return RuntimeStatus(
             managed=True,
-            model_id=MODEL_ID,
+            model_id=self.server.model_id,
+            model_revision=self.server.model_revision,
             pid=self.server.pid,
             session_id=current_session.id if current_session else None,
             started_at=self.server.started_at,
@@ -454,8 +952,372 @@ class ResearchLab:
             log_tail=self.server.read_log_tail(),
         )
 
-    def submit_model_session(self, request: CreateModelSessionRequest) -> JobRecord:
+    def current_intervention_context(self) -> InterventionContextRef | None:
+        return (
+            self.active_context.model_copy(deep=True)
+            if self.active_context is not None
+            else None
+        )
+
+    async def activate_expert_context(
+        self,
+        profile_id: str | None,
+        *,
+        internal: bool = False,
+    ) -> ContextActivationResult:
+        if self.session is None or self.session.state is not ModelState.READY:
+            raise RuntimeError("load a model before activating an expert context")
+        model = self._resolve_manifest_model(self.session.model_id)
+        if model.masking_status == "unsupported":
+            raise RuntimeError("the ready model does not support expert contexts")
+        if not internal:
+            with self._job_guard:
+                active = self._active_job_artifacts_unlocked()
+                if active is not None:
+                    raise ActiveJobConflict(active.record)
+        profile = None
+        if profile_id is not None:
+            profile = self.profiles.get(profile_id)
+            if profile is None:
+                raise KeyError(profile_id)
+            if profile.model_id != self.session.model_id:
+                raise ValueError("expert profile belongs to a different model")
+
+        previous = self.active_context
+        target = self._context_reference(profile)
+        if previous is not None and previous.context_fingerprint == (
+            target.context_fingerprint
+        ):
+            return ContextActivationResult(
+                old_context_id=previous.context_id,
+                old_context_fingerprint=previous.context_fingerprint,
+                new_context_id=previous.context_id,
+                new_context_fingerprint=previous.context_fingerprint,
+                topology_fingerprint=previous.topology_fingerprint,
+                duration_ms=0,
+                process_id=self.server.pid if self.server is not None else None,
+                weights_reloaded=False,
+            )
+
+        if self.server is None:
+            receipt = ContextActivationResult(
+                old_context_id=previous.context_id if previous else None,
+                old_context_fingerprint=(
+                    previous.context_fingerprint if previous else None
+                ),
+                new_context_id=target.context_id,
+                new_context_fingerprint=target.context_fingerprint,
+                topology_fingerprint=target.topology_fingerprint,
+                duration_ms=0,
+                process_id=None,
+                weights_reloaded=False,
+            )
+        else:
+            capabilities = await self.server.context_capabilities()
+            if capabilities.get("supported") is not True:
+                reason = capabilities.get("unsupported_reason") or "unknown reason"
+                raise RuntimeError(f"hot expert contexts are unsupported: {reason}")
+            discovered_topology = capabilities.get("topology_fingerprint")
+            if not isinstance(discovered_topology, str) or not discovered_topology:
+                raise RuntimeError(
+                    "vLLM expert-context capability response omitted topology identity"
+                )
+            target = _validated_context_update(
+                target,
+                topology_fingerprint=discovered_topology,
+            )
+            if profile is None:
+                activation_started = time.perf_counter()
+                try:
+                    receipt = await self.server.reset_context()
+                except RuntimeError as error:
+                    target, receipt = await self._reconcile_activation_error(
+                        previous=previous,
+                        target=target,
+                        error=error,
+                        activation_started=activation_started,
+                    )
+            else:
+                assert model.topology is not None
+                expected_layers = canonical_profile_layer_map(
+                    profile.profile,
+                    model.topology,
+                )
+                expected_profile_fingerprint = expert_profile_fingerprint(
+                    profile.profile,
+                    model.topology,
+                )
+                registered = await self.server.register_context(
+                    context_id=target.context_id,
+                    layers=expected_layers,
+                    creation_source=target.creation_source,
+                    metadata={
+                        "profile_id": profile.id,
+                        "profile_fingerprint": expected_profile_fingerprint,
+                        "saved_profile_fingerprint": profile.profile_fingerprint,
+                        "saved_profile_fingerprint_version": (
+                            profile.profile_fingerprint_version
+                        ),
+                    },
+                )
+                registration_error = _registration_identity_error(
+                    registered,
+                    expected_context_id=target.context_id,
+                    expected_profile_fingerprint=expected_profile_fingerprint,
+                    expected_topology_fingerprint=discovered_topology,
+                    expected_layers=expected_layers,
+                )
+                if registration_error is not None:
+                    raise registration_error
+                registered_fingerprint = registered.get("context_fingerprint")
+                if not isinstance(registered_fingerprint, str):
+                    raise RuntimeError(
+                        "vLLM expert-context registration omitted its fingerprint"
+                    )
+                target = _validated_context_update(
+                    target,
+                    context_fingerprint=registered_fingerprint,
+                )
+                activation_started = time.perf_counter()
+                try:
+                    receipt = await self.server.activate_context(target.context_id)
+                except RuntimeError as error:
+                    target, receipt = await self._reconcile_activation_error(
+                        previous=previous,
+                        target=target,
+                        error=error,
+                        activation_started=activation_started,
+                    )
+            receipt_error = None
+            if receipt.topology_fingerprint != target.topology_fingerprint:
+                receipt_error = RuntimeError(
+                    "vLLM activated an expert context for a different topology"
+                )
+            elif profile is None and receipt.new_context_id != "baseline":
+                receipt_error = RuntimeError(
+                    "vLLM reset activated a non-baseline expert context"
+                )
+            elif profile is not None and (
+                receipt.new_context_id != target.context_id
+                or receipt.new_context_fingerprint != target.context_fingerprint
+            ):
+                receipt_error = RuntimeError(
+                    "vLLM activated a different expert context"
+                )
+            if receipt_error is not None:
+                target, receipt = await self._reconcile_activation_error(
+                    previous=previous,
+                    target=target,
+                    error=receipt_error,
+                    activation_started=activation_started,
+                )
+            elif profile is None:
+                target = _validated_context_update(
+                    target,
+                    context_id=receipt.new_context_id,
+                    context_fingerprint=receipt.new_context_fingerprint,
+                )
+
+        self.active_context = target
+        self.intervention_contexts[target.context_id] = target
+        self.store.save_intervention_context(target)
+        self.runtime.set_active_context(target)
+        return receipt
+
+    async def _reconcile_activation_error(
+        self,
+        *,
+        previous: InterventionContextRef | None,
+        target: InterventionContextRef,
+        error: RuntimeError,
+        activation_started: float,
+    ) -> tuple[InterventionContextRef, ContextActivationResult]:
+        if self.server is None:
+            raise error
+        try:
+            current = await self.server.current_context()
+            observed_id = current.get("active_context_id")
+            observed_fingerprint = current.get("active_context_fingerprint")
+            observed_topology = current.get("topology_fingerprint")
+            process_id = current.get("process_id")
+            if not all(
+                isinstance(value, str) and value
+                for value in (
+                    observed_id,
+                    observed_fingerprint,
+                    observed_topology,
+                )
+            ):
+                raise RuntimeError(
+                    "vLLM reconciliation response omitted active context identity"
+                )
+        except Exception as reconciliation_error:
+            self._disable_ambiguous_runtime_context()
+            raise RuntimeError(
+                "expert-context activation outcome is ambiguous and current "
+                "context reconciliation failed; the model session was disabled"
+            ) from reconciliation_error
+
+        assert isinstance(observed_id, str)
+        assert isinstance(observed_fingerprint, str)
+        assert isinstance(observed_topology, str)
+        serving_safe = current.get("serving_safe")
+        recovery_required = current.get("recovery_required")
+        if serving_safe is not True or recovery_required is not False:
+            try:
+                recovery = (
+                    await self.server.reset_context()
+                    if observed_id == "baseline"
+                    else await self.server.activate_context(observed_id)
+                )
+            except Exception as recovery_error:
+                self._disable_ambiguous_runtime_context()
+                raise RuntimeError(
+                    "expert-context activation committed but serving recovery "
+                    "failed; the model session was disabled"
+                ) from recovery_error
+            if (
+                recovery.new_context_id != observed_id
+                or recovery.new_context_fingerprint != observed_fingerprint
+                or recovery.topology_fingerprint != observed_topology
+            ):
+                self._disable_ambiguous_runtime_context()
+                raise RuntimeError(
+                    "expert-context recovery changed the committed context; "
+                    "the model session was disabled"
+                ) from error
+        if process_id != self.server.pid:
+            self._disable_ambiguous_runtime_context()
+            raise RuntimeError(
+                "expert-context activation reconciled to another process; the "
+                "model session was disabled"
+            ) from error
+        if observed_topology != target.topology_fingerprint:
+            self._disable_ambiguous_runtime_context()
+            raise RuntimeError(
+                "expert-context activation reconciled to a different topology; "
+                "the model session was disabled"
+            ) from error
+        target_committed = observed_fingerprint == target.context_fingerprint or (
+            target.kind is InterventionKind.BASELINE and observed_id == "baseline"
+        )
+        if target_committed:
+            reconciled = _validated_context_update(
+                target,
+                context_id=observed_id,
+                context_fingerprint=observed_fingerprint,
+                topology_fingerprint=observed_topology,
+            )
+            return reconciled, ContextActivationResult(
+                old_context_id=previous.context_id if previous else None,
+                old_context_fingerprint=(
+                    previous.context_fingerprint if previous else None
+                ),
+                new_context_id=observed_id,
+                new_context_fingerprint=observed_fingerprint,
+                topology_fingerprint=observed_topology,
+                duration_ms=(time.perf_counter() - activation_started) * 1000,
+                process_id=process_id if isinstance(process_id, int) else None,
+                weights_reloaded=False,
+            )
+        if previous is not None and (
+            observed_fingerprint == previous.context_fingerprint
+        ):
+            raise error
+        known = next(
+            (
+                context
+                for context in self.intervention_contexts.values()
+                if context.context_fingerprint == observed_fingerprint
+            ),
+            None,
+        )
+        if known is not None:
+            self.active_context = known
+            self.runtime.set_active_context(known)
+            raise RuntimeError(
+                "expert-context activation failed; vLLM reconciled to a known "
+                f"context {known.context_id!r}"
+            ) from error
+        self._disable_ambiguous_runtime_context()
+        raise RuntimeError(
+            "expert-context activation reached an unknown context; the model "
+            "session was disabled"
+        ) from error
+
+    def _disable_ambiguous_runtime_context(self) -> None:
+        self.active_context = None
+        self.runtime.set_active_context(None)
+        if self.session is not None:
+            self.session.state = ModelState.FAILED
+            self.store.save_model_session(self.session)
+
+    def _context_reference(
+        self, profile: SavedExpertProfile | None
+    ) -> InterventionContextRef:
+        model_id = profile.model_id if profile is not None else self._active_model.id
+        model = self._resolve_manifest_model(model_id)
+        topology = model.topology
+        if topology is None:
+            raise RuntimeError("enabled model is missing its manifest topology")
+        topology_fingerprint = canonical_fingerprint(topology)
+        if profile is None:
+            identity = {
+                "model_id": model.id,
+                "model_revision": model.revision,
+                "topology_fingerprint": topology_fingerprint,
+                "kind": InterventionKind.BASELINE.value,
+            }
+            fingerprint = canonical_fingerprint(identity)
+            return InterventionContextRef(
+                context_id="baseline",
+                kind=InterventionKind.BASELINE,
+                model_id=model.id,
+                model_revision=model.revision,
+                topology_fingerprint=topology_fingerprint,
+                context_fingerprint=fingerprint,
+                creation_source="model-baseline",
+            )
+        runtime_profile_fingerprint = expert_profile_fingerprint(
+            profile.profile,
+            topology,
+        )
+        identity = {
+            "model_id": profile.model_id,
+            "model_revision": model.revision,
+            "topology_fingerprint": topology_fingerprint,
+            "profile_fingerprint": runtime_profile_fingerprint,
+            "kind": InterventionKind.EXPERT_MASK.value,
+        }
+        fingerprint = canonical_fingerprint(identity)
+        return InterventionContextRef(
+            context_id=f"expert-mask:{fingerprint[:24]}",
+            kind=InterventionKind.EXPERT_MASK,
+            model_id=profile.model_id,
+            model_revision=model.revision,
+            topology_fingerprint=topology_fingerprint,
+            profile_id=profile.id,
+            profile_fingerprint=runtime_profile_fingerprint,
+            context_fingerprint=fingerprint,
+            creation_source="saved-expert-profile",
+            metadata={
+                "profile_name": profile.name,
+                "saved_profile_fingerprint": profile.profile_fingerprint,
+                "saved_profile_fingerprint_version": (
+                    profile.profile_fingerprint_version
+                ),
+            },
+        )
+
+    def submit_model_session(
+        self,
+        request: CreateModelSessionRequest,
+        *,
+        retry_of_job_id: str | None = None,
+    ) -> JobRecord:
         request = self._resolve_model_session_request(request)
+        assert request.model_id is not None
+        model = self._resolve_manifest_model(request.model_id)
         payload = request.model_dump(mode="json")
         with self._job_guard:
             active = self._active_job_artifacts_unlocked()
@@ -480,6 +1342,9 @@ class ResearchLab:
                 profile=request.profile,
                 profile_id=request.profile_id
                 or (matched_profile.id if matched_profile is not None else None),
+                model_revision=model.revision,
+                topology=model.topology,
+                runtime_recipe=model.runtime_recipe,
             )
             job = JobRecord(
                 id=str(uuid4()),
@@ -487,11 +1352,57 @@ class ResearchLab:
                 status=JobStatus.QUEUED,
                 progress_total=1,
                 result_id=model_session.id,
+                retry_of_job_id=retry_of_job_id,
+                phase_history=[
+                    JobPhaseRecord(
+                        phase=ModelLoadPhase.QUEUED,
+                        source="application",
+                        detail="Model-load request persisted and queued",
+                    )
+                ],
             )
             self.store.save_model_load_submission(model_session, job, payload)
             self.model_sessions[model_session.id] = model_session
             self.jobs[job.id] = JobArtifacts(record=job, payload=payload)
             return job.model_copy(deep=True)
+
+    def retry_model_load(self, job_id: str) -> JobRecord:
+        with self._job_guard:
+            artifacts = self.jobs.get(job_id)
+            if artifacts is None:
+                raise KeyError(job_id)
+            job = artifacts.record
+            if job.kind is not JobKind.MODEL_LOAD:
+                raise ValueError("only model-load jobs can be retried here")
+            if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
+                raise ValueError("only failed or cancelled model loads can be retried")
+            terminal_phase = job.phase_history[-1] if job.phase_history else None
+            if terminal_phase is not None and (
+                terminal_phase.failure_code == "cleanup_failed"
+            ):
+                raise ValueError(
+                    "restart the deployment before retrying because runtime cleanup "
+                    "could not be proven"
+                )
+            request = CreateModelSessionRequest.model_validate(artifacts.payload)
+            planned_session = (
+                self.model_sessions.get(job.result_id)
+                if job.result_id is not None
+                else None
+            )
+            if planned_session is None:
+                raise ValueError("the failed model load has no immutable load plan")
+            manifest = self._resolve_manifest_model(request.model_id)
+            if (
+                planned_session.model_revision != manifest.revision
+                or planned_session.topology != manifest.topology
+                or planned_session.runtime_recipe != manifest.runtime_recipe
+            ):
+                raise ValueError(
+                    "the model manifest changed since this load was planned; submit "
+                    "a new model load instead of retrying different artifacts"
+                )
+        return self.submit_model_session(request, retry_of_job_id=job_id)
 
     def submit_benchmark(self, request: RunRequest) -> JobRecord:
         self._ensure_no_active_job()
@@ -553,6 +1464,62 @@ class ResearchLab:
         )
         return job
 
+    def submit_experiment(self, request: CreateExperimentRequest) -> Experiment:
+        self._ensure_no_active_job()
+        descriptor = self.get_workload_descriptor(request.workload_id)
+        expanded_run_units = self.experiments.validate_request(request, descriptor)
+        experiment_id = str(uuid4())
+        job_id = str(uuid4())
+        self._queue_job(
+            kind=JobKind.EXPERIMENT_RUN,
+            payload={
+                "experiment_id": experiment_id,
+                "request": request.model_dump(mode="json"),
+            },
+            progress_total=expanded_run_units,
+            job_id=job_id,
+            result_id=experiment_id,
+        )
+        try:
+            return self.experiments.create(
+                request,
+                job_id=job_id,
+                descriptor=descriptor,
+                experiment_id=experiment_id,
+            )
+        except Exception:
+            with self._job_guard:
+                artifacts = self.jobs[job_id]
+                artifacts.record.status = JobStatus.FAILED
+                artifacts.record.error = "experiment graph creation failed"
+                artifacts.record.completed_at = datetime.now(UTC)
+                self.store.save_job(artifacts.record, artifacts.payload)
+            raise
+
+    def list_experiments(self) -> list[Experiment]:
+        return self.experiments.list()
+
+    def get_experiment(self, experiment_id: str) -> ExperimentDetail:
+        return self.experiments.detail(experiment_id)
+
+    def get_experiment_events(
+        self,
+        experiment_id: str,
+        *,
+        after: int = 0,
+        limit: int = 500,
+    ) -> RunEventPage:
+        return self.experiments.events(
+            experiment_id,
+            after=after,
+            limit=limit,
+        )
+
+    def cancel_experiment(self, experiment_id: str) -> Experiment:
+        experiment = self.experiments.get(experiment_id)
+        self.cancel_job(experiment.job_id)
+        return self.experiments.get(experiment_id)
+
     async def execute_job(self, job_id: str) -> None:
         with self._job_guard:
             artifacts = self.jobs[job_id]
@@ -571,6 +1538,7 @@ class ResearchLab:
                 result = await self.create_model_session(
                     model_request,
                     session_id=job.result_id,
+                    job_id=job_id,
                 )
                 self._update_job_progress(job_id, 1, 1)
             elif job.kind is JobKind.BENCHMARK_RUN:
@@ -583,6 +1551,14 @@ class ResearchLab:
             elif job.kind is JobKind.DATASET_PREPARE:
                 result = await self.benchmark_catalog.prepare(
                     str(artifacts.payload["benchmark_id"]),
+                    on_progress=lambda current, total: self._update_job_progress(
+                        job_id, current, total
+                    ),
+                    should_cancel=lambda: self._job_cancelled(job_id),
+                )
+            elif job.kind is JobKind.EXPERIMENT_RUN:
+                result = await self.experiments.execute(
+                    str(artifacts.payload["experiment_id"]),
                     on_progress=lambda current, total: self._update_job_progress(
                         job_id, current, total
                     ),
@@ -605,6 +1581,12 @@ class ResearchLab:
         except asyncio.CancelledError:
             with self._job_guard:
                 if job.status in {JobStatus.CANCELLING, JobStatus.CANCELLED}:
+                    if job.kind is JobKind.MODEL_LOAD:
+                        self._cancel_model_session_unlocked(job)
+                        self._cancel_model_load_phase_unlocked(
+                            job,
+                            detail="Model-load execution stopped and cleanup completed",
+                        )
                     job.status = JobStatus.CANCELLED
                     job.error = None
                     job.completed_at = job.completed_at or datetime.now(UTC)
@@ -614,11 +1596,47 @@ class ResearchLab:
                     job.error = "job execution was interrupted during shutdown"
                     job.completed_at = datetime.now(UTC)
                     self._fail_planned_model_session_unlocked(job)
+                    self._fail_model_load_phase_unlocked(job, job.error)
                     self.store.save_job(job, artifacts.payload)
             raise
         except Exception as error:
             with self._job_guard:
-                if job.status in {JobStatus.CANCELLING, JobStatus.CANCELLED}:
+                terminal_experiment = (
+                    self.experiments.get(str(artifacts.payload["experiment_id"]))
+                    if job.kind is JobKind.EXPERIMENT_RUN
+                    else None
+                )
+                if terminal_experiment is not None and terminal_experiment.status in {
+                    ExperimentStatus.COMPLETED,
+                    ExperimentStatus.CANCELLED,
+                    ExperimentStatus.FAILED,
+                }:
+                    job.status = (
+                        JobStatus.COMPLETED
+                        if terminal_experiment.status is ExperimentStatus.COMPLETED
+                        else (
+                            JobStatus.CANCELLED
+                            if terminal_experiment.status is ExperimentStatus.CANCELLED
+                            else JobStatus.FAILED
+                        )
+                    )
+                    job.error = terminal_experiment.error
+                    job.progress_current = terminal_experiment.completed_units
+                    job.completed_at = terminal_experiment.completed_at or datetime.now(
+                        UTC
+                    )
+                    self.store.save_job(job, artifacts.payload)
+                    return
+                if job.status in {
+                    JobStatus.CANCELLING,
+                    JobStatus.CANCELLED,
+                } and not isinstance(error, _ModelLoadCleanupError):
+                    if job.kind is JobKind.MODEL_LOAD:
+                        self._cancel_model_session_unlocked(job)
+                        self._cancel_model_load_phase_unlocked(
+                            job,
+                            detail="Model-load execution stopped and cleanup completed",
+                        )
                     job.status = JobStatus.CANCELLED
                     job.error = None
                     job.completed_at = job.completed_at or datetime.now(UTC)
@@ -629,19 +1647,75 @@ class ResearchLab:
                 job.error = str(error) or error.__class__.__name__
                 job.completed_at = datetime.now(UTC)
                 self._fail_planned_model_session_unlocked(job)
+                self._fail_model_load_phase_unlocked(job, job.error)
                 self.store.save_job(job, artifacts.payload)
             return
 
         with self._job_guard:
             job.result_id = result.id
-            if job.status in {JobStatus.CANCELLING, JobStatus.CANCELLED}:
-                job.status = JobStatus.CANCELLED
-                job.completed_at = job.completed_at or datetime.now(UTC)
+            cancelling_after_result = job.status in {
+                JobStatus.CANCELLING,
+                JobStatus.CANCELLED,
+            }
+            result_is_terminal = (
+                job.kind is JobKind.EXPERIMENT_RUN
+                and isinstance(result, Experiment)
+                and result.status
+                in {
+                    ExperimentStatus.COMPLETED,
+                    ExperimentStatus.CANCELLED,
+                    ExperimentStatus.FAILED,
+                }
+            )
+            if result_is_terminal:
+                job.status = (
+                    JobStatus.COMPLETED
+                    if result.status is ExperimentStatus.COMPLETED
+                    else (
+                        JobStatus.CANCELLED
+                        if result.status is ExperimentStatus.CANCELLED
+                        else JobStatus.FAILED
+                    )
+                )
+                job.error = result.error
+                job.progress_current = result.completed_units
+                job.completed_at = result.completed_at or datetime.now(UTC)
                 self.store.save_job(job, artifacts.payload)
                 return
-            job.status = JobStatus.COMPLETED
-            job.progress_current = job.progress_total
-            job.completed_at = datetime.now(UTC)
+            if not cancelling_after_result:
+                job.status = JobStatus.COMPLETED
+                job.progress_current = job.progress_total
+                job.completed_at = datetime.now(UTC)
+                self.store.save_job(job, artifacts.payload)
+                return
+
+        cleanup_error = (
+            await self._stop_incomplete_model_load()
+            if job.kind is JobKind.MODEL_LOAD
+            else None
+        )
+        with self._job_guard:
+            if cleanup_error is not None:
+                job.status = JobStatus.FAILED
+                job.error = (
+                    "model load completed during cancellation but managed process "
+                    f"cleanup failed: {cleanup_error}"
+                )
+                job.completed_at = datetime.now(UTC)
+                self._fail_planned_model_session_unlocked(job)
+                self._fail_model_load_phase_unlocked(job, job.error)
+                self.active_context = None
+                self.runtime.set_active_context(None)
+            else:
+                if job.kind is JobKind.MODEL_LOAD:
+                    self._cancel_model_session_unlocked(job)
+                    self._cancel_model_load_phase_unlocked(
+                        job,
+                        detail="Model-load execution stopped and cleanup completed",
+                    )
+                job.status = JobStatus.CANCELLED
+                job.error = None
+                job.completed_at = job.completed_at or datetime.now(UTC)
             self.store.save_job(job, artifacts.payload)
 
     def start_job(self, job_id: str) -> asyncio.Task[None]:
@@ -698,17 +1772,60 @@ class ResearchLab:
             job = artifacts.record
             if job.status not in {JobStatus.QUEUED, JobStatus.RUNNING}:
                 return job.model_copy(deep=True)
-            if job.kind is JobKind.MODEL_LOAD:
-                raise ValueError("model-load cancellation is not implemented")
             if job.status is JobStatus.RUNNING:
+                if job.kind is JobKind.EXPERIMENT_RUN:
+                    experiment = self.experiments.get(
+                        str(artifacts.payload["experiment_id"])
+                    )
+                    if experiment.status in {
+                        ExperimentStatus.COMPLETED,
+                        ExperimentStatus.CANCELLED,
+                        ExperimentStatus.FAILED,
+                    }:
+                        job.status = (
+                            JobStatus.COMPLETED
+                            if experiment.status is ExperimentStatus.COMPLETED
+                            else (
+                                JobStatus.CANCELLED
+                                if experiment.status is ExperimentStatus.CANCELLED
+                                else JobStatus.FAILED
+                            )
+                        )
+                        job.error = experiment.error
+                        job.progress_current = experiment.completed_units
+                        job.completed_at = experiment.completed_at or datetime.now(UTC)
+                        self.store.save_job(job, artifacts.payload)
+                        return job.model_copy(deep=True)
+                if job.kind is JobKind.MODEL_LOAD:
+                    task = self._job_tasks.get(job_id)
+                    if task is None or task.done():
+                        raise ValueError(
+                            "model-load execution is not owned by this app process"
+                        )
                 job.status = JobStatus.CANCELLING
-                if job.kind is JobKind.AGENT_RUN:
+                if job.kind is JobKind.MODEL_LOAD:
+                    self._cancel_owned_task(task)
+                elif job.kind is JobKind.AGENT_RUN:
                     self.agentic.request_cancel(str(artifacts.payload["run_id"]))
+                elif job.kind is JobKind.EXPERIMENT_RUN:
+                    self.experiments.request_cancel(
+                        str(artifacts.payload["experiment_id"])
+                    )
             else:
+                if job.kind is JobKind.MODEL_LOAD:
+                    self._cancel_model_session_unlocked(job)
+                    self._cancel_model_load_phase_unlocked(
+                        job,
+                        detail="Model-load request cancelled before runtime launch",
+                    )
+                elif job.kind is JobKind.AGENT_RUN:
+                    self.agentic.cancel_queued_run(str(artifacts.payload["run_id"]))
+                elif job.kind is JobKind.EXPERIMENT_RUN:
+                    self.experiments.cancel_queued(
+                        str(artifacts.payload["experiment_id"])
+                    )
                 job.status = JobStatus.CANCELLED
                 job.completed_at = datetime.now(UTC)
-                if job.kind is JobKind.AGENT_RUN:
-                    self.agentic.cancel_queued_run(str(artifacts.payload["run_id"]))
             self.store.save_job(job, artifacts.payload)
             return job.model_copy(deep=True)
 
@@ -746,23 +1863,433 @@ class ResearchLab:
     def _resolve_model_session_request(
         self, request: CreateModelSessionRequest
     ) -> CreateModelSessionRequest:
-        if request.model_id != MODEL_ID:
-            raise ValueError(f"unsupported model {request.model_id!r}")
+        model = self._resolve_manifest_model(request.model_id)
+        model_id = model.id
         profile = request.profile
         if request.profile_id is not None:
             saved_profile = self.profiles.get(request.profile_id)
             if saved_profile is None:
                 raise ValueError("profile_id does not reference a saved profile")
-            if saved_profile.model_id != request.model_id:
+            if saved_profile.model_id != model_id:
                 raise ValueError("saved profile belongs to a different model")
             if profile is not None and saved_profile.profile != profile:
                 raise ValueError("profile does not match saved profile_id")
             profile = saved_profile.profile.model_copy(deep=True)
         if profile is not None:
-            validation = validate_profile(profile, self.topology)
+            assert model.topology is not None
+            validation = validate_profile(profile, model.topology)
             if not validation.valid:
                 raise ValueError("; ".join(validation.errors))
-        return request.model_copy(update={"profile": profile})
+        return request.model_copy(update={"model_id": model_id, "profile": profile})
+
+    def _resolve_manifest_model(self, model_id: str | None) -> ModelRegistryEntry:
+        selected_id = model_id or MODEL_ID
+        model = next((item for item in self.models if item.id == selected_id), None)
+        if model is None:
+            raise ValueError(f"unknown model {selected_id!r}")
+        if not model.enabled or model.qualification_status == "manifest_only":
+            reason = model.failure_reason or "model is not enabled for live loading"
+            raise ValueError(f"model {selected_id!r} is unavailable: {reason}")
+        if (
+            model.revision is None
+            or model.topology is None
+            or model.runtime_recipe is None
+        ):
+            raise ValueError(
+                f"enabled model {selected_id!r} lacks a pinned runnable manifest"
+            )
+        return model
+
+    async def _configure_runtime_for_model(self, model: ModelRegistryEntry) -> None:
+        if model.topology is None:
+            raise RuntimeError("enabled model is missing its manifest topology")
+        if (
+            self._active_model.id == model.id
+            and self.topology == model.topology
+            and (
+                (
+                    self.settings.mode == "mock"
+                    and isinstance(self.runtime, MockModelRuntime)
+                )
+                or (
+                    self.settings.mode == "vllm"
+                    and isinstance(self.runtime, VllmRuntime)
+                )
+            )
+        ):
+            return
+        previous_runtime = self.runtime
+        self._active_model = model
+        self.topology = model.topology.model_copy(deep=True)
+        self.runtime = self._create_runtime(model)
+        self.agentic.runtime = self.runtime
+        self.agentic.topology = self.topology
+        self.agentic.model_id = model.id
+        self.agentic.gateway.runtime = self.runtime
+        self.agentic.gateway.topology = self.topology
+        self.experiments.runtime = self.runtime
+        self.experiments.topology = self.topology
+        self.experiments.model_id = model.id
+        await previous_runtime.aclose()
+
+    async def _execute_v2_answer_unit(
+        self, request: ExperimentAdapterRequest
+    ) -> ExperimentAdapterResult:
+        if request.should_cancel():
+            raise ExperimentCancellationRequested
+        descriptor = request.experiment.workload
+        workload_unit_id = request.unit.workload_unit_id or descriptor.task_id
+        if descriptor.parent_id is None or workload_unit_id is None:
+            raise RuntimeError("answer workload descriptor is missing its source item")
+        adapter = self.benchmark_catalog.get_adapter(descriptor.parent_id)
+        item = next(
+            (item for item in adapter.items() if item.id == workload_unit_id),
+            None,
+        )
+        if item is None:
+            raise RuntimeError("answer workload source item is no longer available")
+        session = self.session
+        if session is None or session.state is not ModelState.READY:
+            raise RuntimeError(
+                "answer workload requires the current ready model session"
+            )
+        current_context = self.current_intervention_context()
+        if current_context is None or (
+            current_context.context_fingerprint != request.context.context_fingerprint
+        ):
+            raise RuntimeError("answer workload context changed before inference")
+        generation = request.experiment.generation.model_copy(
+            update={"seed": request.unit.seed}
+        )
+        contract = request.experiment.evaluation_contract
+        policy = request.experiment.execution_policy
+        execution = await self._execute_benchmark_item(
+            adapter=adapter,
+            item=item,
+            attempt=1,
+            generation=generation,
+            contract=contract,
+            policy=policy,
+            session=session,
+            profile=request.profile.profile if request.profile is not None else None,
+            run_id=request.unit.id,
+            token_budget=request.remaining_token_budget,
+            cost_budget_usd=request.remaining_cost_budget_usd,
+            on_inference_progress=request.emit_inference_progress,
+        )
+        if request.should_cancel():
+            raise ExperimentCancellationRequested
+        item_result = execution.result
+        budget_exhausted = (
+            execution.token_budget_exhausted or execution.cost_budget_exhausted
+        )
+        passed = None if budget_exhausted else item_result.passed
+        deterministic = item_result.evaluation
+        score = (
+            None
+            if passed is None
+            else (
+                deterministic.combined_score
+                if deterministic is not None
+                else (1.0 if passed else 0.0)
+            )
+        )
+        routing = None
+        if execution.routing is not None:
+            routing = {
+                "layer_ids": self.topology.routed_layer_ids,
+                "selection_counts": execution.routing.selection_counts.tolist(),
+                "routing_mass": execution.routing.routing_mass.tolist(),
+                "total_routed_slots": execution.routing.total_routed_slots,
+            }
+        inference = item_result.performance or InferencePerformance(
+            prompt_tokens=item_result.prompt_tokens,
+            completion_tokens=item_result.completion_tokens,
+            total_tokens=item_result.total_tokens,
+            latency_ms=item_result.latency_ms,
+        )
+        evaluation = EvaluationResultRecord(
+            id=str(uuid4()),
+            workload_run_id=request.workload_run.id,
+            run_unit_id=request.unit.id,
+            passed=passed,
+            score=score,
+            metrics={
+                "passed": passed,
+                "scored": passed is not None,
+                "budget_exhausted": execution.token_budget_exhausted,
+                "token_budget_exhausted": execution.token_budget_exhausted,
+                "cost_budget_exhausted": execution.cost_budget_exhausted,
+                "budget_debit_usd": execution.budget_debit_usd,
+            },
+            formula_fingerprint=contract.fingerprint,
+            deterministic=deterministic,
+        )
+        performance = PerformanceSnapshot(
+            id=str(uuid4()),
+            workload_run_id=request.workload_run.id,
+            run_unit_id=request.unit.id,
+            prompt_tokens=item_result.prompt_tokens,
+            completion_tokens=item_result.completion_tokens,
+            total_tokens=item_result.total_tokens,
+            latency_ms=item_result.latency_ms,
+            tokens_per_second=inference.tokens_per_second,
+            inference=inference,
+        )
+        return ExperimentAdapterResult(
+            passed=passed,
+            score=score,
+            result={
+                "kind": WorkloadKind.ANSWER.value,
+                "benchmark_id": descriptor.parent_id,
+                "workload_unit_id": workload_unit_id,
+                "benchmark_revision": adapter.info.revision,
+                "dataset_content_hash": adapter.content_hash,
+                "scoring_version": adapter.scoring_version,
+                "evaluation_contract_fingerprint": contract.fingerprint,
+                "execution_policy_fingerprint": policy.fingerprint,
+                "generation": generation.model_dump(mode="json"),
+                "model_session_id": session.id,
+                "context": request.context.model_dump(mode="json"),
+                "prompt": item_result.prompt,
+                "output": item_result.output,
+                "expected": item_result.expected,
+                "error": item_result.error,
+                "scoring": item_result.scoring.value,
+                "item": item_result.model_dump(mode="json"),
+                "routing": routing,
+            },
+            evaluation=evaluation,
+            performance=performance,
+        )
+
+    async def _execute_v2_coding_unit(
+        self, request: ExperimentAdapterRequest
+    ) -> ExperimentAdapterResult:
+        if request.should_cancel():
+            raise ExperimentCancellationRequested
+        descriptor = request.experiment.workload
+        workload_unit_id = request.unit.workload_unit_id or descriptor.task_id
+        if descriptor.parent_id is None or workload_unit_id is None:
+            raise RuntimeError("coding workload descriptor is missing its source task")
+        session = self.session
+        if session is None or session.state is not ModelState.READY:
+            raise RuntimeError(
+                "coding workload requires the current ready model session"
+            )
+        current_context = self.current_intervention_context()
+        if current_context is None or (
+            current_context.context_fingerprint != request.context.context_fingerprint
+        ):
+            raise RuntimeError("coding workload context changed before execution")
+        agent_id = str(
+            request.experiment.execution_config.get("agent_id", "bash-json-v1")
+        )
+        sandbox_provider_id = str(
+            request.experiment.execution_config.get("sandbox_provider_id", "fake")
+        )
+        policy = ExecutionPolicy.model_validate(
+            {
+                **request.experiment.execution_policy.model_dump(
+                    mode="python", exclude={"fingerprint"}
+                ),
+                "timeout_seconds": (
+                    request.experiment.execution_policy.per_item_timeout_seconds
+                ),
+                "max_tokens": request.remaining_token_budget,
+                "max_cost_usd": request.remaining_cost_budget_usd,
+            }
+        )
+        agent_request = CreateAgentRunRequest(
+            task_pack_id=descriptor.parent_id,
+            task_ids=[workload_unit_id],
+            agent_id=agent_id,
+            sandbox_provider_id=sandbox_provider_id,
+            model_session_id=session.id,
+            attempts=1,
+            seed=request.unit.seed if request.unit.seed is not None else 0,
+            generation=request.experiment.generation.model_copy(
+                update={"seed": request.unit.seed}
+            ),
+            evaluation_contract=request.experiment.evaluation_contract,
+            execution_policy=policy,
+        )
+        agent_run_id = str(uuid4())
+        self.agentic.create_run(
+            run_id=agent_run_id,
+            job_id=request.experiment.job_id,
+            request=agent_request,
+            model_session=session,
+            intervention_context=request.context,
+        )
+        trial_id = next(
+            trial.id
+            for trial in self.agentic.trials.values()
+            if trial.run_id == agent_run_id
+        )
+        execution = asyncio.create_task(
+            self.agentic.execute_run(
+                agent_run_id,
+                model_session=session,
+                on_progress=lambda _current, _total: None,
+                should_cancel=request.should_cancel,
+                intervention_context=request.context,
+                profile=(
+                    request.profile.profile if request.profile is not None else None
+                ),
+                on_tool_command_started=request.emit_trajectory,
+            )
+        )
+        emitted_steps = 0
+
+        def emit_new_steps() -> None:
+            nonlocal emitted_steps
+            try:
+                trajectory = self.agentic.get_trajectory(trial_id)
+            except KeyError:
+                return
+            for step in trajectory.steps[emitted_steps:]:
+                request.emit_trajectory(step.model_dump(mode="json", exclude_none=True))
+            emitted_steps = len(trajectory.steps)
+
+        try:
+            while not execution.done():
+                emit_new_steps()
+                await asyncio.sleep(0.02)
+            agent_run = await execution
+        except BaseException:
+            if not execution.done():
+                execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+            raise
+        emit_new_steps()
+        trials = [
+            trial
+            for trial in self.agentic.trials.values()
+            if trial.run_id == agent_run_id
+        ]
+        if agent_run.status.value == "cancelled" or request.should_cancel():
+            raise ExperimentCancellationRequested
+        if agent_run.status.value == "failed":
+            raise RuntimeError(agent_run.error or "coding workload execution failed")
+        if len(trials) != 1:
+            raise RuntimeError("coding workload did not produce exactly one trial")
+        trial = trials[0]
+        trajectory = self.agentic.get_trajectory(trial.id)
+        routing = self.agentic.routings.get(trial.id)
+        evaluation = trial.evaluation
+        budget_termination = trial.termination_cause in {
+            TerminationCause.TOKEN_LIMIT,
+            TerminationCause.COST_LIMIT,
+        }
+        score = (
+            None
+            if budget_termination
+            else (evaluation.combined_score if evaluation is not None else trial.reward)
+        )
+        passed = (
+            None
+            if budget_termination
+            else (evaluation.passed if evaluation is not None else None)
+        )
+        trial_performance = trial.performance
+        inference_performance = InferencePerformance(
+            prompt_tokens=trial.prompt_tokens,
+            completion_tokens=trial.completion_tokens,
+            total_tokens=trial.prompt_tokens + trial.completion_tokens,
+            latency_ms=(
+                trial_performance.model_time_ms if trial_performance is not None else 0
+            ),
+            tokens_per_second=(
+                trial_performance.mean_tps if trial_performance is not None else None
+            ),
+            started_at=trial.started_at,
+            completed_at=trial.completed_at,
+        )
+        evaluation_record = EvaluationResultRecord(
+            id=str(uuid4()),
+            workload_run_id=request.workload_run.id,
+            run_unit_id=request.unit.id,
+            passed=passed,
+            score=score,
+            metrics={
+                "reward": trial.reward,
+                "turns": trial.turns,
+                "commands": trial.commands,
+                "token_budget_exhausted": (
+                    trial.termination_cause is TerminationCause.TOKEN_LIMIT
+                ),
+                "cost_budget_exhausted": (
+                    trial.termination_cause is TerminationCause.COST_LIMIT
+                ),
+                "budget_debit_usd": (
+                    trial_performance.judge_cost_debit_usd
+                    if trial_performance is not None
+                    else trial.judge_cost_debit_usd
+                ),
+            },
+            formula_fingerprint=agent_run.evaluation_contract.fingerprint,
+            deterministic=evaluation,
+        )
+        performance = PerformanceSnapshot(
+            id=str(uuid4()),
+            workload_run_id=request.workload_run.id,
+            run_unit_id=request.unit.id,
+            prompt_tokens=trial.prompt_tokens,
+            completion_tokens=trial.completion_tokens,
+            total_tokens=trial.prompt_tokens + trial.completion_tokens,
+            latency_ms=(
+                trial_performance.wall_time_ms if trial_performance is not None else 0
+            ),
+            tokens_per_second=(
+                trial_performance.mean_tps if trial_performance is not None else None
+            ),
+            inference=inference_performance,
+        )
+        return ExperimentAdapterResult(
+            passed=passed,
+            score=score,
+            result={
+                "kind": WorkloadKind.CODING.value,
+                "workload_unit_id": workload_unit_id,
+                "agent_run_id": agent_run.id,
+                "trial_id": trial.id,
+                "agent_run_status": agent_run.status.value,
+                "trial_status": trial.status.value,
+                "termination_cause": (
+                    trial.termination_cause.value
+                    if trial.termination_cause is not None
+                    else None
+                ),
+                "task_pack_revision": agent_run.task_pack_revision,
+                "task_pack_content_hash": agent_run.task_pack_content_hash,
+                "contract_fingerprint": agent_run.contract_fingerprint,
+                "evaluation_contract_fingerprint": (
+                    agent_run.evaluation_contract.fingerprint
+                ),
+                "execution_policy_fingerprint": (
+                    agent_run.execution_policy.fingerprint
+                ),
+                "generation": agent_run.generation.model_dump(mode="json"),
+                "model_session_id": session.id,
+                "context": request.context.model_dump(mode="json"),
+                "trajectory": [
+                    step.model_dump(mode="json", exclude_none=True)
+                    for step in trajectory.steps
+                ],
+                "routing": (
+                    routing.model_dump(mode="json") if routing is not None else None
+                ),
+                "artifact_endpoints": {
+                    "trajectory": f"/api/trials/{trial.id}/trajectory",
+                    "routing": f"/api/trials/{trial.id}/routing",
+                    "artifacts": f"/api/trials/{trial.id}/artifacts",
+                    "export": f"/api/trials/{trial.id}/export",
+                },
+            },
+            evaluation=evaluation_record,
+            performance=performance,
+        )
 
     async def run_benchmark(
         self,
@@ -847,6 +2374,7 @@ class ResearchLab:
                             contract=contract,
                             policy=policy,
                             session=session,
+                            profile=session.profile,
                             run_id=run_id,
                             token_budget=remaining_token_budget,
                             cost_budget_usd=remaining_cost_budget,
@@ -929,7 +2457,10 @@ class ResearchLab:
             model_session_id=session.id,
             profile_id=session.profile_id,
             profile_fingerprint=(
-                _profile_fingerprint(session.profile)
+                expert_profile_fingerprint(
+                    session.profile,
+                    session.topology or self.topology,
+                )
                 if session.profile is not None
                 else None
             ),
@@ -961,9 +2492,11 @@ class ResearchLab:
         contract: EvaluationContract,
         policy: ExecutionPolicy,
         session: ModelSession,
+        profile: ExpertProfile | None,
         run_id: str,
         token_budget: int | None,
         cost_budget_usd: float | None,
+        on_inference_progress: CompletionProgressCallback | None = None,
     ) -> BenchmarkItemExecution:
         prompt = adapter.render_prompt(item)
         started_at = datetime.now(UTC)
@@ -1018,12 +2551,21 @@ class ResearchLab:
             )
             request_key = item.id if attempt == 1 else f"{item.id}:attempt-{attempt}"
             async with asyncio.timeout(policy.per_item_timeout_seconds):
-                completion = await self.runtime.complete(
-                    prompt,
-                    request_key=request_key,
-                    profile=session.profile,
-                    generation=attempt_generation,
-                )
+                if on_inference_progress is None:
+                    completion = await self.runtime.complete(
+                        prompt,
+                        request_key=request_key,
+                        profile=profile,
+                        generation=attempt_generation,
+                    )
+                else:
+                    completion = await self.runtime.complete(
+                        prompt,
+                        request_key=request_key,
+                        profile=profile,
+                        generation=attempt_generation,
+                        on_progress=on_inference_progress,
+                    )
             latency_ms = (time.perf_counter() - started) * 1000
             routing = aggregate_routing(completion.routing, self.topology)
             output = completion.content.strip()
@@ -1318,10 +2860,188 @@ class ResearchLab:
         if job.kind is not JobKind.MODEL_LOAD or job.result_id is None:
             return
         model_session = self.model_sessions.get(job.result_id)
-        if model_session is None or model_session.state is not ModelState.STARTING:
+        if model_session is None or model_session.state not in {
+            ModelState.STARTING,
+            ModelState.READY,
+        }:
             return
         model_session.state = ModelState.FAILED
         self.store.save_model_session(model_session)
+
+    def _cancel_model_session_unlocked(self, job: JobRecord) -> None:
+        if job.kind is not JobKind.MODEL_LOAD or job.result_id is None:
+            return
+        model_session = self.model_sessions.get(job.result_id)
+        if model_session is None or model_session.state not in {
+            ModelState.STARTING,
+            ModelState.READY,
+            ModelState.FAILED,
+            ModelState.STOPPED,
+        }:
+            return
+        if model_session.state is not ModelState.STOPPED:
+            model_session.state = ModelState.STOPPED
+            self.store.save_model_session(model_session)
+        if self.session is model_session:
+            self.session = None
+            self.active_context = None
+            self.runtime.set_active_context(None)
+
+    def _set_model_load_phase(
+        self,
+        job_id: str | None,
+        phase: ModelLoadPhase,
+        *,
+        detail: str,
+        terminal: bool = False,
+        observability: Literal["observed", "unavailable"] = "observed",
+        source: Literal["application", "managed_runtime"] = "application",
+    ) -> None:
+        if job_id is None:
+            return
+        with self._job_guard:
+            artifacts = self.jobs[job_id]
+            now = datetime.now(UTC)
+            if observability == "observed":
+                for record in reversed(artifacts.record.phase_history):
+                    if (
+                        record.status == "active"
+                        and record.phase not in _MODEL_LOAD_CHILD_PHASES
+                    ):
+                        record.status = "completed"
+                        record.completed_at = now
+                        break
+            artifacts.record.phase_history.append(
+                JobPhaseRecord(
+                    phase=phase,
+                    status=(
+                        "unavailable"
+                        if observability == "unavailable"
+                        else ("completed" if terminal else "active")
+                    ),
+                    observability=observability,
+                    source=source,
+                    started_at=now,
+                    completed_at=(
+                        now if terminal or observability == "unavailable" else None
+                    ),
+                    detail=detail,
+                )
+            )
+            self.store.save_job(artifacts.record, artifacts.payload)
+
+    def _update_managed_model_load_phase(
+        self,
+        job_id: str | None,
+        update: ModelLoadPhaseUpdate,
+    ) -> None:
+        if job_id is None:
+            return
+        detail = redact_runtime_secrets(update.detail)
+        with self._job_guard:
+            artifacts = self.jobs[job_id]
+            now = datetime.now(UTC)
+            active = next(
+                (
+                    record
+                    for record in reversed(artifacts.record.phase_history)
+                    if record.phase is update.phase
+                    and record.source == "managed_runtime"
+                    and record.status == "active"
+                ),
+                None,
+            )
+            if update.status == "started":
+                if active is None:
+                    active = JobPhaseRecord(
+                        phase=update.phase,
+                        status="active",
+                        source="managed_runtime",
+                        started_at=now,
+                    )
+                    artifacts.record.phase_history.append(active)
+                active.detail = detail
+                active.bytes_current = update.bytes_current
+                active.bytes_total = update.bytes_total
+                active.files_current = update.files_current
+                active.files_total = update.files_total
+            else:
+                status = {
+                    "completed": "completed",
+                    "failed": "failed",
+                    "unavailable": "unavailable",
+                }[update.status]
+                if active is None:
+                    active = JobPhaseRecord(
+                        phase=update.phase,
+                        status=status,
+                        observability=(
+                            "unavailable"
+                            if update.status == "unavailable"
+                            else "observed"
+                        ),
+                        source="managed_runtime",
+                        started_at=now,
+                    )
+                    artifacts.record.phase_history.append(active)
+                active.status = status
+                active.observability = (
+                    "unavailable" if update.status == "unavailable" else "observed"
+                )
+                active.completed_at = now
+                active.detail = detail
+                active.bytes_current = update.bytes_current
+                active.bytes_total = update.bytes_total
+                active.files_current = update.files_current
+                active.files_total = update.files_total
+            self.store.save_job(artifacts.record, artifacts.payload)
+
+    @staticmethod
+    def _fail_model_load_phase_unlocked(job: JobRecord, detail: str | None) -> None:
+        if job.kind is not JobKind.MODEL_LOAD:
+            return
+        summary, failure_code, recovery_action, diagnostics = _model_load_failure(
+            detail
+        )
+        job.error = summary
+        now = datetime.now(UTC)
+        for record in job.phase_history:
+            if record.status == "active":
+                record.status = "failed"
+                record.completed_at = now
+        job.phase_history.append(
+            JobPhaseRecord(
+                phase=ModelLoadPhase.FAILED,
+                status="failed",
+                source="application",
+                started_at=now,
+                completed_at=now,
+                detail=summary,
+                failure_code=failure_code,
+                recovery_action=recovery_action,
+                diagnostics=diagnostics,
+            )
+        )
+
+    @staticmethod
+    def _cancel_model_load_phase_unlocked(job: JobRecord, *, detail: str) -> None:
+        if job.kind is not JobKind.MODEL_LOAD:
+            return
+        now = datetime.now(UTC)
+        for record in job.phase_history:
+            if record.status == "active":
+                record.status = "cancelled"
+                record.completed_at = now
+        job.phase_history.append(
+            JobPhaseRecord(
+                phase=ModelLoadPhase.CANCELLED,
+                status="cancelled",
+                source="application",
+                started_at=now,
+                completed_at=now,
+                detail=detail,
+            )
+        )
 
     def _discard_job_task(
         self,
@@ -1331,6 +3051,18 @@ class ResearchLab:
         with self._job_guard:
             if self._job_tasks.get(job_id) is task:
                 self._job_tasks.pop(job_id, None)
+
+    @staticmethod
+    def _cancel_owned_task(task: asyncio.Task[None]) -> None:
+        task_loop = task.get_loop()
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is task_loop:
+            task.cancel()
+        else:
+            task_loop.call_soon_threadsafe(task.cancel)
 
     def _update_job_progress(self, job_id: str, current: int, total: int) -> None:
         with self._job_guard:
@@ -1422,9 +3154,9 @@ class ResearchLab:
     def create_expert_profile(
         self, request: CreateExpertProfileRequest
     ) -> SavedExpertProfile:
-        if request.model_id != MODEL_ID:
-            raise ValueError(f"unsupported model {request.model_id!r}")
-        validation = validate_profile(request.profile, self.topology)
+        model = self._resolve_manifest_model(request.model_id)
+        assert model.topology is not None
+        validation = validate_profile(request.profile, model.topology)
         if not validation.valid:
             raise ValueError("; ".join(validation.errors))
 
@@ -1507,7 +3239,11 @@ class ResearchLab:
             description=request.description,
             model_id=request.model_id,
             profile=request.profile,
-            profile_fingerprint=_profile_fingerprint(request.profile),
+            profile_fingerprint=expert_profile_fingerprint(
+                request.profile,
+                model.topology,
+            ),
+            profile_fingerprint_version=EXPERT_PROFILE_FINGERPRINT_VERSION,
             source=request.source,
             source_run_id=request.source_run_id,
             source_trial_id=request.source_trial_id,
@@ -1592,7 +3328,10 @@ class ResearchLab:
                     artifacts.provenance.profile_fingerprint
                     if artifacts.provenance is not None
                     else (
-                        _profile_fingerprint(session.profile)
+                        expert_profile_fingerprint(
+                            session.profile,
+                            session.topology or self.topology,
+                        )
                         if session.profile is not None
                         else None
                     )
@@ -1644,6 +3383,34 @@ class ResearchLab:
             key=lambda profile: profile.created_at,
             reverse=True,
         )
+
+    def update_profile_metadata(
+        self,
+        profile_id: str,
+        update: UpdateProfileMetadataRequest,
+    ) -> SavedExpertProfile:
+        profile = self.profiles.get(profile_id)
+        if profile is None:
+            raise KeyError(profile_id)
+        model = self._resolve_manifest_model(profile.model_id)
+        assert model.topology is not None
+        immutable_fingerprint = _stored_profile_fingerprint(profile, model.topology)
+        if immutable_fingerprint != profile.profile_fingerprint:
+            raise RuntimeError("stored expert profile fingerprint is inconsistent")
+        changes: dict[str, str] = {}
+        if update.name is not None:
+            changes["name"] = update.name
+        if update.description is not None:
+            changes["description"] = update.description
+        renamed = profile.model_copy(update=changes, deep=True)
+        if (
+            _stored_profile_fingerprint(renamed, model.topology)
+            != immutable_fingerprint
+        ):
+            raise RuntimeError("profile metadata update changed the immutable mask")
+        self.profiles[profile_id] = renamed
+        self.store.save_expert_profile(renamed)
+        return renamed.model_copy(deep=True)
 
     def create_comparison(self, request: CreateComparisonRequest) -> ComparisonRecord:
         if request.baseline_run_id == request.candidate_run_id:
@@ -1717,7 +3484,10 @@ class ResearchLab:
                 candidate_session.model_id, candidate_session.profile
             )
         )
-        fingerprint = _profile_fingerprint(candidate_session.profile)
+        fingerprint = expert_profile_fingerprint(
+            candidate_session.profile,
+            candidate_session.topology or self.topology,
+        )
         default_name = (
             f"{saved_profile.name if saved_profile else 'Masked profile'} · "
             f"{request.baseline_run_id[:8]} → {request.candidate_run_id[:8]}"
@@ -1785,11 +3555,21 @@ class ResearchLab:
     def _find_saved_profile(
         self, model_id: str, profile: ExpertProfile
     ) -> SavedExpertProfile | None:
-        fingerprint = _profile_fingerprint(profile)
+        model = self._resolve_manifest_model(model_id)
+        assert model.topology is not None
+        canonical_fingerprint = expert_profile_fingerprint(profile, model.topology)
+        legacy_fingerprint = legacy_profile_fingerprint(profile)
         matching = [
             saved
             for saved in self.profiles.values()
-            if saved.model_id == model_id and saved.profile_fingerprint == fingerprint
+            if saved.model_id == model_id
+            and saved.profile_fingerprint
+            == (
+                canonical_fingerprint
+                if saved.profile_fingerprint_version
+                == EXPERT_PROFILE_FINGERPRINT_VERSION
+                else legacy_fingerprint
+            )
         ]
         return max(matching, key=lambda saved: saved.created_at, default=None)
 
@@ -1823,13 +3603,68 @@ class ResearchLab:
         )
 
 
-def _profile_fingerprint(profile: ExpertProfile) -> str:
-    canonical = json.dumps(
-        profile.model_dump(mode="json"),
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    return hashlib.sha256(canonical).hexdigest()
+def _stored_profile_fingerprint(
+    profile: SavedExpertProfile,
+    topology: ModelTopology,
+) -> str:
+    if profile.profile_fingerprint_version == EXPERT_PROFILE_FINGERPRINT_VERSION:
+        return expert_profile_fingerprint(profile.profile, topology)
+    return legacy_profile_fingerprint(profile.profile)
+
+
+def _validated_context_update(
+    context: InterventionContextRef,
+    **updates: object,
+) -> InterventionContextRef:
+    try:
+        return InterventionContextRef.model_validate(
+            {**context.model_dump(mode="python"), **updates}
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "vLLM expert-context control returned invalid identity provenance"
+        ) from error
+
+
+def _registration_identity_error(
+    registered: dict[str, object],
+    *,
+    expected_context_id: str,
+    expected_profile_fingerprint: str,
+    expected_topology_fingerprint: str,
+    expected_layers: dict[str, dict[str, list[int]]],
+) -> RuntimeError | None:
+    if registered.get("context_id") != expected_context_id:
+        return RuntimeError("vLLM registered an unexpected expert context ID")
+    if registered.get("profile_fingerprint") != expected_profile_fingerprint:
+        return RuntimeError("vLLM registered a different canonical expert mask")
+    if registered.get("topology_fingerprint") != expected_topology_fingerprint:
+        return RuntimeError("vLLM registered an expert mask for a different topology")
+    if registered.get("layers") != expected_layers:
+        return RuntimeError("vLLM registered different canonical expert-mask layers")
+    return None
+
+
+def _task_difficulty(tags: list[str]) -> str:
+    for candidate in ("hard", "medium", "easy", "smoke", "canary"):
+        if candidate in tags:
+            return candidate
+    return "unspecified"
+
+
+def _task_expected_horizon(tags: list[str]) -> int:
+    if "repo-engineering" in tags or "hard" in tags:
+        return 16
+    if "aider-polyglot" in tags or "medium" in tags:
+        return 8
+    return 4
+
+
+def _external_language(task_id: str) -> str | None:
+    marker = "polyglot_"
+    if marker not in task_id:
+        return None
+    return task_id.split(marker, 1)[1].split("_", 1)[0]
 
 
 def _weighted_observed_mass_retained(
@@ -2103,3 +3938,72 @@ def _judge_budget_accounting(result: LLMJudgeResult) -> tuple[float, bool]:
 
 def _prompt_token_upper_bound(prompt: str) -> int:
     return len(prompt.encode("utf-8")) + 4096
+
+
+def _model_load_failure(
+    detail: str | None,
+) -> tuple[str, str, str, str | None]:
+    diagnostics = redact_runtime_secrets(
+        detail or "Model loading failed without diagnostic detail"
+    ).strip()
+    summary = next(
+        (line.strip() for line in diagnostics.splitlines() if line.strip()),
+        "Model loading failed",
+    )
+    lowered = diagnostics.lower()
+    if "cleanup failed" in lowered or "could not prove" in lowered:
+        return (
+            summary,
+            "cleanup_failed",
+            (
+                "Restart the deployment and inspect diagnostics before retrying; "
+                "runtime cleanup could not be proven."
+            ),
+            diagnostics,
+        )
+    if "restarted" in lowered or "interrupted during shutdown" in lowered:
+        return (
+            summary,
+            "application_restarted",
+            "Confirm no model load is active, then retry the same pinned model.",
+            diagnostics,
+        )
+    if "launcher is not executable" in lowered:
+        return (
+            summary,
+            "launcher_unavailable",
+            "Repair the managed vLLM launcher configuration before retrying.",
+            diagnostics,
+        )
+    if any(
+        marker in lowered
+        for marker in (
+            "ready context",
+            "context verification",
+            "expert context",
+            "expert-context",
+            "canonical expert mask",
+        )
+    ):
+        return (
+            summary,
+            "context_verification_failed",
+            (
+                "Inspect expert-context provenance in diagnostics, then retry the "
+                "same pinned model or load the baseline context."
+            ),
+            diagnostics,
+        )
+    if "not ready" in lowered or "readiness" in lowered or "during startup" in lowered:
+        return (
+            summary,
+            "readiness_failed",
+            "Inspect launcher diagnostics and accelerator capacity, then retry.",
+            diagnostics,
+        )
+    return (
+        summary,
+        "runtime_start_failed",
+        "Inspect the collapsed diagnostics, correct the runtime cause, then retry.",
+        diagnostics,
+    )

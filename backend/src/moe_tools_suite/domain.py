@@ -31,6 +31,7 @@ class JobKind(StrEnum):
     BENCHMARK_RUN = "benchmark_run"
     DATASET_PREPARE = "dataset_prepare"
     AGENT_RUN = "agent_run"
+    EXPERIMENT_RUN = "experiment_run"
 
 
 class JobStatus(StrEnum):
@@ -42,6 +43,48 @@ class JobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ModelLoadPhase(StrEnum):
+    QUEUED = "queued"
+    RESOLVING_MODEL = "resolving_model"
+    STOPPING_PREVIOUS = "stopping_previous"
+    CONFIGURING_RUNTIME = "configuring_runtime"
+    LAUNCHING_PROCESS = "launching_process"
+    CHECKING_CACHE = "checking_cache"
+    DOWNLOADING = "downloading"
+    LOADING_WEIGHTS = "loading_weights"
+    INITIALIZING_DISTRIBUTED_WORKERS = "initializing_distributed_workers"
+    COMPILING = "compiling"
+    CAPTURING_GRAPHS = "capturing_graphs"
+    WARMING = "warming"
+    WAITING_FOR_READINESS = "waiting_for_readiness"
+    STARTING_RUNTIME = "starting_runtime"
+    VERIFYING_READY_CONTEXT = "verifying_ready_context"
+    READY = "ready"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class JobPhaseRecord(BaseModel):
+    phase: ModelLoadPhase
+    status: Literal["active", "completed", "failed", "cancelled", "unavailable"] = (
+        "active"
+    )
+    observability: Literal["observed", "unavailable"] = "observed"
+    source: Literal["application", "managed_runtime", "legacy_unknown"] = (
+        "legacy_unknown"
+    )
+    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    completed_at: datetime | None = None
+    detail: str | None = None
+    bytes_current: Annotated[int, Field(ge=0)] | None = None
+    bytes_total: Annotated[int, Field(ge=0)] | None = None
+    files_current: Annotated[int, Field(ge=0)] | None = None
+    files_total: Annotated[int, Field(ge=0)] | None = None
+    failure_code: str | None = None
+    recovery_action: str | None = None
+    diagnostics: str | None = None
+
+
 class JobRecord(BaseModel):
     id: str
     kind: JobKind
@@ -49,7 +92,9 @@ class JobRecord(BaseModel):
     progress_current: Annotated[int, Field(ge=0)] = 0
     progress_total: Annotated[int, Field(ge=0)] = 0
     result_id: str | None = None
+    retry_of_job_id: str | None = None
     error: str | None = None
+    phase_history: list[JobPhaseRecord] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -79,13 +124,61 @@ class ModelTopology(BaseModel):
         return self
 
 
+class ModelRuntimeRecipe(BaseModel):
+    revision: Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+    tensor_parallel_size: Annotated[int, Field(ge=1)] = 1
+    max_model_len: Annotated[int, Field(ge=1)] = 4096
+    reasoning_parser: str | None = None
+
+
 class ModelRegistryEntry(BaseModel):
     id: str
     display_name: str
     enabled: bool
     revision: str | None = None
-    topology: ModelTopology
+    topology: ModelTopology | None
     notes: str
+    architecture: str | None = None
+    dtype: str | None = None
+    quantization: str | None = None
+    tensor_parallel_size: Annotated[int, Field(ge=1)] = 1
+    context_defaults: dict[str, Any] = Field(default_factory=dict)
+    chat_template: str | None = None
+    tool_parser: str | None = None
+    reasoning_parser: str | None = None
+    recommended_hardware: str | None = None
+    minimum_memory_gib: Annotated[float, Field(gt=0)] | None = None
+    masking_status: Literal["qualified", "experimental", "unsupported"] = "unsupported"
+    routing_telemetry_status: Literal["qualified", "experimental", "unsupported"] = (
+        "unsupported"
+    )
+    hot_switch_status: Literal["qualified", "experimental", "unsupported"] = (
+        "unsupported"
+    )
+    qualification_status: Literal[
+        "qualified", "experimental", "manifest_only", "unsupported"
+    ] = "unsupported"
+    last_live_evidence: str | None = None
+    failure_reason: str | None = None
+    runtime_recipe: ModelRuntimeRecipe | None = None
+
+    @model_validator(mode="after")
+    def validate_enabled_runtime(self) -> ModelRegistryEntry:
+        if not self.enabled:
+            return self
+        if self.revision is None:
+            raise ValueError("enabled models require an immutable revision")
+        if self.topology is None:
+            raise ValueError("enabled models require a manifest topology")
+        if self.runtime_recipe is None:
+            raise ValueError("enabled models require a runtime recipe")
+        if self.runtime_recipe.revision != self.revision:
+            raise ValueError("runtime recipe revision must match the manifest revision")
+        if self.runtime_recipe.tensor_parallel_size != self.tensor_parallel_size:
+            raise ValueError(
+                "runtime recipe tensor parallel size must match the manifest"
+            )
+        return self
 
 
 class ProfileLayer(BaseModel):
@@ -234,6 +327,7 @@ class SavedExpertProfile(BaseModel):
     model_id: str
     profile: ExpertProfile
     profile_fingerprint: str
+    profile_fingerprint_version: Literal[1] | None = None
     source: ProfileSource
     source_run_id: str | None = None
     source_trial_id: str | None = None
@@ -255,6 +349,9 @@ class ModelSession(BaseModel):
     mode: Literal["mock", "vllm"]
     profile: ExpertProfile | None = None
     profile_id: str | None = None
+    model_revision: str | None = None
+    topology: ModelTopology | None = None
+    runtime_recipe: ModelRuntimeRecipe | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -984,7 +1081,7 @@ class ProfileProposal(BaseModel):
 
 
 class CreateModelSessionRequest(BaseModel):
-    model_id: str
+    model_id: str | None = None
     profile: ExpertProfile | None = None
     profile_id: str | None = None
 
@@ -999,6 +1096,7 @@ class SystemStatus(BaseModel):
 class RuntimeStatus(BaseModel):
     managed: bool
     model_id: str
+    model_revision: str | None = None
     pid: int | None = None
     session_id: str | None = None
     started_at: datetime | None = None

@@ -14,8 +14,10 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from ipaddress import ip_address
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -25,6 +27,7 @@ import httpx
 ACTIVE_JOB_STATUSES = {"queued", "running", "cancelling"}
 TERMINAL_JOB_STATUSES = {"completed", "failed", "cancelled"}
 DEFAULT_ITEM_IDS = ("arith-03", "arith-04")
+SESSION_COOKIE_NAME = "moe_tools_session"
 
 
 class CanaryFailure(RuntimeError):
@@ -130,6 +133,7 @@ class ApiClient:
             follow_redirects=False,
             transport=transport,
             headers={"Accept": "application/json"},
+            trust_env=not _is_plain_http_loopback(httpx.URL(config.base_url)),
         )
 
     def __enter__(self) -> ApiClient:
@@ -146,6 +150,9 @@ class ApiClient:
 
     def post(self, path: str, payload: object | None = None) -> Any:
         return self._request("POST", path, payload=payload)
+
+    def patch(self, path: str, payload: object) -> Any:
+        return self._request("PATCH", path, payload=payload)
 
     def login(self) -> dict[str, Any]:
         session = _mapping(self.get("/api/session"), "session status")
@@ -202,6 +209,8 @@ class ApiClient:
                 continue
             body = _response_body(response)
             if response.is_success:
+                if method == "POST" and path == "/api/session/login":
+                    self._make_loopback_session_cookie_usable(response)
                 return body
             if (
                 retry_transient
@@ -213,6 +222,24 @@ class ApiClient:
             detail = body.get("detail") if isinstance(body, Mapping) else body
             raise ApiFailure(response.status_code, detail)
         raise AssertionError("request retry loop exhausted")
+
+    def _make_loopback_session_cookie_usable(self, response: httpx.Response) -> None:
+        if not _is_plain_http_loopback(response.request.url):
+            return
+        issued = [
+            cookie
+            for cookie in response.cookies.jar
+            if cookie.name == SESSION_COOKIE_NAME
+        ]
+        if len(issued) != 1:
+            raise CanaryFailure(
+                "successful loopback login did not issue exactly one session cookie"
+            )
+        if not issued[0].secure:
+            return
+        replacement = copy(issued[0])
+        replacement.secure = False
+        self._client.cookies.jar.set_cookie(replacement)
 
 
 class AcceptanceCanary:
@@ -1037,6 +1064,18 @@ def _normalize_base_url(value: str) -> str:
     if parsed.path not in {"", "/"}:
         raise CanaryFailure("base URL must be an origin without an API path")
     return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def _is_plain_http_loopback(url: httpx.URL) -> bool:
+    if url.scheme != "http":
+        return False
+    host = url.host.rstrip(".").casefold()
+    if host == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _profile_name() -> str:
