@@ -700,17 +700,45 @@ class V2LiveAcceptance:
         ]
         if len(units) != 2:
             raise CanaryFailure("paired coding did not produce exactly two lane units")
-        required_steps = {"assistant", "tool", "observation", "verifier"}
+        valid_lane_statuses = {"passed", "failed"}
+        valid_termination_causes = {"agent_finished", "turn_limit"}
+        validated_tool_pairs = 0
         lane_evidence = []
         for unit in units:
             result = _mapping(unit.get("result"), "coding unit result")
+            unit_status = unit.get("status")
+            if unit_status not in valid_lane_statuses:
+                raise CanaryFailure(
+                    f"coding unit ended in invalid terminal status {unit_status!r}"
+                )
+            agent_run_status = result.get("agent_run_status")
+            if agent_run_status != "completed":
+                raise CanaryFailure(
+                    f"coding agent run ended in invalid status {agent_run_status!r}"
+                )
+            trial_status = result.get("trial_status")
+            if trial_status not in valid_lane_statuses:
+                raise CanaryFailure(
+                    f"coding trial ended in invalid terminal status {trial_status!r}"
+                )
+            if trial_status != unit_status:
+                raise CanaryFailure(
+                    "coding unit and trial terminal statuses do not match: "
+                    f"{unit_status!r} != {trial_status!r}"
+                )
+            termination_cause = result.get("termination_cause")
+            if termination_cause not in valid_termination_causes:
+                raise CanaryFailure(
+                    "coding trial ended with invalid termination cause "
+                    f"{termination_cause!r}"
+                )
             trajectory = [
                 _mapping(step, "trajectory step")
                 for step in _list(result.get("trajectory"), "coding trajectory")
             ]
             observed_steps = {step.get("type") for step in trajectory}
-            if not required_steps <= observed_steps:
-                raise CanaryFailure("coding trajectory omitted required step types")
+            validated_lane_pairs = _validate_coding_trajectory(trajectory)
+            validated_tool_pairs += validated_lane_pairs
             routing = result.get("routing")
             if self.config.require_routing_evidence:
                 routing_map = _mapping(routing, "coding routing evidence")
@@ -719,10 +747,14 @@ class V2LiveAcceptance:
             lane_evidence.append(
                 {
                     "unit_id": unit.get("id"),
-                    "status": unit.get("status"),
+                    "status": unit_status,
                     "agent_run_id": result.get("agent_run_id"),
+                    "agent_run_status": agent_run_status,
                     "trial_id": result.get("trial_id"),
+                    "trial_status": trial_status,
+                    "termination_cause": termination_cause,
                     "trajectory_step_types": sorted(observed_steps),
+                    "validated_tool_observation_pairs": validated_lane_pairs,
                     "sandbox_status": self._trial_sandbox_status(result),
                     "routing_total_slots": (
                         routing.get("total_routed_slots")
@@ -730,6 +762,10 @@ class V2LiveAcceptance:
                         else None
                     ),
                 }
+            )
+        if not validated_tool_pairs:
+            raise CanaryFailure(
+                "paired coding trajectories contained no linked tool execution pair"
             )
         self.report["paired_coding"] = {
             "experiment_id": experiment_record.get("id"),
@@ -1206,6 +1242,56 @@ class V2LiveAcceptance:
             for job in jobs
             if isinstance(job, Mapping) and job.get("kind") == "model_load"
         }
+
+
+def _validate_coding_trajectory(trajectory: Sequence[Mapping[str, Any]]) -> int:
+    steps_by_type: dict[str, list[Mapping[str, Any]]] = {
+        step_type: [step for step in trajectory if step.get("type") == step_type]
+        for step_type in ("assistant", "tool", "observation", "verifier")
+    }
+    if not steps_by_type["assistant"] or not steps_by_type["verifier"]:
+        raise CanaryFailure("coding trajectory omitted an assistant or verifier step")
+
+    tools: dict[str, int] = {}
+    for tool in steps_by_type["tool"]:
+        tool_call_id = tool.get("tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+            raise CanaryFailure("coding tool step omitted non-empty tool_call_id")
+        if tool_call_id in tools:
+            raise CanaryFailure("coding trajectory repeated a tool_call_id")
+        command = tool.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise CanaryFailure("coding tool step omitted a non-empty command")
+        tools[tool_call_id] = _integer(tool, "sequence")
+
+    observations: dict[str, int] = {}
+    for observation in steps_by_type["observation"]:
+        source_call_id = observation.get("source_call_id")
+        if not isinstance(source_call_id, str) or not source_call_id.strip():
+            raise CanaryFailure("coding observation omitted non-empty source_call_id")
+        if source_call_id in observations:
+            raise CanaryFailure(
+                "coding trajectory repeated an observation source_call_id"
+            )
+        observations[source_call_id] = _integer(observation, "sequence")
+
+    if tools.keys() != observations.keys():
+        raise CanaryFailure(
+            "coding tool_call_id and observation source_call_id values do not match"
+        )
+    for call_id, tool_sequence in tools.items():
+        if tool_sequence >= observations[call_id]:
+            raise CanaryFailure(
+                "coding tool sequence must precede its matching observation"
+            )
+
+    if observations:
+        verifier_sequences = [
+            _integer(verifier, "sequence") for verifier in steps_by_type["verifier"]
+        ]
+        if min(verifier_sequences) <= max(observations.values()):
+            raise CanaryFailure("coding verifier sequence must follow all observations")
+    return len(tools)
 
 
 def _profile_payloads(

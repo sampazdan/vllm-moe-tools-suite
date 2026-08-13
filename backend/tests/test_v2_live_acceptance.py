@@ -26,6 +26,7 @@ from scripts.v2_live_acceptance import (
     _contract_fingerprint,
     _drift_insight,
     _profile_payloads,
+    _validate_coding_trajectory,
 )
 
 MODEL_ID = "Qwen/Qwen3.6-35B-A3B-FP8"
@@ -38,8 +39,45 @@ ANSWER_CONTENT_FINGERPRINT = "8" * 64
 ANSWER_UNIT_IDS = tuple(f"arith-{index:02d}" for index in range(3, 15))
 
 
+def _linked_coding_trajectory(
+    *,
+    tool_call_id: str = "call-1",
+    source_call_id: str = "call-1",
+    command: str = "pytest -q",
+    tool_sequence: int = 2,
+    observation_sequence: int = 3,
+    verifier_sequence: int = 4,
+) -> list[dict[str, Any]]:
+    return [
+        {"type": "assistant", "sequence": 1},
+        {
+            "type": "tool",
+            "sequence": tool_sequence,
+            "tool_call_id": tool_call_id,
+            "command": command,
+        },
+        {
+            "type": "observation",
+            "sequence": observation_sequence,
+            "source_call_id": source_call_id,
+        },
+        {"type": "verifier", "sequence": verifier_sequence},
+    ]
+
+
+def _no_tool_coding_trajectory() -> list[dict[str, Any]]:
+    return [
+        {"type": "assistant", "sequence": 1},
+        {"type": "verifier", "sequence": 2},
+    ]
+
+
 class FakeV2Deployment:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        coding_lanes: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
         self.loaded = False
         self.model_load_posts = 0
         self.profiles: dict[str, dict[str, Any]] = {}
@@ -48,6 +86,26 @@ class FakeV2Deployment:
         self.experiments: dict[str, str] = {}
         self.progress_payload: dict[str, Any] | None = None
         self.daytona_preflight_posts = 0
+        default_coding_lanes: dict[str, dict[str, Any]] = {
+            "baseline": {
+                "status": "passed",
+                "agent_run_status": "completed",
+                "trial_status": "passed",
+                "termination_cause": "agent_finished",
+                "trajectory": _linked_coding_trajectory(),
+            },
+            "candidate": {
+                "status": "failed",
+                "agent_run_status": "completed",
+                "trial_status": "failed",
+                "termination_cause": "turn_limit",
+                "trajectory": _no_tool_coding_trajectory(),
+            },
+        }
+        self.coding_lanes = {
+            role: {**lane, **((coding_lanes or {}).get(role, {}))}
+            for role, lane in default_coding_lanes.items()
+        }
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         method = request.method
@@ -584,21 +642,19 @@ class FakeV2Deployment:
             "units": units,
         }
 
-    @staticmethod
-    def _coding_unit(role: str, context: Mapping[str, Any]) -> dict[str, Any]:
+    def _coding_unit(self, role: str, context: Mapping[str, Any]) -> dict[str, Any]:
+        lane = self.coding_lanes[role]
         return {
             "id": f"unit-{role}",
-            "status": "passed",
+            "status": lane["status"],
             "result": {
                 "agent_run_id": f"agent-{role}",
+                "agent_run_status": lane["agent_run_status"],
                 "trial_id": f"trial-{role}",
+                "trial_status": lane["trial_status"],
+                "termination_cause": lane["termination_cause"],
                 "context": context,
-                "trajectory": [
-                    {"type": "assistant"},
-                    {"type": "tool"},
-                    {"type": "observation"},
-                    {"type": "verifier"},
-                ],
+                "trajectory": [dict(step) for step in lane["trajectory"]],
                 "routing": {"total_routed_slots": 128},
             },
         }
@@ -617,8 +673,9 @@ class FakeV2Deployment:
         }
 
 
-def test_full_v2_harness_loads_once_and_emits_machine_readable_evidence() -> None:
-    deployment = FakeV2Deployment()
+def _run_fake_harness(
+    deployment: FakeV2Deployment,
+) -> tuple[dict[str, Any], list[str]]:
     messages: list[str] = []
     config = V2AcceptanceConfig(
         base_url="https://v2.test",
@@ -648,6 +705,12 @@ def test_full_v2_harness_loads_once_and_emits_machine_readable_evidence() -> Non
             reconnect_client=client,
         )
         report = runner.run()
+    return report, messages
+
+
+def test_full_v2_harness_loads_once_and_emits_machine_readable_evidence() -> None:
+    deployment = FakeV2Deployment()
+    report, messages = _run_fake_harness(deployment)
 
     assert deployment.model_load_posts == 1
     assert deployment.daytona_preflight_posts == 1
@@ -690,7 +753,24 @@ def test_full_v2_harness_loads_once_and_emits_machine_readable_evidence() -> Non
     assert ordinary["reconnect"]["inference_progress_visible_after_reconnect"]
     assert ordinary["reconnect"]["replayed_inference_progress"][0]["current_tps"] == 16
     assert report["in_appliance_gates"]["ordinary_inference_progress_and_current_tps"]
-    assert report["paired_coding"]["lanes"][0]["sandbox_status"] == "deleted"
+    coding_lanes = report["paired_coding"]["lanes"]
+    assert coding_lanes[0]["sandbox_status"] == "deleted"
+    assert coding_lanes[0]["agent_run_status"] == "completed"
+    assert coding_lanes[0]["trial_status"] == "passed"
+    assert coding_lanes[0]["termination_cause"] == "agent_finished"
+    assert coding_lanes[0]["validated_tool_observation_pairs"] == 1
+    assert coding_lanes[0]["trajectory_step_types"] == [
+        "assistant",
+        "observation",
+        "tool",
+        "verifier",
+    ]
+    assert coding_lanes[1]["status"] == "failed"
+    assert coding_lanes[1]["agent_run_status"] == "completed"
+    assert coding_lanes[1]["trial_status"] == "failed"
+    assert coding_lanes[1]["termination_cause"] == "turn_limit"
+    assert coding_lanes[1]["validated_tool_observation_pairs"] == 0
+    assert coding_lanes[1]["trajectory_step_types"] == ["assistant", "verifier"]
     assert report["driftbench"]["insight"][
         "mean_routing_mass_js_divergence"
     ] == pytest.approx(0.13)
@@ -704,6 +784,235 @@ def test_full_v2_harness_loads_once_and_emits_machine_readable_evidence() -> Non
         f"[{index:02d}/{V2_ACCEPTANCE_STEP_COUNT:02d}]"
         for index in range(1, V2_ACCEPTANCE_STEP_COUNT + 1)
     ]
+
+
+def test_coding_acceptance_rejects_pair_with_no_tool_observation_steps() -> None:
+    deployment = FakeV2Deployment(
+        coding_lanes={"baseline": {"trajectory": _no_tool_coding_trajectory()}}
+    )
+
+    with pytest.raises(CanaryFailure, match="no linked tool execution pair"):
+        _run_fake_harness(deployment)
+
+
+def test_coding_acceptance_rejects_mismatched_execution_ids() -> None:
+    deployment = FakeV2Deployment(
+        coding_lanes={
+            "baseline": {
+                "trajectory": _linked_coding_trajectory(
+                    tool_call_id="tool-call", source_call_id="different-call"
+                )
+            }
+        }
+    )
+
+    with pytest.raises(CanaryFailure, match="values do not match"):
+        _run_fake_harness(deployment)
+
+
+@pytest.mark.parametrize("missing_step", ["assistant", "verifier"])
+def test_coding_acceptance_requires_assistant_and_verifier_on_every_lane(
+    missing_step: str,
+) -> None:
+    candidate_trajectory = [
+        step for step in _no_tool_coding_trajectory() if step["type"] != missing_step
+    ]
+    deployment = FakeV2Deployment(
+        coding_lanes={"candidate": {"trajectory": candidate_trajectory}}
+    )
+
+    with pytest.raises(CanaryFailure, match="assistant or verifier"):
+        _run_fake_harness(deployment)
+
+
+def test_coding_acceptance_rejects_shaped_infrastructure_failure_lane() -> None:
+    deployment = FakeV2Deployment(
+        coding_lanes={
+            "candidate": {
+                "status": "error",
+                "trial_status": "error",
+                "termination_cause": "verifier_error",
+                "trajectory": _linked_coding_trajectory(),
+            }
+        }
+    )
+
+    with pytest.raises(CanaryFailure, match="invalid terminal status 'error'"):
+        _run_fake_harness(deployment)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_values", "failure_pattern"),
+    [
+        pytest.param(
+            "status",
+            (None, "unknown", "unscored", "error", "cancelled"),
+            "coding unit",
+            id="unit-status",
+        ),
+        pytest.param(
+            "agent_run_status",
+            (None, "unknown", "running", "failed", "cancelled"),
+            "coding agent run",
+            id="agent-run-status",
+        ),
+        pytest.param(
+            "trial_status",
+            (None, "unknown", "unscored", "error", "cancelled"),
+            "coding trial ended",
+            id="trial-status",
+        ),
+        pytest.param(
+            "termination_cause",
+            (
+                None,
+                "unknown",
+                "cancelled",
+                "interrupted",
+                "model_error",
+                "sandbox_error",
+                "verifier_error",
+                "cleanup_error",
+                "token_limit",
+                "cost_limit",
+                "time_limit",
+            ),
+            "invalid termination cause",
+            id="termination-cause",
+        ),
+    ],
+)
+def test_coding_acceptance_rejects_invalid_lane_outcomes(
+    field: str,
+    invalid_values: tuple[object, ...],
+    failure_pattern: str,
+) -> None:
+    for invalid_value in invalid_values:
+        deployment = FakeV2Deployment(
+            coding_lanes={"candidate": {field: invalid_value}}
+        )
+
+        with pytest.raises(CanaryFailure, match=failure_pattern):
+            _run_fake_harness(deployment)
+
+
+def test_coding_acceptance_rejects_unit_trial_status_mismatch() -> None:
+    deployment = FakeV2Deployment(
+        coding_lanes={"candidate": {"status": "passed", "trial_status": "failed"}}
+    )
+
+    with pytest.raises(CanaryFailure, match="terminal statuses do not match"):
+        _run_fake_harness(deployment)
+
+
+def _without_step_field(
+    trajectory: list[dict[str, Any]], step_type: str, field: str
+) -> list[dict[str, Any]]:
+    return [
+        {key: value for key, value in step.items() if key != field}
+        if step["type"] == step_type
+        else dict(step)
+        for step in trajectory
+    ]
+
+
+@pytest.mark.parametrize(
+    ("trajectory", "failure_pattern"),
+    [
+        pytest.param(
+            _without_step_field(_linked_coding_trajectory(), "tool", "tool_call_id"),
+            "tool_call_id",
+            id="missing-tool-call-id",
+        ),
+        pytest.param(
+            _linked_coding_trajectory(tool_call_id=""),
+            "tool_call_id",
+            id="empty-tool-call-id",
+        ),
+        pytest.param(
+            _without_step_field(
+                _linked_coding_trajectory(), "observation", "source_call_id"
+            ),
+            "source_call_id",
+            id="missing-source-call-id",
+        ),
+        pytest.param(
+            _linked_coding_trajectory(source_call_id=""),
+            "source_call_id",
+            id="empty-source-call-id",
+        ),
+        pytest.param(
+            [
+                *_linked_coding_trajectory()[:2],
+                dict(_linked_coding_trajectory()[1]),
+                *_linked_coding_trajectory()[2:],
+            ],
+            "repeated a tool_call_id",
+            id="duplicate-tool-call-id",
+        ),
+        pytest.param(
+            [
+                *_linked_coding_trajectory()[:3],
+                dict(_linked_coding_trajectory()[2]),
+                *_linked_coding_trajectory()[3:],
+            ],
+            "repeated an observation source_call_id",
+            id="duplicate-source-call-id",
+        ),
+        pytest.param(
+            _linked_coding_trajectory(command=""),
+            "non-empty command",
+            id="empty-command",
+        ),
+        pytest.param(
+            [
+                *_linked_coding_trajectory()[:2],
+                _linked_coding_trajectory()[3],
+            ],
+            "values do not match",
+            id="tool-without-observation",
+        ),
+        pytest.param(
+            [
+                _linked_coding_trajectory()[0],
+                *_linked_coding_trajectory()[2:],
+            ],
+            "values do not match",
+            id="observation-without-tool",
+        ),
+        pytest.param(
+            _linked_coding_trajectory(tool_sequence=3, observation_sequence=2),
+            "tool sequence must precede",
+            id="observation-before-tool",
+        ),
+        pytest.param(
+            _linked_coding_trajectory(verifier_sequence=3),
+            "verifier sequence must follow",
+            id="verifier-before-observation",
+        ),
+        pytest.param(
+            _linked_coding_trajectory(
+                tool_call_id="tool-call", source_call_id="different-call"
+            ),
+            "values do not match",
+            id="mismatched-identifiers",
+        ),
+    ],
+)
+def test_coding_trajectory_rejects_unlinked_or_unordered_execution(
+    trajectory: list[dict[str, Any]], failure_pattern: str
+) -> None:
+    with pytest.raises(CanaryFailure, match=failure_pattern):
+        _validate_coding_trajectory(trajectory)
+
+
+def test_coding_trajectory_allows_no_tool_pair_without_ordering_verifier() -> None:
+    trajectory = [
+        {"type": "assistant"},
+        {"type": "verifier"},
+    ]
+
+    assert _validate_coding_trajectory(trajectory) == 0
 
 
 def test_profile_generator_is_full_non_uniform_and_distinct() -> None:
